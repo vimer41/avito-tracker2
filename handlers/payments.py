@@ -138,11 +138,18 @@ async def successful_payment(message: Message, bot: Bot):
     if not order["applied"]:
         await message.answer("Этот платёж уже обработан. Текущая подписка доступна в /profile; вопросы — /paysupport.")
         return
+    notes = ""
+    if (order["allowed_before"] and order["tariff_before"] != order["tariff_after"]
+            and database.subscription_seconds_left({"subscription_until": order["subscription_before"]})):
+        notes += "\nОстаток прежнего тарифа пересчитан по цене нового."
+    paused = await database.count_limit_paused(order["user_id"])
+    if paused:
+        notes += f"\nНе вошли в лимит тарифа и стоят на паузе радаров: {paused}. Какие запускать, можно выбрать в «Мои радары»."
     await message.answer(
         f"{ui.e('ok')} <b>Оплата {order['total_amount']} ⭐ прошла</b>\n\n"
         f"Тариф <b>«{config.plan_title(order['tariff_plan'])}»</b>, радаров до {await database.get_user_max_radars(order['user_id'])}.\n"
         f"+{order['days']} дней, действует до {database.format_subscription_date(order['subscription_after'])}.\n"
-        f"Заказ <code>{order['id']}</code>, без автосписания. Вопросы: /paysupport.",
+        f"Заказ <code>{order['id']}</code>, без автосписания. Вопросы: /paysupport.{notes}",
         parse_mode="HTML", reply_markup=ui.kb(
             [ui.btn("Добавить радар", "radar", callback_data="add_search_prompt", style="primary")],
             [ui.btn("Мои радары", "radars", callback_data="list_searches"),

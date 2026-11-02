@@ -55,6 +55,11 @@ class TestStarsBilling(unittest.IsolatedAsyncioTestCase):
         async with aiosqlite.connect(database.DB_PATH) as db:
             self.assertEqual((await (await db.execute("SELECT COUNT(*) FROM stars_orders")).fetchone())[0], 0)
 
+    async def test_test_tariff_is_closed_by_default(self):
+        with self.assertRaises(billing.PaymentValidationError):
+            await billing.create_order(self.user_id, "test")
+
+    @patch.object(config, "STARS_TEST_ENABLED", True)
     async def test_test_tariff_flow(self):
         order = await billing.create_order(self.user_id, "test")
         self.assertEqual(order["total_amount"], 10)
@@ -130,7 +135,7 @@ class TestStarsBilling(unittest.IsolatedAsyncioTestCase):
         first = await self.approved_order()
         await self.pay(first)
         before = await database.get_user(self.user_id)
-        second = await self.approved_order("pro")
+        second = await self.approved_order()
         with self.assertRaises(billing.PaymentValidationError):
             await self.pay(second)
         self.assertEqual(await database.get_user(self.user_id), before)

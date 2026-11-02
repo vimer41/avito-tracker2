@@ -1,14 +1,18 @@
 """Background jobs that talk to people rather than Avito: renewal reminders and the morning admin report."""
 
 import asyncio
+import gzip
 import logging
+import os
 import re
+import shutil
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError
+from aiogram.types import FSInputFile
 
 import config
 import database
@@ -18,6 +22,7 @@ from runtime_metrics import METRICS
 logger = logging.getLogger(__name__)
 
 DAY = 86400.0
+BACKUP_MAX_BYTES = 49 * 1024 * 1024  # Telegram refuses a bot's document over 50 MB
 
 
 def _until_epoch(raw) -> Optional[float]:
@@ -108,6 +113,16 @@ async def reminder_worker(bot: Bot) -> None:
             raise
         except Exception:
             logger.exception("Сбой рассылки напоминаний")
+        try:
+            from handlers.support import retry_undelivered_tickets
+
+            count = await retry_undelivered_tickets(bot)
+            if count:
+                logger.info("Доставлено отложенных обращений в поддержку: %s", count)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Сбой повторной отправки обращений")
         await asyncio.sleep(config.REMINDER_CHECK_INTERVAL)
 
 
@@ -161,6 +176,39 @@ def seconds_until_report(now: Optional[float] = None) -> float:
     return target - msk
 
 
+def pack_database_backup() -> Optional[str]:
+    path = database.create_database_backup_file()
+    if not path:
+        return None
+    packed = f"{path}.gz"
+    try:
+        with open(path, "rb") as source, gzip.open(packed, "wb", compresslevel=6) as target:
+            shutil.copyfileobj(source, target)
+    finally:
+        os.remove(path)
+    return packed
+
+
+async def send_daily_backup(bot: Bot) -> None:
+    """The deploy's backups stay on the VPS: this copy is the one that survives losing the server."""
+    packed = await asyncio.to_thread(pack_database_backup)
+    if packed is None:
+        await bot.send_message(config.ADMIN_ID, "Не удалось создать ежедневную копию базы, смотрите errors.log.")
+        return
+    try:
+        size = os.path.getsize(packed)
+        if size > BACKUP_MAX_BYTES:
+            await bot.send_message(
+                config.ADMIN_ID, f"Копия базы {size // (1024 * 1024)} МБ: больше лимита Telegram, не отправлена."
+            )
+            return
+        await bot.send_document(
+            config.ADMIN_ID, FSInputFile(packed), caption=f"Ежедневная копия базы, {size // 1024} КБ. Храните её как личные данные."
+        )
+    finally:
+        os.remove(packed)
+
+
 async def daily_report_worker(bot: Bot) -> None:
     while True:
         await asyncio.sleep(seconds_until_report())
@@ -178,6 +226,12 @@ async def daily_report_worker(bot: Bot) -> None:
             raise
         except Exception:
             logger.exception("Сбой утреннего отчёта")
+        try:
+            await send_daily_backup(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Сбой ежедневной копии базы")
 
 
 # One-off /stats report at a time the admin picked (/stats_at 5:00); kept in bot_settings to survive restarts.

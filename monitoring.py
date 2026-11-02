@@ -41,6 +41,7 @@ CRASH_ALERT_INTERVAL = 3600
 # Failures that describe the page itself. Blocks and timeouts say nothing about the link.
 DEAD_LINK_KINDS = frozenset({"catalog_missing", "invalid_redirect", "invalid_html", "invalid_response", "http_client"})
 DEAD_LINK_OK_WINDOW = 120.0
+DEAD_LINK_OWNER_COOLDOWN = 86400.0  # a flaky link must not repeat the same warning to its owner
 
 
 def group_sources(searches: list[dict]) -> dict[str, list[dict]]:
@@ -55,13 +56,13 @@ def group_sources(searches: list[dict]) -> dict[str, list[dict]]:
     return dict(groups)
 
 
-async def nothing_new_for_fanout(seen_store, task, collection, has_pro_catchup: bool) -> bool:
+async def nothing_new_for_fanout(seen_store, task, collection, has_catchup: bool) -> bool:
     """
     Top-3 may reshuffle (promoted lots rotate) while the page brings nothing new. When every ID
     already went through fanout for the same radar group, the DB fanout is a guaranteed no-op.
     The planner's own fast-skip guards still apply: periodic full scans, resume, calibration.
     """
-    if collection.fast_skipped or not task.can_fast_skip or has_pro_catchup:
+    if collection.fast_skipped or not task.can_fast_skip or has_catchup:
         return False
     return await seen_store.all_known(task.key, task.group_revision, (it.item_id for it in collection.items))
 
@@ -263,6 +264,8 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             "Подробности — в logs/errors.log."
         )
 
+    dead_link_warned_at: dict[int, float] = {}
+
     async def alert_dead_link(task: ScheduledScan, failure, streak: int):
         """The verdict comes from scans that already ran, so a user's bad link costs no extra requests."""
         if streak != config.SOURCE_DEAD_ALERT_STREAK or failure is None or failure.kind not in DEAD_LINK_KINDS:
@@ -285,12 +288,17 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         could otherwise bring a flood-wait on the admin chat."""
         for radar in task.radars:
             owner = int(radar.get("user_id") or 0)
+            radar_id = int(radar.get("id") or 0)
             if not owner or config.is_admin(owner):
                 continue
+            if time.monotonic() - dead_link_warned_at.get(radar_id, -DEAD_LINK_OWNER_COOLDOWN) < DEAD_LINK_OWNER_COOLDOWN:
+                continue
+            dead_link_warned_at[radar_id] = time.monotonic()
             text = (
                 f"{ui.e('warn')} <b>Радар не получает лоты</b>\n\n"
-                f"«{html.escape(str(radar.get('title') or 'Радар'))}»: Авито не отдаёт выдачу по этой ссылке.\n"
-                "Откройте поиск на Авито и пришлите адрес из строки браузера целиком."
+                f"«{html.escape(str(radar.get('title') or 'Радар'))}»: несколько проверок подряд Авито не отдал выдачу по этой ссылке.\n\n"
+                "Если поиск открывается в браузере, ничего делать не нужно: бот продолжит проверять. "
+                "Если нет, пришлите новую ссылку."
             )
             markup = ui.kb([ui.btn("Сменить ссылку", "refresh", callback_data=f"change_url:{radar.get('id')}")])
             try:
@@ -454,10 +462,9 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         attempts: list[str] = []
         scan_t0 = time.monotonic()
         max_age = max((min(30, max(1, int(r.get("max_age_minutes") or 5))) for r in task.radars), default=5)
-        has_pro_catchup = (
+        has_catchup = (
             task.previous_processed_at > 0
             and (now_epoch - task.previous_processed_at) > (max_age * 60)
-            and any(database.classify_user_tariff(r)[0] == "pro" for r in task.radars)
         )
         collection_max_age = config.CATCHUP_MAX_AGE_MINUTES
         collection_max_pages = max(1, int(config.BROAD_RADAR_MAX_PAGES))
@@ -490,7 +497,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                     task.key,
                     collection_max_age,
                     max_pages=collection_max_pages,
-                    can_fast_skip=(task.can_fast_skip and not has_pro_catchup),
+                    can_fast_skip=(task.can_fast_skip and not has_catchup),
                     read_next_page=page_is_all_new,
                     last_top_ids=task.last_top_ids,
                 )
@@ -516,7 +523,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         record_source_result(task, scan_client, ok, attempts)
         if ok and scan_client is not None:
             collection = dataclasses.replace(collection, channel=short_channel(scan_client.proxy_id, scan_client.masked_url))
-        if ok and await nothing_new_for_fanout(seen_store, task, collection, has_pro_catchup):
+        if ok and await nothing_new_for_fanout(seen_store, task, collection, has_catchup):
             collection = dataclasses.replace(collection, fast_skipped=True)
         gap = bool(collection.coverage_gap) if collection is not None else False
         fast_skipped = bool(collection.fast_skipped) if collection is not None else False
@@ -531,7 +538,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             coverage_gap=gap,
             revisit_seconds=revisit_seconds,
             due_lag_seconds=due_lag_seconds,
-            is_catchup=has_pro_catchup,
+            is_catchup=has_catchup,
             proxy_id=scan_client.proxy_id if scan_client is not None else "direct",
             masked_url=scan_client.masked_url if scan_client is not None else "direct",
             failure_kind=None if ok else (last_failure.kind if last_failure else ("unknown" if attempts else "no_channel")),

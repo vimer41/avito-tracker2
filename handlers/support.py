@@ -1,6 +1,7 @@
 import html
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -55,6 +56,71 @@ async def cb_support_cancel(call: CallbackQuery, state: FSMContext):
 
 # ── 2. Пользователь: отправка сообщения в поддержку ─────────────────────
 
+# Telegram counts 1024 characters of a caption and 4096 of a message, and the ticket header takes its share.
+TICKET_CAPTION_TEXT = 700
+TICKET_MESSAGE_TEXT = 3500
+TICKET_MEDIA_FIELDS = ("document", "voice", "video")
+
+
+def ticket_media(message: Message) -> tuple[str, str]:
+    if message.photo:
+        return "photo", message.photo[-1].file_id
+    for kind in TICKET_MEDIA_FIELDS:
+        media = getattr(message, kind)
+        if media:
+            return kind, media.file_id
+    return "", ""
+
+
+async def send_ticket_to_admin(bot: Bot, admin_id: int, ticket: dict) -> None:
+    created = datetime.fromtimestamp(ticket["created_epoch"], database.MSK_TZ).strftime("%d.%m.%Y %H:%M")
+    username = f"@{ticket['username']}" if ticket["username"] else "без username"
+    title = "ОБРАЩЕНИЕ ПО ОПЛАТЕ / ВОЗВРАТУ" if ticket["is_payment"] else "НОВОЕ ОБРАЩЕНИЕ В ПОДДЕРЖКУ!"
+    header = (
+        f"📩 <b>{title}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>От:</b> {html.escape(ticket['full_name'])} ({username})\n"
+        f"🆔 <b>ID:</b> <code>{ticket['user_id']}</code>\n"
+        f"🕒 <b>Время:</b> {created} МСК\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📝 <b>Текст:</b>\n"
+    )
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Ответить пользователю", callback_data=f"support_reply:{ticket['user_id']}")]
+    ])
+    text, kind = ticket["text"], ticket["media_type"]
+    limit = TICKET_CAPTION_TEXT if kind else TICKET_MESSAGE_TEXT
+    body = header + html.escape(text[:limit])
+    if kind:
+        send = getattr(bot, f"send_{kind}")
+        await send(chat_id=admin_id, caption=body, reply_markup=admin_kb, parse_mode="HTML", **{kind: ticket["file_id"]})
+    else:
+        await bot.send_message(chat_id=admin_id, text=body, reply_markup=admin_kb, parse_mode="HTML")
+    if text[limit:]:
+        await bot.send_message(chat_id=admin_id, text=f"📝 Продолжение:\n{html.escape(text[limit:])}", parse_mode="HTML")
+
+
+async def deliver_ticket(bot: Bot, ticket: dict) -> bool:
+    """One admin is enough. A saved ticket stays in support_outbox until that happens."""
+    delivered = False
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await send_ticket_to_admin(bot, admin_id, ticket)
+            delivered = True
+        except Exception as err:
+            logger.error(f"Не удалось отправить обращение в поддержку администратору {admin_id}: {err}")
+    if delivered:
+        await database.delete_support_ticket(ticket["id"])
+    return delivered
+
+
+async def retry_undelivered_tickets(bot: Bot) -> int:
+    delivered = 0
+    for ticket in await database.get_undelivered_support_tickets():
+        delivered += int(await deliver_ticket(bot, ticket))
+    return delivered
+
+
 @router.message(SupportStates.waiting_for_user_message)
 async def handle_user_support_message(message: Message, state: FSMContext, bot: Bot):
     user = message.from_user
@@ -65,71 +131,22 @@ async def handle_user_support_message(message: Message, state: FSMContext, bot: 
     if await route_menu_text(message, state):
         return
 
-    text_content = message.text or message.caption or "(без текста, вложение)"
+    text_content = (message.text or message.caption or "(без текста, вложение)").strip()
     state_data = await state.get_data()
-    clean_text = html.escape(text_content.strip())
-    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    username_str = f"@{user.username}" if user.username else "без username"
-
-    admin_caption = (
-        f"📩 <b>{'ОБРАЩЕНИЕ ПО ОПЛАТЕ / ВОЗВРАТУ' if state_data.get('payment_support') else 'НОВОЕ ОБРАЩЕНИЕ В ПОДДЕРЖКУ!'}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 <b>От:</b> {html.escape(user.full_name)} ({username_str})\n"
-        f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
-        f"🕒 <b>Время:</b> {now_str}\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"📝 <b>Текст:</b>\n{clean_text}"
-    )
-
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✍️ Ответить пользователю", callback_data=f"support_reply:{user_id}")]
-    ])
-
-    # Доставка сообщения всем администраторам бота
-    for aid in config.ADMIN_IDS:
-        try:
-            if message.photo:
-                photo_id = message.photo[-1].file_id
-                await bot.send_photo(
-                    chat_id=aid,
-                    photo=photo_id,
-                    caption=admin_caption,
-                    reply_markup=admin_kb,
-                    parse_mode="HTML"
-                )
-            elif message.document:
-                await bot.send_document(
-                    chat_id=aid,
-                    document=message.document.file_id,
-                    caption=admin_caption,
-                    reply_markup=admin_kb,
-                    parse_mode="HTML"
-                )
-            elif message.voice:
-                await bot.send_voice(
-                    chat_id=aid,
-                    voice=message.voice.file_id,
-                    caption=admin_caption,
-                    reply_markup=admin_kb,
-                    parse_mode="HTML"
-                )
-            elif message.video:
-                await bot.send_video(
-                    chat_id=aid,
-                    video=message.video.file_id,
-                    caption=admin_caption,
-                    reply_markup=admin_kb,
-                    parse_mode="HTML"
-                )
-            else:
-                await bot.send_message(
-                    chat_id=aid,
-                    text=admin_caption,
-                    reply_markup=admin_kb,
-                    parse_mode="HTML"
-                )
-        except Exception as err:
-            logger.error(f"Не удалось отправить обращение в поддержку администратору {aid}: {err}")
+    media_type, file_id = ticket_media(message)
+    ticket = {
+        "user_id": user_id,
+        "full_name": user.full_name,
+        "username": user.username or "",
+        "text": text_content,
+        "media_type": media_type,
+        "file_id": file_id,
+        "is_payment": bool(state_data.get("payment_support")),
+        "created_epoch": time.time(),
+    }
+    ticket["id"] = await database.save_support_ticket(**ticket)
+    if not await deliver_ticket(bot, ticket):
+        logger.warning("Обращение #%s пока не доставлено, повторю позже", ticket["id"])
 
     await state.clear()
 
@@ -241,12 +258,8 @@ async def handle_admin_quote_reply(message: Message, state: FSMContext, bot: Bot
     replied = message.reply_to_message
     replied_text = replied.text or replied.caption or ""
 
-    # Извлекаем ID пользователя из текста оригинального сообщения
-    m = (
-        re.search(r"🆔\s*<b>ID:</b>\s*<code>(\d+)</code>", replied_text)
-        or re.search(r"ID:\s*<code>(\d+)</code>", replied_text)
-        or re.search(r"<code>(\d{6,})</code>", replied_text)
-    )
+    # Извлекаем ID пользователя: Telegram отдаёт текст уже без HTML-тегов
+    m = re.search(r"🆔\s*ID:\s*(\d+)", replied_text)
     if not m:
         return
 

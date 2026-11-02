@@ -1,5 +1,6 @@
 import html
 import logging
+import time
 from typing import Callable, Dict, Any, Awaitable
 from aiogram import BaseMiddleware, Bot
 from aiogram.exceptions import TelegramBadRequest
@@ -14,6 +15,19 @@ from logger_setup import log_user_event
 from runtime_metrics import sanitize_proxy_credentials
 
 logger = logging.getLogger(__name__)
+
+EXPIRED_ALERT_INTERVAL = 3600.0  # one person pressing buttons must not flood the admin chat
+_expired_alert_at: dict[int, float] = {}
+
+
+def expired_alert_due(user_id: int) -> bool:
+    now = time.monotonic()
+    if now - _expired_alert_at.get(user_id, -EXPIRED_ALERT_INTERVAL) < EXPIRED_ALERT_INTERVAL:
+        return False
+    if len(_expired_alert_at) > 5000:
+        _expired_alert_at.clear()
+    _expired_alert_at[user_id] = now
+    return True
 
 
 class ActionLoggingMiddleware(BaseMiddleware):
@@ -187,6 +201,9 @@ class AccessControlMiddleware(BaseMiddleware):
             await event.answer("Срок действия доступа истёк. Выберите тариф или напишите в поддержку.", show_alert=True)
 
         # 6. Отправляем запрос администраторам
+        if not expired_alert_due(user_id):
+            return
+
         user_msg = f"\n💬 <b>Сообщение:</b> <i>«{html.escape(event.text[:250])}»</i>" if (isinstance(event, Message) and event.text) else ""
         admin_text = (
             "🔔 <b>Пользователь с истёкшим доступом пишет в бот:</b>\n\n"

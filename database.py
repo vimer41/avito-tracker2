@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import aiosqlite
 import config
+import radar_filters
 from config import DB_PATH, ADMIN_ID, ADMIN_IDS, MAX_SEARCHES_PER_USER
 
 logger = logging.getLogger(__name__)
@@ -224,6 +225,30 @@ def invalidate_blacklist_cache(user_id: int | None = None) -> None:
         _BLACKLIST_CACHE.clear()
     else:
         _BLACKLIST_CACHE.pop(int(user_id), None)
+
+
+async def _add_seller_key_column(db) -> None:
+    """Two sellers may share a name, so the key has to join the UNIQUE rule: that needs a table rebuild."""
+    async with db.execute("PRAGMA table_info(blocked_sellers)") as cursor:
+        if "seller_key" in {row[1] for row in await cursor.fetchall()}:
+            return
+    await db.execute("ALTER TABLE blocked_sellers RENAME TO blocked_sellers_old")
+    await db.execute("""
+        CREATE TABLE blocked_sellers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            seller_name TEXT NOT NULL,
+            seller_key TEXT NOT NULL DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, seller_name, seller_key) ON CONFLICT IGNORE,
+            FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+        );
+    """)
+    await db.execute("""
+        INSERT INTO blocked_sellers (id, user_id, seller_name, created_at)
+        SELECT id, user_id, seller_name, created_at FROM blocked_sellers_old
+    """)
+    await db.execute("DROP TABLE blocked_sellers_old")
 
 
 async def ensure_columns(db, table: str, columns: dict[str, str]):
@@ -697,6 +722,7 @@ async def init_db():
             "delivery_only": "INTEGER DEFAULT 0",
             "hide_promoted": "INTEGER DEFAULT 0",
             "reply_template": "TEXT DEFAULT ''",
+            "pause_reason": "TEXT DEFAULT ''",
         })
         await db.execute("UPDATE searches SET is_active = 1 WHERE is_active IS NULL;")
         await db.execute("UPDATE searches SET stop_words = '[]' WHERE stop_words IS NULL;")
@@ -725,9 +751,24 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 seller_name TEXT NOT NULL,
+                seller_key TEXT NOT NULL DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, seller_name) ON CONFLICT IGNORE,
+                UNIQUE(user_id, seller_name, seller_key) ON CONFLICT IGNORE,
                 FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+            );
+        """)
+        await _add_seller_key_column(db)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS support_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                full_name TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL DEFAULT '',
+                text TEXT NOT NULL DEFAULT '',
+                media_type TEXT NOT NULL DEFAULT '',
+                file_id TEXT NOT NULL DEFAULT '',
+                is_payment INTEGER NOT NULL DEFAULT 0,
+                created_epoch REAL NOT NULL
             );
         """)
 
@@ -960,6 +1001,88 @@ def _plan_max_radars(plan: str, is_allowed: bool, trial_used: bool) -> int:
     return config.TRIAL_RADARS
 
 
+PAUSE_LIMIT = "limit"      # paused by the bot: the radar does not fit the tariff
+PAUSE_BLOCKED = "blocked"  # paused by the bot: the user blocked it
+
+
+async def sync_radar_limit_in_transaction(db, user_id: int) -> None:
+    """Running radars fit the tariff: extras pause, and radars paused for this reason return when room appears."""
+    if user_id in ADMIN_IDS:
+        return
+    async with db.execute(
+        "SELECT tariff_plan, is_allowed, trial_used, extra_radars FROM users WHERE user_id = ?", (user_id,)
+    ) as cursor:
+        user = await cursor.fetchone()
+    if user is None:
+        return
+    plan = (user[0] or "standart").lower()
+    limit = _plan_max_radars(plan, bool(user[1]), bool(user[2])) + int(user[3] or 0)
+    async with db.execute(
+        "SELECT id, is_active, pause_reason FROM searches WHERE user_id = ? ORDER BY id", (user_id,)
+    ) as cursor:
+        rows = await cursor.fetchall()
+    active = [row[0] for row in rows if row[1]]
+    waiting = [row[0] for row in rows if not row[1] and row[2] == PAUSE_LIMIT]
+    if active[limit:]:
+        await db.executemany(
+            "UPDATE searches SET is_active = 0, pause_reason = ? WHERE id = ?",
+            [(PAUSE_LIMIT, radar_id) for radar_id in active[limit:]],
+        )
+    returning = waiting[: max(0, limit - len(active))]
+    if returning:
+        await db.executemany(
+            "UPDATE searches SET is_active = 1, pause_reason = '' WHERE id = ?",
+            [(radar_id,) for radar_id in returning],
+        )
+
+
+async def sync_radar_limit(user_id: int) -> None:
+    async with writer_connection() as db:
+        await sync_radar_limit_in_transaction(db, user_id)
+        await db.commit()
+
+
+async def enforce_radar_limits() -> None:
+    """Startup pass for radars left over a limit before the limit covered running radars."""
+    async with reader_connection() as db:
+        async with db.execute("SELECT DISTINCT user_id FROM searches WHERE is_active = 1") as cursor:
+            user_ids = [int(row[0]) for row in await cursor.fetchall()]
+    for user_id in user_ids:
+        await sync_radar_limit(user_id)
+
+
+async def count_limit_paused(user_id: int) -> int:
+    async with reader_connection() as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM searches WHERE user_id = ? AND is_active = 0 AND pause_reason = ?",
+            (user_id, PAUSE_LIMIT),
+        ) as cursor:
+            return int((await cursor.fetchone())[0])
+
+
+async def resume_blocked_searches(user_id: int) -> int:
+    """The user is back after blocking the bot: their radars run again, within the tariff."""
+    async with writer_connection() as db:
+        cursor = await db.execute(
+            "UPDATE searches SET is_active = 1, pause_reason = '' WHERE user_id = ? AND pause_reason = ?",
+            (user_id, PAUSE_BLOCKED),
+        )
+        resumed = max(0, int(cursor.rowcount or 0))
+        if resumed:
+            await sync_radar_limit_in_transaction(db, user_id)
+        await db.commit()
+        return resumed
+
+
+def subscription_seconds_left(user: dict) -> int:
+    raw = str(user.get("subscription_until") or "").strip()[:19]
+    try:
+        until = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return 0
+    return max(0, int((until - datetime.now(timezone.utc)).total_seconds()))
+
+
 async def get_user_max_radars(user_id: int) -> int:
     """Tariff limit plus the extra radars an admin granted (admins start from MAX_SEARCHES_PER_USER)."""
     if user_id in ADMIN_IDS:
@@ -980,6 +1103,7 @@ async def change_user_extra_radars(user_id: int, delta: int) -> int:
             "UPDATE users SET extra_radars = MAX(0, COALESCE(extra_radars, 0) + ?) WHERE user_id = ?",
             (int(delta), user_id),
         )
+        await sync_radar_limit_in_transaction(db, user_id)
         await db.commit()
         async with db.execute("SELECT extra_radars FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
@@ -1005,6 +1129,7 @@ async def set_user_allowed(user_id: int, is_allowed: int = 1):
             "UPDATE users SET is_allowed = ?, subscription_until = NULL, trial_used = 1, subscription_revision = subscription_revision + 1 WHERE user_id = ?",
             (int(bool(is_allowed)), user_id),
         )
+        await sync_radar_limit_in_transaction(db, user_id)
         await db.commit()
 
 
@@ -1062,6 +1187,7 @@ async def grant_vip_access(user_id: int, tariff_plan: str = "pro") -> Dict[str, 
                 subscription_revision = subscription_revision + 1
             WHERE user_id = ?
         """, (plan, user_id))
+        await sync_radar_limit_in_transaction(db, user_id)
         await db.commit()
     user = await get_user(user_id)
     return user or {}
@@ -1078,6 +1204,7 @@ async def reset_user_trial(user_id: int) -> Dict[str, Any]:
                 subscription_revision = subscription_revision + 1
             WHERE user_id = ?
         """, (user_id,))
+        await sync_radar_limit_in_transaction(db, user_id)
         await db.commit()
     user = await get_user(user_id)
     return user or {}
@@ -1330,6 +1457,7 @@ async def count_user_searches(user_id: int) -> int:
 
 
 async def toggle_search_active(search_id: int, user_id: int) -> Optional[bool]:
+    max_radars = await get_user_max_radars(user_id)
     async with writer_connection() as db:
         async with db.execute("SELECT is_active FROM searches WHERE id = ? AND user_id = ?", (search_id, user_id)) as cursor:
             row = await cursor.fetchone()
@@ -1337,8 +1465,15 @@ async def toggle_search_active(search_id: int, user_id: int) -> Optional[bool]:
                 return None
             new_status = 0 if row[0] == 1 else 1
 
+        if new_status and user_id not in ADMIN_IDS:
+            async with db.execute(
+                "SELECT COUNT(*) FROM searches WHERE user_id = ? AND is_active = 1", (user_id,)
+            ) as cursor:
+                if (await cursor.fetchone())[0] >= max_radars:
+                    raise RadarLimitError(f"Тариф вмещает работающих радаров: {max_radars}")
+
         await db.execute(
-            "UPDATE searches SET is_active = ? WHERE id = ? AND user_id = ?",
+            "UPDATE searches SET is_active = ?, pause_reason = '' WHERE id = ? AND user_id = ?",
             (new_status, search_id, user_id)
         )
         await db.commit()
@@ -1532,14 +1667,14 @@ async def get_all_active_searches() -> List[Dict[str, Any]]:
             return results
 
 
-async def add_blocked_seller(user_id: int, seller_name: str) -> bool:
+async def add_blocked_seller(user_id: int, seller_name: str, seller_key: str = "") -> bool:
     name = seller_name.strip()
     if not name or name.lower() in {"продавец", "пользователь", "авито", "компания", "частное лицо"}:
         return False
     async with writer_connection() as db:
         await db.execute(
-            "INSERT OR IGNORE INTO blocked_sellers (user_id, seller_name) VALUES (?, ?)",
-            (user_id, name)
+            "INSERT OR IGNORE INTO blocked_sellers (user_id, seller_name, seller_key) VALUES (?, ?, ?)",
+            (user_id, name, (seller_key or "").strip())
         )
         await db.commit()
     invalidate_blacklist_cache(user_id)
@@ -1577,14 +1712,14 @@ async def get_blocked_sellers_for_users(user_ids: Sequence[int]) -> dict[int, se
         fetched: dict[int, set[str]] = {uid: set() for uid in missing_ids}
         async with reader_connection() as db:
             async with db.execute(
-                f"SELECT user_id, seller_name FROM blocked_sellers WHERE user_id IN ({placeholders})",
+                f"SELECT user_id, seller_name, seller_key FROM blocked_sellers WHERE user_id IN ({placeholders})",
                 tuple(missing_ids),
             ) as cur:
                 for row in await cur.fetchall():
                     uid = int(row[0])
-                    sname = str(row[1] or "").lower().strip()
-                    if sname:
-                        fetched[uid].add(sname)
+                    token = radar_filters.seller_token(row[2]) if row[2] else str(row[1] or "").lower().strip()
+                    if token:
+                        fetched[uid].add(token)
         for uid, sset in fetched.items():
             _BLACKLIST_CACHE[uid] = (now, set(sset))
             result[uid] = sset
@@ -2998,6 +3133,20 @@ async def grant_subscription_in_transaction(db, user_id: int, days: int, tariff_
     if tariff_plan is not None and tariff_plan.lower() not in (*config.PAID_PLANS, "test"):
         raise ValueError("Unknown tariff plan")
     effective_plan = "standart" if (tariff_plan and tariff_plan.lower() == "test") else (tariff_plan.lower() if tariff_plan else None)
+    async with db.execute("""
+        SELECT tariff_plan, is_allowed, subscription_until FROM users WHERE user_id = ?
+    """, (user_id,)) as cursor:
+        current = await cursor.fetchone()
+    if current is None:
+        raise ValueError("Пользователь не найден")
+    # A trial has is_allowed = 0: its hours are free and are not converted.
+    if current[1] and effective_plan and effective_plan != (current[0] or "").lower():
+        left = subscription_seconds_left({"subscription_until": current[2]})
+        if left:
+            await db.execute(
+                "UPDATE users SET subscription_until = datetime('now', '+' || ? || ' seconds') WHERE user_id = ?",
+                (config.plan_switch_seconds(current[0], effective_plan, left), user_id),
+            )
     cursor = await db.execute("""
         UPDATE users
         SET subscription_until = datetime(
@@ -3010,6 +3159,7 @@ async def grant_subscription_in_transaction(db, user_id: int, days: int, tariff_
     """, (days, effective_plan, user_id))
     if cursor.rowcount != 1:
         raise ValueError("Пользователь не найден")
+    await sync_radar_limit_in_transaction(db, user_id)
     async with db.execute("SELECT subscription_until FROM users WHERE user_id = ?", (user_id,)) as cursor:
         return (await cursor.fetchone())[0]
 
@@ -3068,7 +3218,10 @@ async def apply_admin_subscription_action(token: str, admin_id: int) -> Dict[str
 
 async def deactivate_user_searches(user_id: int):
     async with writer_connection() as db:
-        await db.execute("UPDATE searches SET is_active = 0 WHERE user_id = ?", (user_id,))
+        await db.execute(
+            "UPDATE searches SET is_active = 0, pause_reason = ? WHERE user_id = ? AND is_active = 1",
+            (PAUSE_BLOCKED, user_id),
+        )
         await db.commit()
 
 
@@ -3296,6 +3449,29 @@ def create_database_backup_file() -> Optional[str]:
         return None
 
 
+async def save_support_ticket(user_id: int, full_name: str, username: str, text: str,
+                              media_type: str, file_id: str, is_payment: bool, created_epoch: float) -> int:
+    async with writer_connection() as db:
+        cursor = await db.execute("""
+            INSERT INTO support_outbox (user_id, full_name, username, text, media_type, file_id, is_payment, created_epoch)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, full_name, username, text, media_type, file_id, int(is_payment), created_epoch))
+        await db.commit()
+        return int(cursor.lastrowid)
+
+
+async def get_undelivered_support_tickets(limit: int = 20) -> List[Dict[str, Any]]:
+    async with reader_connection() as db:
+        async with db.execute("SELECT * FROM support_outbox ORDER BY id LIMIT ?", (limit,)) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+
+async def delete_support_ticket(ticket_id: int) -> None:
+    async with writer_connection() as db:
+        await db.execute("DELETE FROM support_outbox WHERE id = ?", (ticket_id,))
+        await db.commit()
+
+
 async def purge_user_by_pattern(pattern: str) -> Dict[str, Any]:
     clean = pattern.strip().lstrip("@").lower()
     if not clean:
@@ -3340,6 +3516,7 @@ async def purge_user_by_pattern(pattern: str) -> Dict[str, Any]:
             await db.execute("DELETE FROM notification_outbox WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM searches WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM blocked_sellers WHERE user_id = ?", (uid,))
+            await db.execute("DELETE FROM support_outbox WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM admin_subscription_actions WHERE user_id = ? AND applied_at IS NULL", (uid,))
             await db.execute("DELETE FROM users WHERE user_id = ?", (uid,))
             invalidate_blacklist_cache(uid)

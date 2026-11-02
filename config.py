@@ -298,6 +298,8 @@ STARS_PRICE_LITE = int(os.getenv("STARS_PRICE_BASIC", "199"))
 STARS_PRICE_STANDART = int(os.getenv("STARS_PRICE_MEDIUM", "449"))
 STARS_PRICE_PRO = int(os.getenv("STARS_PRICE_FULL", "899"))
 STARS_PRICE_TEST = int(os.getenv("STARS_PRICE_TEST", "10"))
+# Hidden 1-day plan for checking checkout end to end. Off, it cannot be bought even with a forged button.
+STARS_TEST_ENABLED = os.getenv("STARS_TEST_ENABLED", "0").strip() == "1"
 STARS_PRICE_MAX = 100000
 STARS_SUBSCRIPTION_DAYS = 30
 if min(STARS_PRICE_LITE, STARS_PRICE_STANDART, STARS_PRICE_PRO, STARS_PRICE_TEST) <= 0:
@@ -352,6 +354,14 @@ def plan_radars(plan: str | None) -> int:
 
 def plan_interval(plan: str | None) -> int:
     return int(TARIFF_SCAN_INTERVAL.get((plan or "standart").lower(), TARIFF_SCAN_INTERVAL["standart"]))
+
+
+def plan_switch_seconds(old_plan: str | None, new_plan: str | None, seconds_left: int) -> int:
+    """Paid time keeps its value in Stars when the tariff changes: cheap days must not become expensive ones."""
+    old, new = (old_plan or "").lower(), (new_plan or "").lower()
+    if old == new or old not in PAID_PLANS or new not in PAID_PLANS or seconds_left <= 0:
+        return max(0, int(seconds_left))
+    return int(seconds_left * stars_price(old) / stars_price(new))
 
 
 def parse_proxy(raw_proxy: str | None) -> str | None:

@@ -574,12 +574,11 @@ async def send_ad_to_user(
     search_ids: Optional[List[int]] = None,
     is_catchup: bool = False,
     possible_duplicate_after_crash: bool = False,
-    allow_uncached_photo: bool = False,
     preverified_delivery: bool = False,
     silent: bool = False,
     reply_template: str = "",
 ) -> bool:
-    """Deliver notification to Telegram user with tariff-aware photo pipeline."""
+    """Deliver notification to Telegram user: file_id cache, then photo by URL, then upload, then text."""
     caption = build_notification_text(
         it,
         search_title,
@@ -632,8 +631,8 @@ async def send_ad_to_user(
         except Exception as cache_err:
             logger.debug(f"file_id кэш сбой ({cache_err}), пробуем следующий путь...")
 
-    # 2. Для Standart/PRO/admin: прямая отправка по image_url -> single-flight BufferedInputFile
-    if allow_uncached_photo and it.image_url:
+    # 2. Прямая отправка по image_url -> single-flight BufferedInputFile
+    if it.image_url:
         try:
             if not await prepare_send():
                 return False
@@ -703,7 +702,7 @@ async def send_ad_to_user(
                         except Exception as upload_err:
                             logger.debug(f"BufferedInputFile сбой ({upload_err}), отправляем текст...")
 
-    # 3. Фолбэк (и базовый путь для тарифа base): отправляем текстом с превью ссылки
+    # 3. Фолбэк: фото не вышло, отправляем текстом
     for _ in range(2):
         try:
             if not await prepare_send():
@@ -894,17 +893,15 @@ async def process_collected_group_fanout(
             parsed_u = urlparse(radar.get("url", ""))
             q_val = parse_qs(parsed_u.query).get("q", [""])[0].strip()
             if q_val:
-                keywords = [w.lower() for w in re.findall(r"[\w\d]+", q_val) if len(w) >= 2]
-                if keywords:
-                    matching_title_items = []
-                    for it in new_items:
-                        if any(kw in it.title.lower() for kw in keywords):
-                            matching_title_items.append(it)
-                        else:
-                            logger.debug(
-                                f"  {w_tag}🏷 [ТОЛЬКО В НАЗВАНИИ] Отсеян лот «{it.title[:35]}» (нет '{q_val}' в заголовке) [{user_str}]"
-                            )
-                    new_items = matching_title_items
+                matching_title_items = []
+                for it in new_items:
+                    if radar_filters.title_matches(it.title, q_val):
+                        matching_title_items.append(it)
+                    else:
+                        logger.debug(
+                            f"  {w_tag}🏷 [ТОЛЬКО В НАЗВАНИИ] Отсеян лот «{it.title[:35]}» (нет '{q_val}' в заголовке) [{user_str}]"
+                        )
+                new_items = matching_title_items
 
         if not new_items:
             METRICS.record_fanout_items(new=len(all_new_candidates), title=len(all_new_candidates))
@@ -919,10 +916,8 @@ async def process_collected_group_fanout(
         max_age_min = 5 if (not max_age_raw or int(max_age_raw) <= 0) else min(30, int(max_age_raw))
 
         tariff, priority, delay_sec = database.classify_user_tariff(radar)
-        is_pro_or_admin = (tariff == "pro")
         is_downtime_catchup = (
-            is_pro_or_admin
-            and previous_processed_at > 0
+            previous_processed_at > 0
             and (now_epoch - previous_processed_at) > (max_age_min * 60)
         )
         radar_created_epoch = parse_created_epoch(radar)
@@ -954,7 +949,7 @@ async def process_collected_group_fanout(
                 stop_word_hits += 1
                 logger.debug(f"Отсеяно по стоп-слову «{matched_stop}» [{user_str}]: «{it.title[:30]}»")
                 continue
-            if it.seller_name and it.seller_name.lower().strip() in blocked_sellers:
+            if radar_filters.seller_is_blocked(it, blocked_sellers):
                 seller_hits += 1
                 logger.debug(f"Отсеян продавец «{it.seller_name}» из ЧС [{user_str}]")
                 continue
@@ -974,7 +969,7 @@ async def process_collected_group_fanout(
             title=len(all_new_candidates) - len(new_items),
         )
 
-        # In downtime catch-up mode for PRO/admin, cap to CATCHUP_MAX_ITEMS (10) newest items
+        # In downtime catch-up mode, cap to CATCHUP_MAX_ITEMS (10) newest items
         omitted_catchup_ids: set[str] = set()
         if is_downtime_catchup and len(deliverable_items) > config.CATCHUP_MAX_ITEMS:
             kept = deliverable_items[: config.CATCHUP_MAX_ITEMS]
@@ -1086,20 +1081,16 @@ async def process_url_group(
     try:
         parser.last_coverage_gap = False
         max_age = max((min(30, max(1, int(radar.get("max_age_minutes") or 5))) for radar in radars_for_url), default=5)
-        has_pro_catchup = (
-            previous_processed_at > 0
-            and (time.time() - previous_processed_at) > (max_age * 60)
-            and any(database.classify_user_tariff(r)[0] == "pro" for r in radars_for_url)
-        )
-        collection_max_age = config.CATCHUP_MAX_AGE_MINUTES if has_pro_catchup else max_age
-        collection_max_pages = config.CATCHUP_MAX_PAGES if has_pro_catchup else config.AVITO_MAX_PAGES_PER_SCAN
+        has_catchup = previous_processed_at > 0 and (time.time() - previous_processed_at) > (max_age * 60)
+        collection_max_age = config.CATCHUP_MAX_AGE_MINUTES if has_catchup else max_age
+        collection_max_pages = config.CATCHUP_MAX_PAGES if has_catchup else config.AVITO_MAX_PAGES_PER_SCAN
 
         collection = await collect_source(
             parser,
             clean_url,
             collection_max_age,
             max_pages=collection_max_pages,
-            can_fast_skip=(can_fast_skip and not has_pro_catchup),
+            can_fast_skip=(can_fast_skip and not has_catchup),
             last_top_ids=last_top_ids,
         )
         if collection is None:
@@ -1234,7 +1225,7 @@ async def _prepare_delivery(row: dict) -> Optional[dict]:
             return None
 
     blocked = await database.get_blocked_sellers(user_id)
-    if item.seller_name and item.seller_name.lower().strip() in blocked:
+    if radar_filters.seller_is_blocked(item, blocked):
         await database.discard_notification(notification_id, token)
         return None
 
@@ -1345,7 +1336,6 @@ async def deliver_notification(bot: Bot, parser: Optional[AvitoParser], row: dic
             search_ids=ctx["radar_ids"],
             is_catchup=ctx["is_catchup"],
             possible_duplicate_after_crash=ctx["possible_dup"],
-            allow_uncached_photo=(ctx["tariff"] in ("pro", "standart")),
             preverified_delivery=bool(row.get("_fast_claimed")),
             silent=ctx["silent"],
             reply_template=ctx["reply_template"],
@@ -1372,6 +1362,7 @@ async def deliver_notification(bot: Bot, parser: Optional[AvitoParser], row: dic
             chat=user_id,
             retry_after=exc.retry_after,
         )
+        pause_flooded_chat(user_id, retry_delay)
         await database.release_notification(notification_id, token, retry_delay)
         return False
     except Exception as exc:
@@ -1401,7 +1392,28 @@ def build_digest_text(entries: list[dict]) -> str:
             line += f" · <i>{html.escape(ctx['radar_titles'][0])}</i>"
         lines.append(line)
     lines += ["", "<i>Лотов много — прислал списком, чтобы не упереться в лимит Telegram.</i>"]
+    has_copy = any(radar_filters.render_reply(ctx.get("reply_template"), ctx["item"]) for ctx in entries)
+    if has_copy or any(ctx["item"].seller_name for ctx in entries):
+        hints = [f"{ui.e('ban')} скрыть продавца"] + ([f"{ui.e('write')} скопировать сообщение"] if has_copy else [])
+        lines.append(f"<i>Цифры на кнопках — номера лотов: {', '.join(hints)}.</i>")
     return "\n".join(lines)
+
+
+def build_digest_keyboard(entries: list[dict]) -> Optional[InlineKeyboardMarkup]:
+    """Numbered per-lot buttons: a list message has no room for a full keyboard under each lot."""
+    copy_buttons, ban_buttons = [], []
+    for index, ctx in enumerate(entries, 1):
+        reply_text = radar_filters.render_reply(ctx.get("reply_template"), ctx["item"])
+        if reply_text:
+            copy_buttons.append(ui.btn(str(index), "write", copy_text=CopyTextButton(text=reply_text)))
+        if ctx["item"].seller_name:
+            ban_buttons.append(ui.btn(str(index), "ban", callback_data=f"ban_seller:{ctx['id']}"))
+    rows = [
+        buttons[start:start + 5]
+        for buttons in (copy_buttons, ban_buttons)
+        for start in range(0, len(buttons), 5)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
 async def deliver_digest(bot: Bot, parser: Optional[AvitoParser], rows: list[dict]) -> int:
@@ -1426,7 +1438,11 @@ async def deliver_digest(bot: Bot, parser: Optional[AvitoParser], rows: list[dic
 
     if len(ready) < max(2, int(config.NOTIFICATION_DIGEST_MIN)):
         delivered = 0
-        for row, _ in ready:
+        for row, ctx in ready:
+            left = flood_seconds_left(ctx["user_id"])
+            if left > 0:
+                await database.release_notification(ctx["id"], ctx["token"], left)
+                continue
             delivered += int(await deliver_notification(bot, parser, row))
         return delivered
 
@@ -1441,6 +1457,7 @@ async def deliver_digest(bot: Bot, parser: Optional[AvitoParser], rows: list[dic
             text=build_digest_text([ctx for _, ctx in ready]),
             parse_mode="HTML",
             disable_web_page_preview=True,
+            reply_markup=build_digest_keyboard([ctx for _, ctx in ready]),
             disable_notification=all(ctx.get("silent") for _, ctx in ready),
         )
     except asyncio.CancelledError:
@@ -1463,6 +1480,7 @@ async def deliver_digest(bot: Bot, parser: Optional[AvitoParser], rows: list[dic
             chat=user_id,
             retry_after=exc.retry_after,
         )
+        pause_flooded_chat(user_id, retry_delay)
         for row, ctx in ready:
             await database.release_notification(ctx["id"], ctx["token"], retry_delay)
         return 0
@@ -1482,13 +1500,30 @@ async def deliver_digest(bot: Bot, parser: Optional[AvitoParser], rows: list[dic
 # Chats a sender is working on right now. Other senders skip them, so one flooded chat
 # waiting for its Telegram per-chat slot never blocks notifications to everybody else.
 CHATS_IN_DELIVERY: dict[int, int] = {}
+# Chat -> monotonic moment Telegram allows it again. Sending earlier only prolongs the ban.
+CHATS_IN_FLOOD: dict[int, float] = {}
+
+
+def pause_flooded_chat(chat_id: int, seconds: float) -> None:
+    CHATS_IN_FLOOD[chat_id] = time.monotonic() + float(seconds)
+
+
+def flood_seconds_left(chat_id: int) -> float:
+    return max(0.0, CHATS_IN_FLOOD.get(chat_id, 0.0) - time.monotonic())
+
+
+def flooded_chats() -> list[int]:
+    now = time.monotonic()
+    for chat_id in [chat_id for chat_id, until in CHATS_IN_FLOOD.items() if until <= now]:
+        CHATS_IN_FLOOD.pop(chat_id, None)
+    return list(CHATS_IN_FLOOD)
 
 
 async def notification_worker(bot: Bot, parser: Optional[AvitoParser] = None, worker_id: int = 1):
     logger.info("📬 Persistent Outbox #%s started", worker_id)
     while True:
         try:
-            row = await database.claim_notification_event(exclude_user_ids=list(CHATS_IN_DELIVERY))
+            row = await database.claim_notification_event(exclude_user_ids=[*CHATS_IN_DELIVERY, *flooded_chats()])
             if row is None:
                 NOTIFICATION_WAKEUP_EVENT.clear()
                 try:

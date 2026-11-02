@@ -16,6 +16,8 @@ class PaymentValidationError(ValueError):
 async def create_order(user_id: int, plan: str) -> dict[str, Any]:
     if not config.STARS_PAYMENTS_ENABLED:
         raise PaymentValidationError("Приём платежей временно выключен.")
+    if plan == "test" and not config.STARS_TEST_ENABLED:
+        raise PaymentValidationError("Этот тариф недоступен. Откройте список тарифов заново.")
     amount = config.stars_price(plan)
     days = 1 if plan == "test" else config.STARS_SUBSCRIPTION_DAYS
     user = await database.get_user(user_id)
@@ -183,6 +185,7 @@ async def complete_refund(charge_id: str) -> dict[str, Any]:
                 UPDATE users SET subscription_until = ?, tariff_plan = ?, is_allowed = ?, trial_used = ?,
                     subscription_revision = subscription_revision + 1 WHERE user_id = ?
             """, (row["subscription_before"], row["tariff_before"], row["allowed_before"], row["trial_before"], row["user_id"]))
+            await database.sync_radar_limit_in_transaction(db, row["user_id"])
         await db.execute("""
             UPDATE stars_orders SET status = 'refunded', refunded_at = datetime('now'), refund_needs_review = ? WHERE id = ?
         """, (int(review), row["id"]))

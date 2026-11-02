@@ -22,6 +22,9 @@ MARKET_MAX_PERCENT = 70    # a deeper one is usually another product: a case in 
 
 CLEAR_WORDS = frozenset({"0", "-", "нет", "сброс", "убрать"})
 _PRICE_GROUP_RE = re.compile(r"(?<=\d)[ .](?=\d{3}\b)")
+_PRICE_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(млн|лям\w*|m\b|м\b|тыс\w*|т\b|к\b|k\b)?")
+PRICE_MAX = 10_000_000_000
+TITLE_WORD_RE = re.compile(r"[\w\d]+")
 
 
 def parse_words(raw: Any) -> list[str]:
@@ -51,14 +54,27 @@ def parse_price_range(text: str) -> Optional[tuple[int, int]]:
     value = (text or "").lower().replace("\xa0", " ").replace("₽", "").replace("руб", "").strip(" .")
     if value in CLEAR_WORDS:
         return 0, 0
-    value = _PRICE_GROUP_RE.sub("", value)
-    numbers = re.findall(r"\d+", value)
-    if not numbers or len(numbers) > 2 or any(len(number) > 10 for number in numbers):
+    tokens = _PRICE_RE.findall(_PRICE_GROUP_RE.sub("", value))
+    if not tokens or len(tokens) > 2:
         return None
-    if len(numbers) == 2:
-        low, high = sorted(int(number) for number in numbers)
+    numbers = [float(number.replace(",", ".")) for number, _unit in tokens]
+    scales = [_price_scale(unit) for _number, unit in tokens]
+    # «10-50 тыс»: the unit is written once, after the second number.
+    if len(tokens) == 2 and not tokens[0][1] and numbers[0] <= numbers[1]:
+        scales[0] = scales[1]
+    prices = [round(number * scale) for number, scale in zip(numbers, scales)]
+    if max(prices) > PRICE_MAX:
+        return None
+    if len(prices) == 2:
+        low, high = sorted(prices)
         return low, high
-    return (0, int(numbers[0])) if "до" in value else (int(numbers[0]), 0)
+    return (0, prices[0]) if "до" in value else (prices[0], 0)
+
+
+def _price_scale(unit: str) -> int:
+    if not unit:
+        return 1
+    return 1_000_000 if unit[0] in "мmл" else 1000
 
 
 def format_rub(value: int) -> str:
@@ -95,6 +111,27 @@ def filter_reason(item: Any, radar: dict) -> Optional[str]:
         if not any(word in text for word in words):
             return "must_words"
     return None
+
+
+def seller_token(seller_key: str) -> str:
+    """Blacklist entry of a seller known by id. Prefixed, so it can never equal a seller's name."""
+    return f"key:{seller_key}"
+
+
+def seller_is_blocked(item: Any, blocked: Iterable[str]) -> bool:
+    """A seller name is not unique, so a name only counts for old entries saved without an id."""
+    key = getattr(item, "seller_key", None)
+    if key and seller_token(key) in blocked:
+        return True
+    name = (item.seller_name or "").lower().strip()
+    return bool(name) and name in blocked
+
+
+def title_matches(title: str, query: str) -> bool:
+    """Every word of the query is in the title. The last two letters are ignored: «кроссовки» finds «кроссовок»."""
+    text = (title or "").lower()
+    words = [word for word in TITLE_WORD_RE.findall((query or "").lower()) if len(word) >= 2]
+    return all((word if len(word) <= 4 or word.isdigit() else word[:-2]) in text for word in words)
 
 
 def summary(radar: dict) -> str:

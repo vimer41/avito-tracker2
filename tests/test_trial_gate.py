@@ -115,7 +115,8 @@ class TestOfferInMiddleware(unittest.IsolatedAsyncioTestCase):
 
     async def start(self, user_record, user_id=123456):
         message = SimpleNamespace(from_user=SimpleNamespace(id=user_id, username="u", first_name="U"), answer=AsyncMock())
-        with patch.object(database, "get_or_create_user", new=AsyncMock(return_value=user_record)):
+        with patch.object(database, "get_or_create_user", new=AsyncMock(return_value=user_record)), \
+                patch.object(database, "resume_blocked_searches", new=AsyncMock(return_value=0)):
             await common.cmd_start(message, self.state)
         return [call.args[0] for call in message.answer.await_args_list]
 

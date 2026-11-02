@@ -23,7 +23,7 @@ class TestStartupCleanup(unittest.IsolatedAsyncioTestCase):
     async def test_telegram_failure_closes_session_without_starting_workers(self):
         runner = SimpleNamespace(cleanup=AsyncMock())
         bot = SimpleNamespace(delete_webhook=AsyncMock(side_effect=RuntimeError("test Telegram failure")), session=SimpleNamespace(close=AsyncMock(), middleware=Mock()))
-        with patch.object(bot_module, "start_health_server", new=AsyncMock(return_value=runner)), patch.object(bot_module.database, "init_db", new=AsyncMock()), patch.object(bot_module, "close_image_session", new=AsyncMock()), patch.object(bot_module, "Bot", return_value=bot), patch.object(bot_module, "Dispatcher", return_value=Mock()), patch.object(bot_module, "start_background_services") as start_workers:
+        with patch.object(bot_module, "start_health_server", new=AsyncMock(return_value=runner)), patch.object(bot_module.database, "init_db", new=AsyncMock()), patch.object(bot_module.database, "enforce_radar_limits", new=AsyncMock()), patch.object(bot_module, "close_image_session", new=AsyncMock()), patch.object(bot_module, "Bot", return_value=bot), patch.object(bot_module, "Dispatcher", return_value=Mock()), patch.object(bot_module, "start_background_services") as start_workers:
             with self.assertRaisesRegex(RuntimeError, "test Telegram failure"):
                 await bot_module.main()
             bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)

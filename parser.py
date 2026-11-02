@@ -123,6 +123,48 @@ def _error_detail(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"[:120]
 
 
+SELLER_PROFILE_PATH_RE = re.compile(r"^/(user|brands)/[^/?#]+")
+SELLER_LINK_FIELDS = ("link", "url", "uri", "href", "profileUrl", "profileLink")
+SELLER_ID_FIELDS = ("userKey", "userHash", "sellerId", "userId")
+_seller_keys_reported = False
+
+
+def seller_key_from(item: dict, user_step: dict) -> Optional[str]:
+    """A stable seller id: names repeat, a profile link does not.
+
+    Only /user/<id> and /brands/<id> links count: another link of the block may be common to all sellers,
+    and hiding one seller must never hide everybody.
+    """
+    raw_seller = item.get("seller") if isinstance(item.get("seller"), dict) else {}
+    profile = user_step.get("profile") if isinstance(user_step.get("profile"), dict) else {}
+    for source in (profile, raw_seller):
+        for field in SELLER_LINK_FIELDS:
+            value = source.get(field)
+            match = SELLER_PROFILE_PATH_RE.match(urlparse(value).path) if isinstance(value, str) else None
+            if match:
+                return match.group(0)
+    for source in (profile, user_step, raw_seller, item):
+        for field in SELLER_ID_FIELDS:
+            value = source.get(field)
+            if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value).strip():
+                return f"id:{str(value).strip()}"
+    return None
+
+
+def report_missing_seller_keys(items: list, profile_fields: list[str]) -> None:
+    """Avito's seller block is undocumented. If no id is found, the log names the fields to look at instead."""
+    global _seller_keys_reported
+    named = [item for item in items if item.seller_name]
+    if _seller_keys_reported or len(named) < 5:
+        return
+    _seller_keys_reported = True
+    found = sum(1 for item in named if item.seller_key)
+    if found:
+        logger.info("Ключ продавца найден у %s из %s лотов", found, len(named))
+    else:
+        logger.warning("Ключ продавца не найден, чёрный список работает по имени. Поля блока: %s", profile_fields)
+
+
 @dataclass
 class AvitoItem:
     item_id: str
@@ -135,6 +177,7 @@ class AvitoItem:
     description: Optional[str] = None
     seller: Optional[str] = None
     seller_name: Optional[str] = None
+    seller_key: Optional[str] = None
     delivery: Optional[str] = None
     condition: Optional[str] = None
     timestamp: Optional[int] = None
@@ -1162,6 +1205,7 @@ class AvitoParser:
                 return []
 
             results: List[AvitoItem] = []
+            profile_fields: list[str] = []
             for it in catalog_items:
                 if not isinstance(it, dict):
                     continue
@@ -1232,10 +1276,12 @@ class AvitoParser:
                 # Продавец и рейтинг
                 seller = None
                 seller_name = None
+                seller_profile = {}
                 user_steps = iva.get("UserInfoStep") or []
                 for step in user_steps:
                     payload = step.get("payload") or {}
                     if "profile" in payload:
+                        seller_profile = payload
                         prof_title = (payload.get("profile") or {}).get("title")
                         if prof_title:
                             seller_name = prof_title.strip()
@@ -1257,6 +1303,10 @@ class AvitoParser:
                             seller = f"{seller_name} · ⭐ {score}"
                         elif seller_name:
                             seller = seller_name
+
+                seller_key = seller_key_from(it, seller_profile)
+                if seller_profile and not profile_fields:
+                    profile_fields = sorted({*seller_profile, *(seller_profile.get("profile") or {})})
 
                 # Доставка
                 delivery = None
@@ -1359,6 +1409,7 @@ class AvitoParser:
                     description=description,
                     seller=seller,
                     seller_name=seller_name,
+                    seller_key=seller_key,
                     delivery=delivery,
                     condition=None,
                     timestamp=exact_ts,
@@ -1372,6 +1423,7 @@ class AvitoParser:
                     t_pub_reliable=t_pub_reliable,
                 ))
 
+            report_missing_seller_keys(results, profile_fields)
             return results
         except Exception as e:
             logger.debug(f"Ошибка парсинга SSR JSON: {e}")

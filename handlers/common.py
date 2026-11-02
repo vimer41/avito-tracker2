@@ -5,7 +5,8 @@ from typing import Optional
 from aiogram import Router, F
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import CommandStart, Command
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.enums import ChatMemberStatus, ChatType
+from aiogram.types import CallbackQuery, ChatMemberUpdated, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 
 import config
@@ -119,10 +120,11 @@ async def cmd_start(event, state: FSMContext):
     user = event.from_user
     first_name = user.first_name or "Пользователь"
     user_record = await database.get_or_create_user(user.id, user.username, first_name)
+    await database.resume_blocked_searches(user.id)
 
     text = (
         f"{ui.e('logo')} <b>Avito Radar</b>\n"
-        "Новые объявления Авито в Telegram через секунды после публикации.\n\n"
+        "Новые объявления Авито приходят в Telegram, как только появляются в поиске.\n\n"
         f"{ui.e('hello')} <b>{html.escape(first_name)}</b> · {access_status(user_record, user.id)}\n\n"
         "<b>Как начать</b>\n"
         "1. Откройте <code>avito.ru</code>, задайте поиск и фильтры.\n"
@@ -144,6 +146,13 @@ async def cmd_start(event, state: FSMContext):
     await event.answer(text, reply_markup=markup, parse_mode="HTML")
 
 
+@router.my_chat_member()
+async def on_bot_unblocked(update: ChatMemberUpdated):
+    """Unblocking sends no message, so this update is the only sign that the person is back."""
+    if update.chat.type == ChatType.PRIVATE and update.new_chat_member.status == ChatMemberStatus.MEMBER:
+        await database.resume_blocked_searches(update.from_user.id)
+
+
 @router.message(F.text.in_(ui.menu_texts("help")))
 @router.callback_query(F.data == "open_help_menu")
 @router.message(Command("help"))
@@ -157,7 +166,9 @@ async def cmd_help(event):
         f"{ui.e('shield')} <b>2. Отсекайте лишнее</b>\n"
         "• <b>Стоп-слова</b>: лоты с этими словами не придут («запчасти», «реплика»).\n"
         "• <b>Чёрный список</b>: кнопка под лотом скрывает все объявления продавца.\n"
-        "• <b>Область поиска</b>: только заголовок или заголовок с описанием.\n\n"
+        "• <b>Область поиска</b>: только заголовок или заголовок с описанием.\n"
+        "• <b>Фильтры радара</b>: цена, обязательные слова, только с доставкой, без продвинутых.\n"
+        "• <b>Сообщение продавцу</b>: кнопка под лотом копирует ваш текст.\n\n"
         f"{ui.e('tariffs')} <b>3. Тарифы</b>\n"
         f"Пробный период за подписку на канал: {radars_word(config.TRIAL_RADARS)} на {TRIAL_HOURS} часов.\n"
         f"{plan_summary('lite')}\n"
@@ -189,7 +200,8 @@ async def cmd_profile(event):
     user = await database.get_or_create_user(user_id)
     searches = await database.get_user_searches(user_id)
     searches_count = len(searches)
-    active_count = sum(1 for s in searches if s.get("is_active"))
+    has_access = await database.is_user_allowed(user_id)
+    active_count = sum(1 for s in searches if s.get("is_active")) if has_access else 0
     is_adm = config.is_admin(user_id)
     max_radars = await database.get_user_max_radars(user_id)
     scan_interval = config.plan_interval(database.classify_user_tariff(user)[0])
@@ -356,10 +368,31 @@ PLAN_PERKS = {
 }
 
 
+async def plan_change_note(user_id: int, plan: str) -> str:
+    """What a purchase does to the current tariff; empty when nothing changes."""
+    user = await database.get_user(user_id)
+    if not user or not user.get("is_allowed") or plan == user.get("tariff_plan"):
+        return ""
+    lines = []
+    left = database.subscription_seconds_left(user)
+    if left:
+        days_left = left // 86400
+        new_days = config.plan_switch_seconds(user.get("tariff_plan"), plan, left) // 86400
+        lines.append(
+            f"Сейчас «{config.plan_title(user.get('tariff_plan'))}», осталось {days_left} дн. "
+            f"Новый тариф начнёт действовать сразу, остаток пересчитается по цене: {new_days} дн. "
+            f"и ещё {config.STARS_SUBSCRIPTION_DAYS} оплаченных."
+        )
+    if config.plan_radars(plan) < await database.count_user_searches(user_id):
+        lines.append(f"Работать будут {radars_word(config.plan_radars(plan))}, остальные встанут на паузу.")
+    return "".join(f"{ui.e('warn')} {line}\n" for line in lines) + ("\n" if lines else "")
+
+
 @router.callback_query(F.data.startswith("buy_tariff:"))
 async def cb_select_tariff(call: CallbackQuery):
     tariff_key = call.data.split(":")[1]
-    if tariff_key not in (*config.PAID_PLANS, "test"):
+    test_enabled = config.STARS_TEST_ENABLED and tariff_key == "test"
+    if tariff_key not in config.PAID_PLANS and not test_enabled:
         # Old buttons (removed tariffs) lead back to the current tariff list.
         await cmd_subscription_menu(call)
         return
@@ -375,8 +408,10 @@ async def cb_select_tariff(call: CallbackQuery):
         f"{plan_icon(plan)} <b>Тариф «{title}»</b> — {price_label} за {'1 день' if is_test else '30 дней'}\n\n"
         f"• До <b>{radars_word(config.plan_radars(plan))}</b>\n"
         f"• Проверка каждого радара раз в <b>{config.plan_interval(plan)} с</b>\n"
-        "• Стоп-слова, чёрный список продавцов, поиск по заголовку\n\n"
+        "• Стоп-слова, чёрный список продавцов, поиск по заголовку\n"
+        "• Фильтры по цене и словам, сообщение продавцу в одно касание\n\n"
         f"<i>{PLAN_PERKS[plan]}</i>\n\n"
+        f"{await plan_change_note(call.from_user.id, plan)}"
         "Разовая оплата без автосписаний, доступ включается сразу. Оплачивая, вы соглашаетесь с /terms.\n\n"
         "<b>Способ оплаты:</b>"
     )
@@ -520,6 +555,7 @@ async def cb_ban_seller(call: CallbackQuery):
     raw_id = parts[1].strip() if len(parts) > 1 else ""
 
     seller_name = None
+    seller_key = ""
     if raw_id.isdigit() and int(raw_id) > 0:
         event_id = int(raw_id)
         event = await database.get_event_for_callback(event_id)
@@ -533,6 +569,7 @@ async def cb_ban_seller(call: CallbackQuery):
         if isinstance(item_obj.get("item"), dict):
             item_obj = item_obj["item"]
         seller_name = (item_obj.get("seller_name") or "").strip()
+        seller_key = (item_obj.get("seller_key") or "").strip()
 
     if not seller_name and call.message:
         # Old notifications: the seller line is "👤 Продавец: Имя" in the plain message text.
@@ -545,7 +582,7 @@ async def cb_ban_seller(call: CallbackQuery):
         await call.answer("Не удалось определить имя продавца", show_alert=True)
         return
 
-    await database.add_blocked_seller(user_id, seller_name)
+    await database.add_blocked_seller(user_id, seller_name, seller_key)
     log_user_event(user_id, call.from_user.username, call.from_user.first_name, "Блокировка продавца", f"Продавец «{seller_name}» добавлен в ЧС", status="OK")
     logger.info(f"🚷 [ЧЕРНЫЙ СПИСОК] Пользователь ID:{user_id} заблокировал продавца «{seller_name}»")
 

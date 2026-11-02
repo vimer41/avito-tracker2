@@ -367,7 +367,7 @@ class TestReliability(unittest.IsolatedAsyncioTestCase):
         self.bot.send_photo.assert_not_awaited()
         self.bot.send_message.assert_not_awaited()
 
-    async def test_uncached_photo_never_delays_text_notification(self):
+    async def test_lot_without_cached_photo_goes_out_with_photo_by_url(self):
         self.item.image_url = "https://c80.img.avito.st/test.jpg"
         self.bot.send_photo = AsyncMock()
         self.bot.send_message = AsyncMock()
@@ -378,8 +378,8 @@ class TestReliability(unittest.IsolatedAsyncioTestCase):
                 await scheduler.send_ad_to_user(self.bot, None, self.user_id, self.radar_id, "Test", self.item)
             )
         download.assert_not_awaited()
-        self.bot.send_photo.assert_not_awaited()
-        self.bot.send_message.assert_awaited_once()
+        self.bot.send_photo.assert_awaited_once()
+        self.bot.send_message.assert_not_awaited()
 
     async def test_verified_notification_survives_queue_age_and_changed_age_limit(self):
         await database.grant_subscription(self.user_id, tariff_plan="pro")

@@ -81,6 +81,7 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("subscription_period", invoice.model_dump())
         self.assertEqual(await database.get_user(self.user_id), before)
 
+    @patch.object(config, "STARS_TEST_ENABLED", True)
     async def test_test_tariff_ui_and_invoice(self):
         await self.dispatch_callback("buy_tariff:test")
         self.assertIn("stars_buy:test:10", self.callback_values())

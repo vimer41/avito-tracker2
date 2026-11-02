@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from aiogram import Router, F
+from aiogram.filters import StateFilter
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -284,7 +285,8 @@ async def process_new_url(message: Message, state: FSMContext):
     await status_msg.edit_text(note + card_text, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
 
 
-@router.message(F.text.regexp(r"(?i)avito\.ru"))
+# Only outside other steps: a seller message or a stop word that mentions avito.ru is not a new radar.
+@router.message(StateFilter(None), F.text.regexp(r"(?i)avito\.ru"))
 @router.message(SearchStates.waiting_for_url)
 async def process_avito_url(message: Message, state: FSMContext):
     if not message.text:
@@ -333,6 +335,16 @@ async def process_avito_url(message: Message, state: FSMContext):
         await message.answer(
             f"{ui.e('warn')} Не получилось разобрать ссылку: {html.escape(str(e))}",
             reply_markup=_url_error_kb(), parse_mode="HTML",
+        )
+        return
+
+    same_link = next((r for r in await database.get_user_searches(user_id) if r["url"] == normalized_url), None)
+    if same_link is not None:
+        await state.clear()
+        await message.answer(
+            f"{ui.e('warn')} <b>Такой радар уже есть:</b> «{html.escape(same_link['title'])}»",
+            reply_markup=ui.kb([ui.btn("Открыть радар", "radar", callback_data=f"open_search:{same_link['id']}")]),
+            parse_mode="HTML",
         )
         return
 
@@ -434,6 +446,8 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
     title_only = bool(s.get("search_in_title_only", 0))
 
     status = f"{ui.e('on')} Работает" if is_active else f"{ui.e('pause')} На паузе"
+    if s.get("pause_reason") == database.PAUSE_LIMIT:
+        status += " (не вошёл в лимит тарифа)"
     card_text = (
         f"{ui.e('radar')} <b>{html.escape(s['title'])}</b>\n\n"
         f"<b>Статус:</b> {status}\n"
@@ -541,7 +555,11 @@ async def cb_open_search(call: CallbackQuery):
 @router.callback_query(F.data.startswith("toggle_search:"))
 async def cb_toggle_search(call: CallbackQuery):
     search_id = int(call.data.split(":")[1])
-    new_status = await database.toggle_search_active(search_id, call.from_user.id)
+    try:
+        new_status = await database.toggle_search_active(search_id, call.from_user.id)
+    except database.RadarLimitError as exc:
+        await call.answer(f"{exc}. Поставьте другой радар на паузу или смените тариф.", show_alert=True)
+        return
 
     if new_status is None:
         await call.answer("Радар не найден", show_alert=True)
@@ -1088,7 +1106,7 @@ async def cb_filter_price(call: CallbackQuery, state: FSMContext):
     await _ask_filter_value(
         call, state, SearchStates.waiting_for_price,
         f"{ui.e('price')} <b>Диапазон цены</b>\n\n"
-        "Пришлите, например: <code>10000-50000</code>, <code>от 10000</code> или <code>до 50000</code>.\n"
+        "Пришлите, например: <code>10000-50000</code>, <code>от 10к</code> или <code>до 1.5 млн</code>.\n"
         "Убрать фильтр: <code>нет</code>.",
     )
 
@@ -1101,7 +1119,7 @@ async def process_filter_price(message: Message, state: FSMContext):
     if parsed is None:
         await message.answer(
             f"{ui.e('warn')} Не понял диапазон. Пример: <code>10000-50000</code>, "
-            "<code>от 10000</code>, <code>до 50000</code> или <code>нет</code>.",
+            "<code>от 10к</code>, <code>до 50 тыс</code> или <code>нет</code>.",
             parse_mode="HTML",
         )
         return

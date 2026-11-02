@@ -103,6 +103,7 @@ async def main():
 
     try:
         await database.init_db()
+        await database.enforce_radar_limits()
         pool = get_proxy_pool()
         await pool.reload_async(allow_direct=config.ALLOW_DIRECT_AVITO)
         bot = Bot(
