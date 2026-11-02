@@ -148,6 +148,8 @@ class AvitoItem:
     discount_percent: Optional[int] = None
     badges: Optional[List[str]] = None
     t_pub_reliable: bool = False
+    market_median: Optional[int] = None
+    market_percent: Optional[int] = None
 
 
 def _default_headers() -> dict[str, str]:

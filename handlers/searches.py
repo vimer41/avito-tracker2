@@ -1,4 +1,5 @@
 import html
+import json
 import logging
 import re
 from aiogram import Router, F
@@ -10,6 +11,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import config
 import database
+import radar_filters
 import ui
 from parser import AvitoParser
 from source_cache import SOURCE_SNAPSHOTS, BadSourceLink
@@ -42,6 +44,9 @@ class SearchStates(StatesGroup):
     waiting_for_custom_age = State()
     waiting_for_rename = State()
     waiting_for_new_url = State()
+    waiting_for_price = State()
+    waiting_for_must_words = State()
+    waiting_for_reply_template = State()
 
 
 async def route_menu_text(message: Message, state: FSMContext) -> bool:
@@ -434,6 +439,7 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
         f"<b>Статус:</b> {status}\n"
         f"<b>Ищет:</b> {_scope_label(title_only)}\n"
         f"<b>Стоп-слова:</b> {stops_count or 'нет'}\n"
+        f"<b>Фильтры:</b> {html.escape(radar_filters.summary(s))}\n"
         f"<a href=\"{html.escape(s['url'], quote=True)}\">Открыть выдачу на Авито</a>"
     )
     toggle = (
@@ -444,6 +450,7 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
     markup = ui.kb(
         [toggle, ui.btn(f"Стоп-слова ({stops_count})", "shield", callback_data=f"manage_stops:{search_id}")],
         [_scope_button(search_id, title_only)],
+        [ui.btn("Фильтры и сообщение продавцу", "note", callback_data=f"flt_open:{search_id}")],
         [ui.btn("Переименовать", "write", callback_data=f"rename_search:{search_id}"),
          ui.btn("Сменить ссылку", "refresh", callback_data=f"change_url:{search_id}")],
         [ui.btn("На Авито", "link", url=s["url"]),
@@ -988,6 +995,165 @@ async def cb_add_stop_word_prompt(call: CallbackQuery, state: FSMContext):
         await call.answer("Радар не найден", show_alert=True)
         return
     await _start_stop_word_fsm(call, state, search_id)
+
+
+# ── Фильтры радара и сообщение продавцу ────────────────────────────────
+
+FILTER_TOGGLES = ("delivery_only", "hide_promoted")
+
+
+def _yes_no(value) -> str:
+    return "да" if value else "нет"
+
+
+def build_filters_screen(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
+    search_id = s["id"]
+    price_min, price_max = int(s.get("price_min") or 0), int(s.get("price_max") or 0)
+    words = radar_filters.parse_words(s.get("must_words"))
+    template = (s.get("reply_template") or "").strip()
+    text = (
+        f"{ui.e('note')} <b>Фильтры радара</b>\n«{html.escape(s['title'])}»\n\n"
+        f"<b>Цена:</b> {radar_filters.price_label(price_min, price_max)}\n"
+        f"<b>Обязательные слова:</b> {html.escape(', '.join(words)) or 'нет'}\n"
+        f"<b>Только с Авито Доставкой:</b> {_yes_no(s.get('delivery_only'))}\n"
+        f"<b>Скрывать продвинутые:</b> {_yes_no(s.get('hide_promoted'))}\n"
+        f"<b>Сообщение продавцу:</b> {html.escape(template) or 'нет'}\n\n"
+        "<blockquote>Лот придёт, если проходит все условия. Лот без цены проходит фильтр цены. "
+        "Лот, отсеянный сейчас, не придёт и после смены фильтра.</blockquote>"
+    )
+    markup = ui.kb(
+        [ui.btn("Цена", "price", callback_data=f"flt_price:{search_id}"),
+         ui.btn("Обязательные слова", "scope", callback_data=f"flt_must:{search_id}")],
+        [ui.btn(f"Только с доставкой: {_yes_no(s.get('delivery_only'))}", "box",
+                callback_data=f"flt_tog:delivery_only:{search_id}")],
+        [ui.btn(f"Скрывать продвинутые: {_yes_no(s.get('hide_promoted'))}", "ban",
+                callback_data=f"flt_tog:hide_promoted:{search_id}")],
+        [ui.btn("Сообщение продавцу", "write", callback_data=f"flt_tpl:{search_id}")],
+        [ui.btn("« К радару", callback_data=f"open_search:{search_id}")],
+    )
+    return text, markup
+
+
+async def _ask_filter_value(call: CallbackQuery, state: FSMContext, step: State, text: str) -> None:
+    search_id = int(call.data.split(":")[1])
+    if not await _own_search(call, search_id):
+        return
+    await state.set_state(step)
+    await state.update_data(search_id=search_id)
+    await ui.show(call, text, ui.kb([ui.btn("Отмена", "cancel", callback_data=f"flt_back:{search_id}")]))
+
+
+async def _save_filter_value(message: Message, state: FSMContext, **fields) -> None:
+    data = await state.get_data()
+    search_id = int(data.get("search_id") or 0)
+    await state.clear()
+    saved = await database.update_search_filters(search_id, message.from_user.id, **fields)
+    s = await database.get_search(search_id) if saved else None
+    if not s:
+        await message.answer(f"{ui.e('warn')} Радар не найден.", parse_mode="HTML")
+        return
+    log_user_event(message.from_user.id, message.from_user.username, message.from_user.first_name,
+                   "Фильтры радара", f"Радар #{search_id}: {sorted(fields)}", status="OK")
+    text, markup = build_filters_screen(s)
+    await ui.show(message, text, markup)
+
+
+@router.callback_query(F.data.startswith(("flt_open:", "flt_back:")))
+async def cb_filters_open(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    s = await _own_search(call, int(call.data.split(":")[1]))
+    if not s:
+        return
+    text, markup = build_filters_screen(s)
+    await ui.show(call, text, markup)
+
+
+@router.callback_query(F.data.startswith("flt_tog:"))
+async def cb_filter_toggle(call: CallbackQuery):
+    _, field, raw_id = call.data.split(":")
+    if field not in FILTER_TOGGLES:
+        await call.answer()
+        return
+    s = await _own_search(call, int(raw_id))
+    if not s:
+        return
+    s[field] = 0 if s.get(field) else 1
+    await database.update_search_filters(s["id"], call.from_user.id, **{field: s[field]})
+    text, markup = build_filters_screen(s)
+    await ui.show(call, text, markup)
+
+
+@router.callback_query(F.data.startswith("flt_price:"))
+async def cb_filter_price(call: CallbackQuery, state: FSMContext):
+    await _ask_filter_value(
+        call, state, SearchStates.waiting_for_price,
+        f"{ui.e('price')} <b>Диапазон цены</b>\n\n"
+        "Пришлите, например: <code>10000-50000</code>, <code>от 10000</code> или <code>до 50000</code>.\n"
+        "Убрать фильтр: <code>нет</code>.",
+    )
+
+
+@router.message(SearchStates.waiting_for_price, F.text)
+async def process_filter_price(message: Message, state: FSMContext):
+    if await route_menu_text(message, state):
+        return
+    parsed = radar_filters.parse_price_range(message.text)
+    if parsed is None:
+        await message.answer(
+            f"{ui.e('warn')} Не понял диапазон. Пример: <code>10000-50000</code>, "
+            "<code>от 10000</code>, <code>до 50000</code> или <code>нет</code>.",
+            parse_mode="HTML",
+        )
+        return
+    await _save_filter_value(message, state, price_min=parsed[0], price_max=parsed[1])
+
+
+@router.callback_query(F.data.startswith("flt_must:"))
+async def cb_filter_must_words(call: CallbackQuery, state: FSMContext):
+    await _ask_filter_value(
+        call, state, SearchStates.waiting_for_must_words,
+        f"{ui.e('scope')} <b>Обязательные слова</b>\n\n"
+        "Лот придёт, если в названии или описании есть хотя бы одно слово.\n"
+        "Пришлите слова через запятую: <code>256, pro max</code>. Список заменится целиком.\n"
+        "Убрать фильтр: <code>нет</code>.",
+    )
+
+
+@router.message(SearchStates.waiting_for_must_words, F.text)
+async def process_filter_must_words(message: Message, state: FSMContext):
+    if await route_menu_text(message, state):
+        return
+    text = message.text.strip().lower()
+    words = [] if text in radar_filters.CLEAR_WORDS else radar_filters.split_words(text)
+    await _save_filter_value(message, state, must_words=json.dumps(words, ensure_ascii=False))
+
+
+@router.callback_query(F.data.startswith("flt_tpl:"))
+async def cb_filter_reply_template(call: CallbackQuery, state: FSMContext):
+    await _ask_filter_value(
+        call, state, SearchStates.waiting_for_reply_template,
+        f"{ui.e('write')} <b>Сообщение продавцу</b>\n\n"
+        "Под каждым лотом появится кнопка: один тап копирует текст, останется вставить его в чат на Авито.\n"
+        "В тексте можно использовать <code>{название}</code> и <code>{цена}</code>.\n"
+        "Пример: <code>Здравствуйте! {название} ещё продаётся? Заберу сегодня.</code>\n"
+        "Убрать: <code>нет</code>.",
+    )
+
+
+@router.message(SearchStates.waiting_for_reply_template, F.text)
+async def process_filter_reply_template(message: Message, state: FSMContext):
+    if await route_menu_text(message, state):
+        return
+    template = message.text.strip()
+    if template.lower() in radar_filters.CLEAR_WORDS:
+        template = ""
+    if len(template) > radar_filters.REPLY_TEMPLATE_MAX_LEN:
+        await message.answer(
+            f"{ui.e('warn')} Слишком длинно: максимум {radar_filters.REPLY_TEMPLATE_MAX_LEN} символов.",
+            parse_mode="HTML",
+        )
+        return
+    await _save_filter_value(message, state, reply_template=template)
 
 
 @router.message(SearchStates.waiting_for_stop_word, F.text)

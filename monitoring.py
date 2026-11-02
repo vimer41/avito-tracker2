@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import html
 import logging
 import os
 import time
@@ -16,6 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 import config
 import database
 import logger_setup
+import ui
 from collector import collect_source, settled_item_ids
 from logger_setup import get_trace, log_event, new_trace, set_trace, write_metrics_row
 from parser import AvitoParser
@@ -276,6 +278,25 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             f"Причина: {FAILURE_LABELS.get(failure.kind, failure.kind)}\n\n{radars}\n{task.key[:300]}\n\n"
             "Радар продолжает проверяться реже. Удалить: Админка → пользователь → Удалить радары."
         )
+        await notify_dead_link_owners(task)
+
+    async def notify_dead_link_owners(task: ScheduledScan):
+        """Only the owner can fix the link. Admins already got the alert above, and their test radars
+        could otherwise bring a flood-wait on the admin chat."""
+        for radar in task.radars:
+            owner = int(radar.get("user_id") or 0)
+            if not owner or config.is_admin(owner):
+                continue
+            text = (
+                f"{ui.e('warn')} <b>Радар не получает лоты</b>\n\n"
+                f"«{html.escape(str(radar.get('title') or 'Радар'))}»: Авито не отдаёт выдачу по этой ссылке.\n"
+                "Откройте поиск на Авито и пришлите адрес из строки браузера целиком."
+            )
+            markup = ui.kb([ui.btn("Сменить ссылку", "refresh", callback_data=f"change_url:{radar.get('id')}")])
+            try:
+                await bot.send_message(chat_id=owner, text=text, reply_markup=markup, parse_mode="HTML")
+            except Exception:
+                logger.warning("Не удалось предупредить владельца радара #%s", radar.get("id"), exc_info=True)
 
     async def fanout_worker(f_id: int):
         while True:

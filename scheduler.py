@@ -18,7 +18,7 @@ from aiogram.exceptions import (
     TelegramNetworkError,
     TelegramRetryAfter,
 )
-from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import BufferedInputFile, CopyTextButton, InlineKeyboardMarkup, InlineKeyboardButton
 
 import config
 import database
@@ -28,6 +28,7 @@ from request_budget import get_network_block_state, RequestDeferred, RequestBudg
 from logger_setup import get_trace, log_event, set_trace
 from runtime_metrics import METRICS
 from parser import AvitoParser, AvitoItem
+import radar_filters
 from collector import SourceCollection, collect_source
 from source_cache import SOURCE_SNAPSHOTS, SourceSnapshot
 
@@ -406,6 +407,10 @@ def build_notification_text(
     if item.seller:
         detail_lines.append(f"{ui.e('profile')} Продавец: {html.escape(item.seller)}")
 
+    if item.market_percent:
+        median = radar_filters.format_rub(item.market_median or 0)
+        detail_lines.append(f"{ui.e('stats')} На {item.market_percent} % дешевле медианы выдачи ({median})")
+
     # Время: возраст считается на момент отправки, а не на момент скана
     item_age = format_item_age(item.date, item.timestamp) if item.timestamp else item.date
     if item_age:
@@ -438,14 +443,18 @@ def build_notification_keyboard(
     has_seller: bool = True,
     *,
     use_event_callbacks: bool = True,
+    reply_text: str = "",
 ) -> InlineKeyboardMarkup:
     """Инлайн-кнопки под карточкой товара (привязаны к event_id для групповых событий)."""
-    row1 = [ui.btn("Открыть на Авито", "link", url=item_url, style="primary")]
+    rows = [[ui.btn("Открыть на Авито", "link", url=item_url, style="primary")]]
+    if reply_text:
+        rows.append([ui.btn("Скопировать сообщение", "write", copy_text=CopyTextButton(text=reply_text))])
     stop_cb = f"event_stop:{target_id}" if use_event_callbacks else f"add_stop_from_item:{target_id}"
     row2 = [ui.btn("Стоп-слово", "shield", callback_data=stop_cb)]
     if has_seller:
         row2.append(ui.btn("Скрыть продавца", "ban", callback_data=f"ban_seller:{target_id}"))
-    return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
+    rows.append(row2)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def plural_form(n: int, form1: str, form2: str, form5: str) -> str:
@@ -568,6 +577,7 @@ async def send_ad_to_user(
     allow_uncached_photo: bool = False,
     preverified_delivery: bool = False,
     silent: bool = False,
+    reply_template: str = "",
 ) -> bool:
     """Deliver notification to Telegram user with tariff-aware photo pipeline."""
     caption = build_notification_text(
@@ -583,6 +593,7 @@ async def send_ad_to_user(
         target_btn_id,
         has_seller=bool(it.seller_name),
         use_event_callbacks=(event_id is not None),
+        reply_text=radar_filters.render_reply(reply_template, it),
     )
     owner_str = f" [{user_label}]" if user_label else f" ID:{user_id}"
     check_ids = list(search_ids) if search_ids else ([search_id] if search_id else [])
@@ -847,6 +858,7 @@ async def process_collected_group_fanout(
     seen_batch: List[Tuple[int, str, Optional[int]]] = []
     candidates_to_enqueue: List[dict] = []
     now_epoch = collection.captured_at
+    radar_filters.mark_market(items)
 
     for idx, radar in enumerate(calibrated_radars):
         radar_id = int(radar["id"])
@@ -935,7 +947,7 @@ async def process_collected_group_fanout(
         log_new_lots(radar_id, new_items, collection, previous_processed_at, normal_fresh_flags)
 
         deliverable_items = []
-        stop_word_hits = seller_hits = 0
+        stop_word_hits = seller_hits = filter_hits = 0
         for it in fresh_items:
             matched_stop = is_stop_word_matched(it, stop_words)
             if matched_stop:
@@ -946,12 +958,18 @@ async def process_collected_group_fanout(
                 seller_hits += 1
                 logger.debug(f"Отсеян продавец «{it.seller_name}» из ЧС [{user_str}]")
                 continue
+            filter_reason = radar_filters.filter_reason(it, radar)
+            if filter_reason:
+                filter_hits += 1
+                logger.debug(f"Отсеяно фильтром {filter_reason} [{user_str}]: «{it.title[:30]}»")
+                continue
             deliverable_items.append(it)
         METRICS.record_fanout_items(
             new=len(all_new_candidates),
             queued=len(deliverable_items),
             stop_word=stop_word_hits,
             seller=seller_hits,
+            filtered=filter_hits,
             too_old=len(new_items) - len(fresh_items) - len(unknown_ids),
             title=len(all_new_candidates) - len(new_items),
         )
@@ -1163,6 +1181,12 @@ async def _prepare_delivery(row: dict) -> Optional[dict]:
                 "is_active": bool(r["is_active"]),
                 "stop_words": list(r.get("stop_words") or []),
                 "max_age_minutes": int(r.get("max_age_minutes") or 5),
+                "price_min": r.get("price_min"),
+                "price_max": r.get("price_max"),
+                "must_words": r.get("must_words"),
+                "delivery_only": r.get("delivery_only"),
+                "hide_promoted": r.get("hide_promoted"),
+                "reply_template": r.get("reply_template"),
             }
             for r in (row.get("radars") or [])
             if r.get("exists")
@@ -1217,6 +1241,7 @@ async def _prepare_delivery(row: dict) -> Optional[dict]:
     passing_searches = [
         s for s in active_searches
         if not is_stop_word_matched(item, s.get("stop_words", []))
+        and not radar_filters.filter_reason(item, s)
     ]
     if not passing_searches:
         await database.discard_notification(notification_id, token)
@@ -1245,6 +1270,7 @@ async def _prepare_delivery(row: dict) -> Optional[dict]:
         "is_catchup": bool(row.get("is_catchup") or payload.get("is_catchup")),
         "possible_dup": bool(row.get("possible_duplicate_after_crash")),
         "silent": silent,
+        "reply_template": next((s["reply_template"] for s in passing_searches if s.get("reply_template")), ""),
     }
 
 
@@ -1322,6 +1348,7 @@ async def deliver_notification(bot: Bot, parser: Optional[AvitoParser], row: dic
             allow_uncached_photo=(ctx["tariff"] in ("pro", "standart")),
             preverified_delivery=bool(row.get("_fast_claimed")),
             silent=ctx["silent"],
+            reply_template=ctx["reply_template"],
         )
         if delivered:
             return await _acknowledge_delivery(row, ctx)
@@ -1365,6 +1392,8 @@ def build_digest_text(entries: list[dict]) -> str:
         title = html.escape((item.title or "Объявление")[:70])
         url = html.escape(item.url or "", quote=True)
         line = f"{index}. <a href=\"{url}\">{title}</a> — {html.escape(item.price or '')}"
+        if item.market_percent:
+            line += f" (−{item.market_percent} % к выдаче)"
         age = format_item_age(item.date, getattr(item, "timestamp", None))
         if age:
             line += f" · {html.escape(age)}"

@@ -691,6 +691,12 @@ async def init_db():
             "max_age_minutes": "INTEGER DEFAULT 5",
             "created_at": "TIMESTAMP",
             "initialized_at": "TEXT DEFAULT ''",
+            "price_min": "INTEGER DEFAULT 0",
+            "price_max": "INTEGER DEFAULT 0",
+            "must_words": "TEXT DEFAULT '[]'",
+            "delivery_only": "INTEGER DEFAULT 0",
+            "hide_promoted": "INTEGER DEFAULT 0",
+            "reply_template": "TEXT DEFAULT ''",
         })
         await db.execute("UPDATE searches SET is_active = 1 WHERE is_active IS NULL;")
         await db.execute("UPDATE searches SET stop_words = '[]' WHERE stop_words IS NULL;")
@@ -1717,6 +1723,25 @@ async def update_seen_item_price(search_id: int, item_id: str, new_price: int):
         await db.commit()
 
 
+SEARCH_FILTER_COLUMNS = frozenset({
+    "price_min", "price_max", "must_words", "delivery_only", "hide_promoted", "reply_template",
+})
+
+
+async def update_search_filters(search_id: int, user_id: int, **fields: Any) -> bool:
+    unknown = set(fields) - SEARCH_FILTER_COLUMNS
+    if unknown or not fields:
+        raise ValueError(f"Неизвестные поля фильтра: {sorted(unknown)}")
+    assignments = ", ".join(f"{name} = ?" for name in fields)
+    async with writer_connection() as db:
+        cursor = await db.execute(
+            f"UPDATE searches SET {assignments} WHERE id = ? AND user_id = ?",
+            (*fields.values(), search_id, user_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
 async def update_search_discount_percent(search_id: int, user_id: int, percent: int) -> bool:
     """Колонка сохранена для совместимости схемы; повторные алерты о скидках отключены."""
     async with writer_connection() as db:
@@ -2383,7 +2408,8 @@ async def claim_notification_event(
                 """
                 SELECT dr.search_id, dr.radar_title,
                        s.id AS live_id, s.title AS live_title, s.is_active, s.stop_words, s.search_in_title_only,
-                       s.max_age_minutes, s.url, s.template
+                       s.max_age_minutes, s.url, s.template, s.price_min, s.price_max, s.must_words,
+                       s.delivery_only, s.hide_promoted, s.reply_template
                 FROM notification_dedupe_radars dr
                 LEFT JOIN searches s ON s.id = dr.search_id AND s.user_id = dr.user_id
                 WHERE dr.user_id = ? AND dr.item_id = ?
@@ -2402,15 +2428,18 @@ async def claim_notification_event(
                 )
                 urow = ucur.fetchone()
                 ucur.close()
-                if urow is None or not urow["is_allowed"]:
+                # Same rule as is_user_allowed: a trial has subscription_until (UTC) and is_allowed = 0.
+                if urow is None:
                     u_allowed = False
                 elif urow["subscription_until"]:
                     try:
                         sub_until = datetime.fromisoformat(urow["subscription_until"])
-                        if sub_until <= datetime.now(MSK_TZ).replace(tzinfo=None):
+                        if sub_until <= datetime.now(timezone.utc).replace(tzinfo=None):
                             u_allowed = False
                     except ValueError:
                         u_allowed = False
+                elif not urow["is_allowed"]:
+                    u_allowed = False
 
             conn.commit()
             return dict(r), r_rows, ltoken, u_allowed
@@ -2433,6 +2462,12 @@ async def claim_notification_event(
             "max_age_minutes": int(r["max_age_minutes"] or 5),
             "url": r["url"] or "",
             "template": r["template"],
+            "price_min": int(r["price_min"] or 0),
+            "price_max": int(r["price_max"] or 0),
+            "must_words": r["must_words"] or "[]",
+            "delivery_only": int(r["delivery_only"] or 0),
+            "hide_promoted": int(r["hide_promoted"] or 0),
+            "reply_template": r["reply_template"] or "",
         })
 
     first_sid = radars[0]["search_id"] if radars else 0

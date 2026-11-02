@@ -612,14 +612,21 @@ class TestProductionScanLoop(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
-        texts = [call.kwargs["text"] for call in bot.send_message.await_args_list]
-        return [text for text in texts if "Ссылка не работает" in text]
+        self.sent = [call.kwargs for call in bot.send_message.await_args_list]
+        return [sent["text"] for sent in self.sent if "Ссылка не работает" in sent["text"]]
 
     async def test_dead_link_alerts_admins_once_with_its_owner(self):
         alerts = await self._dead_link_alerts("catalog_missing")
         self.assertEqual(len(alerts), 1)
         self.assertIn("#7 «битая», пользователь 42", alerts[0])
         self.assertIn("https://www.avito.ru/moskva/bad", alerts[0])
+
+    async def test_dead_link_tells_the_owner_once_with_a_way_to_fix_it(self):
+        await self._dead_link_alerts("catalog_missing")
+        to_owner = [sent for sent in self.sent if sent["chat_id"] == 42]
+        self.assertEqual(len(to_owner), 1)
+        self.assertIn("Радар не получает лоты", to_owner[0]["text"])
+        self.assertEqual(to_owner[0]["reply_markup"].inline_keyboard[0][0].callback_data, "change_url:7")
 
     async def test_blocks_are_not_reported_as_a_dead_link(self):
         self.assertEqual(await self._dead_link_alerts("forbidden"), [])

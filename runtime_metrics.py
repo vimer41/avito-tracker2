@@ -209,6 +209,7 @@ class MinuteBucket:
     items_new: int = 0
     items_queued: int = 0
     items_stop_word: int = 0
+    items_filtered: int = 0
     items_seller: int = 0
     items_too_old: int = 0
     items_title: int = 0
@@ -254,6 +255,7 @@ class MinuteBucket:
         self.items_new = 0
         self.items_queued = 0
         self.items_stop_word = 0
+        self.items_filtered = 0
         self.items_seller = 0
         self.items_too_old = 0
         self.items_title = 0
@@ -850,13 +852,15 @@ class RuntimeMetricsRegistry:
         stats[2] += float(seconds)
 
     def record_fanout_items(
-        self, *, new: int = 0, queued: int = 0, stop_word: int = 0, seller: int = 0, too_old: int = 0, title: int = 0
+        self, *, new: int = 0, queued: int = 0, stop_word: int = 0, seller: int = 0, too_old: int = 0, title: int = 0,
+        filtered: int = 0,
     ) -> None:
         """Lot funnel of one radar: what the scan found and where each lot went."""
         b = self._bucket()
         b.items_new += new
         b.items_queued += queued
         b.items_stop_word += stop_word
+        b.items_filtered += filtered
         b.items_seller += seller
         b.items_too_old += too_old
         b.items_title += title
@@ -938,6 +942,7 @@ class RuntimeMetricsRegistry:
                 "new": b.items_new,
                 "queued": b.items_queued,
                 "stop": b.items_stop_word,
+                "filter": b.items_filtered,
                 "seller": b.items_seller,
                 "old": b.items_too_old,
                 "title": b.items_title,
