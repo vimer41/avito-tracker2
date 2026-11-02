@@ -170,7 +170,8 @@ async def cmd_help(event):
         "• <b>Фильтры радара</b>: цена, обязательные слова, только с доставкой, без продвинутых.\n"
         "• <b>Сообщение продавцу</b>: кнопка под лотом копирует ваш текст.\n\n"
         f"{ui.e('tariffs')} <b>3. Тарифы</b>\n"
-        f"Пробный период за подписку на канал: {TRIAL_HOURS} часов, всё как на тарифе «Полный».\n"
+        f"Пробный период за подписку на канал: {radars_word(config.TRIAL_RADARS)} на {TRIAL_HOURS} часов, "
+        "остальное как на тарифе «Полный».\n"
         f"{plan_summary('lite')}\n"
         f"{plan_summary('standart')}\n"
         f"{plan_summary('pro')}\n\n"
@@ -316,7 +317,7 @@ async def cb_activate_trial(call: CallbackQuery):
     until = database.format_subscription_date(res.get("until"))
     text = (
         f"{ui.e('trial')} <b>Пробный период включён</b>\n\n"
-        f"Действует до {until}, всё как на тарифе «Полный»: до {radars_word(config.TRIAL_RADARS)}, "
+        f"Действует до {until}: {radars_word(config.TRIAL_RADARS)}, остальное как на тарифе «Полный», "
         f"проверка раз в {config.plan_interval('pro')} с.\n"
         "Пришлите ссылку на поиск Авито, и первый радар заработает."
     )
