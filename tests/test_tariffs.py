@@ -28,7 +28,7 @@ class TestTariffScanIntervals(unittest.TestCase):
         shared = monitoring.source_interval([radar(5, "lite"), radar(6, "pro")], key)
         self.assertEqual(shared, monitoring.source_interval([radar(6, "pro")], key))
         trial = monitoring.source_interval([radar(7, "standart", allowed=0)], key)
-        self.assertGreaterEqual(trial, config.TARIFF_SCAN_INTERVAL["base"] * 0.9)
+        self.assertEqual(trial, shared)
 
     def test_jitter_is_stable_per_url(self):
         radars = [radar(5, "standart")]

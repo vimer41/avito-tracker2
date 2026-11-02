@@ -51,7 +51,7 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
 
         # Лимит для триала — ровно 1 радар
         trial_radars = await database.get_user_max_radars(trial_user_id)
-        self.assertEqual(trial_radars, 1)
+        self.assertEqual(trial_radars, config.plan_radars("pro"))
 
         # Проверяем сводную статистику системы: и админ, и триал-пользователь должны быть учтены в allowed_users
         stats = await database.get_system_stats()

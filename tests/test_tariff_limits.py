@@ -97,6 +97,27 @@ class TestPlanSwitch(DatabaseCase):
         self.assertEqual(await common.plan_change_note(USER_ID, "pro"), "")
 
 
+class TestTrialIsLikeFull(DatabaseCase):
+    async def test_trial_has_the_limit_speed_and_priority_of_the_full_tariff(self):
+        await database.activate_trial(USER_ID)
+        self.assertEqual(await database.get_user_max_radars(USER_ID), config.plan_radars("pro"))
+        ids = await self.add_radars(4)
+        self.assertEqual(await self.running(), ids)
+        user = await database.get_user(USER_ID)
+        self.assertEqual(database.classify_user_tariff(user)[:2], database.classify_user_tariff({**user, "tariff_plan": "pro", "is_allowed": 1})[:2])
+
+    async def test_buying_a_smaller_tariff_after_the_trial_warns_and_pauses_the_rest(self):
+        await database.activate_trial(USER_ID)
+        ids = await self.add_radars(4)
+        self.assertIn("1 радар", await common.plan_change_note(USER_ID, "lite"))
+        await database.grant_subscription(USER_ID, 30, "lite")
+        self.assertEqual(await self.running(), ids[:1])
+        self.assertEqual(await database.count_limit_paused(USER_ID), 3)
+
+    async def test_test_order_stays_on_its_own_class(self):
+        self.assertEqual(database.classify_user_tariff({"user_id": USER_ID, "tariff_plan": "standart", "is_test_order": 1})[0], "base")
+
+
 class TestRadarLimit(DatabaseCase):
     async def test_extra_radars_pause_after_moving_down_and_return_after_moving_up(self):
         await database.grant_subscription(USER_ID, 30, "pro")

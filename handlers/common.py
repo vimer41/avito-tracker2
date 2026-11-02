@@ -170,7 +170,7 @@ async def cmd_help(event):
         "• <b>Фильтры радара</b>: цена, обязательные слова, только с доставкой, без продвинутых.\n"
         "• <b>Сообщение продавцу</b>: кнопка под лотом копирует ваш текст.\n\n"
         f"{ui.e('tariffs')} <b>3. Тарифы</b>\n"
-        f"Пробный период за подписку на канал: {radars_word(config.TRIAL_RADARS)} на {TRIAL_HOURS} часов.\n"
+        f"Пробный период за подписку на канал: {TRIAL_HOURS} часов, всё как на тарифе «Полный».\n"
         f"{plan_summary('lite')}\n"
         f"{plan_summary('standart')}\n"
         f"{plan_summary('pro')}\n\n"
@@ -316,7 +316,8 @@ async def cb_activate_trial(call: CallbackQuery):
     until = database.format_subscription_date(res.get("until"))
     text = (
         f"{ui.e('trial')} <b>Пробный период включён</b>\n\n"
-        f"Действует до {until}: {radars_word(config.TRIAL_RADARS)}, все фильтры.\n"
+        f"Действует до {until}, всё как на тарифе «Полный»: до {radars_word(config.TRIAL_RADARS)}, "
+        f"проверка раз в {config.plan_interval('pro')} с.\n"
         "Пришлите ссылку на поиск Авито, и первый радар заработает."
     )
     await ui.show(call, text, ui.kb(
@@ -371,10 +372,11 @@ PLAN_PERKS = {
 async def plan_change_note(user_id: int, plan: str) -> str:
     """What a purchase does to the current tariff; empty when nothing changes."""
     user = await database.get_user(user_id)
-    if not user or not user.get("is_allowed") or plan == user.get("tariff_plan"):
+    if not user:
         return ""
     lines = []
-    left = database.subscription_seconds_left(user)
+    tariff_changes = user.get("is_allowed") and plan != user.get("tariff_plan")
+    left = database.subscription_seconds_left(user) if tariff_changes else 0
     if left:
         days_left = left // 86400
         new_days = config.plan_switch_seconds(user.get("tariff_plan"), plan, left) // 86400

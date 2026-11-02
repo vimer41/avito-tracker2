@@ -148,11 +148,12 @@ AVITO_MAX_PAGES_PER_SCAN = min(5, positive_int_setting("AVITO_MAX_PAGES_PER_SCAN
 
 # --- Тарифы ---
 # Internal keys stay as stored in the DB and old orders: lite = «Базовый», standart = «Средний», pro = «Полный».
-# "base" is the trial / unpaid classification. A URL watched by several tariffs is scanned at the fastest one.
+# A trial has everything the Полный tariff has, only for TRIAL_HOURS. "base" is the classification of test orders.
+# A URL watched by several tariffs is scanned at the fastest one.
 PAID_PLANS: tuple[str, ...] = ("lite", "standart", "pro")
 PLAN_TITLES: dict[str, str] = {"lite": "Базовый", "standart": "Средний", "pro": "Полный", "test": "Тест", "base": "Пробный"}
 PLAN_RADARS: dict[str, int] = {"lite": 1, "standart": 2, "pro": 4}
-TRIAL_RADARS = 1
+TRIAL_RADARS = PLAN_RADARS["pro"]
 TRIAL_HOURS = 6
 # The trial is granted for subscribing to this channel; the bot must be its admin to check that.
 TRIAL_CHANNEL = os.getenv("TRIAL_CHANNEL", "@avitoradar1").strip()

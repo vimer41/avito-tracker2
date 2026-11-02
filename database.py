@@ -313,7 +313,8 @@ def classify_user_tariff(
     - admin / Полный (pro) -> ('pro', 10, ...)
     - Средний (standart) -> ('standart', 20, ...)
     - Базовый (lite) -> ('lite', 25, ...)
-    - test / trial / без доступа -> ('base', 30, ...)
+    - триал (is_allowed = 0, в скан попадает только при действующем сроке) -> как Полный
+    - тестовый заказ -> ('base', 30, ...)
     """
     if isinstance(user_id, dict):
         row = user_id
@@ -332,8 +333,10 @@ def classify_user_tariff(
     plan = (plan_raw or "standart").strip().lower()
     if plan == "pro":
         return "pro", 10, config.tariff_delivery_delay("pro")
-    if plan in ("base", "test", "trial") or test_val or not bool(allowed_val):
+    if plan in ("base", "test", "trial") or test_val:
         return "base", 30, config.tariff_delivery_delay("base")
+    if not bool(allowed_val):
+        return "pro", 10, config.tariff_delivery_delay("pro")
     if plan == "lite":
         return "lite", 25, config.tariff_delivery_delay("lite")
     return "standart", 20, config.tariff_delivery_delay("standart")

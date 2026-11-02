@@ -11,6 +11,7 @@ from tests import _environment
 import aiosqlite
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.methods import SendMessage
+import config
 import database
 import scheduler
 from parser import AvitoItem
@@ -168,13 +169,13 @@ class TestReliability(unittest.IsolatedAsyncioTestCase):
         results = await asyncio.gather(
             *[
                 database.add_search(self.user_id, f"Radar {i}", f"https://www.avito.ru/search?q={i}")
-                for i in range(4)
+                for i in range(config.TRIAL_RADARS + 3)
             ],
             return_exceptions=True,
         )
-        self.assertEqual(sum(isinstance(result, int) for result in results), 1)
+        self.assertEqual(sum(isinstance(result, int) for result in results), config.TRIAL_RADARS)
         self.assertEqual(sum(isinstance(result, database.RadarLimitError) for result in results), 3)
-        self.assertEqual(await database.count_user_searches(self.user_id), 1)
+        self.assertEqual(await database.count_user_searches(self.user_id), config.TRIAL_RADARS)
 
     async def test_enqueue_is_persistent_deduplicated_and_not_seen(self):
         self.assertTrue(await self.enqueue())
