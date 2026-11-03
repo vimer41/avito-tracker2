@@ -42,3 +42,6 @@ deploy_*.md
 tests/run_vps_cmd.py
 tests/test_remix.py
 DEPLOY_*.md
+
+# Local full description (not for the public repo)
+README.local.md
