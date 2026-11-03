@@ -88,8 +88,32 @@ def plan_summary(plan: str) -> str:
         f"{plan_icon(plan)} <b>{config.plan_title(plan)}</b> — {config.rub_price(plan)} ₽ / мес · "
         f"{config.rub_price(plan, 3)} ₽ / 3 мес\n"
         f"{radars_word(config.plan_radars(plan))} · проверка раз в {config.plan_interval(plan)} с"
-        + (" · лоты в группу" if plan in config.GROUP_DELIVERY_PLANS else "")
+        + (" · лоты в группу или канал" if plan in config.GROUP_DELIVERY_PLANS else "")
     )
+
+
+PLAN_AUDIENCE = {
+    "lite": "Для поиска вещи для себя",
+    "pro": "Для перепродажи и больших городов",
+}
+
+
+def plan_card(plan: str) -> str:
+    """A tariff on the tariff screen: what it gives over the cheaper one and the per-month price of 3 months."""
+    fastest = min(config.PAID_PLANS, key=config.plan_interval)
+    long_price = config.rub_price(plan, 3)
+    lines = [
+        f"{plan_icon(plan)} <b>{config.plan_title(plan)}</b> — {config.rub_price(plan)} ₽ / мес"
+        + (" · <b>Популярный</b>" if plan == "standart" else ""),
+        f"{radars_word(config.plan_radars(plan))} · проверка раз в {config.plan_interval(plan)} с"
+        + (" — самая быстрая" if plan == fastest else ""),
+    ]
+    if plan in config.GROUP_DELIVERY_PLANS:
+        lines.append("+ лоты в вашу группу или канал")
+    if plan in PLAN_AUDIENCE:
+        lines.append(f"<i>{PLAN_AUDIENCE[plan]}</i>")
+    lines.append(f"3 мес: {long_price} ₽ (≈{round(long_price / 3)} ₽/мес)")
+    return "\n".join(lines)
 
 
 def period_discount_text(months: int) -> str:
@@ -242,7 +266,7 @@ async def cmd_profile(event):
     night = "выкл" if night_mode == database.NIGHT_OFF else f"{night_from:02d}–{night_to:02d}"
     rows.append([ui.btn(f"Ночной режим: {night}", "pause", callback_data="night_mode")])
     group = "вкл" if await database.get_mirror_chat(user_id) else "выкл"
-    rows.append([ui.btn(f"Лоты в группу: {group}", "users", callback_data="group_delivery")])
+    rows.append([ui.btn(f"Лоты в группу или канал: {group}", "users", callback_data="group_delivery")])
     rows.append([ui.btn("Обновить", "refresh", callback_data="refresh_profile"), ui.home_btn()])
     await ui.show(event, text, ui.kb(*rows), answer=False)
 
@@ -348,9 +372,10 @@ async def cmd_subscription_menu(event):
     text = (
         f"{ui.e('tariffs')} <b>Тарифы</b>\n"
         f"Сейчас: <b>{access_status(user, user_id)}</b>\n\n"
-        f"{plan_summary('lite')}\n\n"
-        f"{plan_summary('standart')}\n\n"
-        f"{plan_summary('pro')}\n\n"
+        f"{plan_card('lite')}\n\n"
+        f"{plan_card('standart')}\n\n"
+        f"{plan_card('pro')}\n\n"
+        "На всех тарифах: стоп-слова, фильтр цены, чёрный список продавцов, ночной режим.\n\n"
         "<blockquote>Чем чаще проверка, тем раньше вы увидите лот и успеете написать первым.</blockquote>\n"
         f"Оплата разовая на 1 или 3 месяца, без автосписаний. За 3 месяца{period_discount_text(3)}. "
         "Оплаченные дни добавляются к текущему сроку."
@@ -434,7 +459,7 @@ async def cb_select_tariff(call: CallbackQuery):
         f"• Проверка каждого радара раз в <b>{config.plan_interval(plan)} с</b>\n"
         "• Стоп-слова, чёрный список продавцов, поиск по заголовку\n"
         "• Фильтры по цене и словам, сообщение продавцу в одно касание\n"
-        + ("• Копии лотов в вашу группу — для работы вдвоём или командой\n" if plan in config.GROUP_DELIVERY_PLANS else "")
+        + ("• Копии лотов в вашу группу или канал — для работы вдвоём или командой\n" if plan in config.GROUP_DELIVERY_PLANS else "")
         + f"\n<i>{PLAN_PERKS[plan]}</i>\n\n"
         f"{await plan_change_note(call.from_user.id, plan, months)}"
         "Разовая оплата без автосписаний, доступ включается сразу. Оплачивая, вы соглашаетесь с /terms.\n\n"

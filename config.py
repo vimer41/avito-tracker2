@@ -356,7 +356,7 @@ def period_months(days: int) -> int:
 
 
 def period_title(months: int) -> str:
-    return "1 месяц" if months == 1 else f"{months} {plural(months, 'месяц', 'месяца', 'месяцев')}"
+    return plural(months, "месяц", "месяца", "месяцев")
 
 
 def nice_price(value: int) -> int:

@@ -8,13 +8,17 @@ from tests import _environment
 from tests._dispatcher import DispatcherFixture
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.methods import CopyMessage
-from aiogram.types import Chat, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, User
+from aiogram.types import (
+    Chat, ChatMemberAdministrator, ChatMemberLeft, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup,
+    Message, Update, User,
+)
 
 import config
 import database
 import scheduler
 
 GROUP_ID = -100777
+CHANNEL_ID = -100888
 
 
 class TestGroupDelivery(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
@@ -82,7 +86,42 @@ class TestGroupDelivery(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_callback("group_off", user_id=self.user_id)
         self.assertIsNone(await database.get_mirror_chat(self.user_id))
         urls = [b.url for row in self.last_markup().inline_keyboard for b in row if b.url]
-        self.assertEqual(urls, ["https://t.me/fixture_bot?startgroup=radar"])
+        self.assertEqual(urls, ["https://t.me/fixture_bot?startgroup=radar",
+                                "https://t.me/fixture_bot?startchannel&admin=post_messages"])
+
+    async def channel_update(self, user_id, status, can_post=True):
+        self.update_id += 1
+        bot_user = User(id=self.bot.id, is_bot=True, first_name="Fixture Bot")
+        if status == "administrator":
+            new = ChatMemberAdministrator(
+                user=bot_user, can_be_edited=False, is_anonymous=False, can_manage_chat=True, can_delete_messages=False,
+                can_manage_video_chats=False, can_restrict_members=False, can_promote_members=False,
+                can_change_info=False, can_invite_users=False, can_post_stories=False, can_edit_stories=False,
+                can_delete_stories=False, can_send_welcome_messages=False, can_post_messages=can_post,
+            )
+        else:
+            new = ChatMemberLeft(user=bot_user)
+        update = ChatMemberUpdated(
+            chat=Chat(id=CHANNEL_ID, type="channel", title="Лоты"), from_user=User(id=user_id, is_bot=False, first_name="F"),
+            date=datetime.now(timezone.utc), old_chat_member=ChatMemberLeft(user=bot_user), new_chat_member=new,
+        )
+        await self.dp.feed_update(self.bot, Update(update_id=self.update_id, my_chat_member=update))
+
+    async def test_channel_links_through_admin_rights_and_unlinks_on_removal(self):
+        await database.grant_subscription(self.user_id, days=30, tariff_plan="standart")
+        await self.channel_update(self.user_id, "administrator", can_post=False)
+        self.assertIsNone(await database.get_mirror_chat(self.user_id))
+        self.assertIn("публиковать", self.methods("SendMessage")[-1].text)
+        await self.channel_update(self.user_id, "administrator")
+        self.assertEqual(await database.get_mirror_chat(self.user_id), CHANNEL_ID)
+        self.assertEqual(self.methods("SendMessage")[-1].chat_id, self.user_id)
+        await self.channel_update(self.user_id, "left")
+        self.assertIsNone(await database.get_mirror_chat(self.user_id))
+
+    async def test_lite_cannot_link_a_channel(self):
+        await database.grant_subscription(self.user_id, days=30, tariff_plan="lite")
+        await self.channel_update(self.user_id, "administrator")
+        self.assertIsNone(await database.get_mirror_chat(self.user_id))
 
     async def test_other_group_messages_get_no_menu(self):
         self.update_id += 1

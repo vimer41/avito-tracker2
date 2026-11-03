@@ -4,9 +4,9 @@ import html
 import logging
 
 from aiogram import Bot, F, Router
-from aiogram.enums import ChatType
+from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.filters import CommandStart
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, ChatMemberUpdated, Message
 
 import config
 import database
@@ -37,7 +37,7 @@ async def link_group(message: Message, bot: Bot):
         return
     if not await group_delivery_allowed(user.id):
         await message.answer(
-            f"{ui.e('lock')} Копии лотов в группу есть на тарифах «Средний» и «Полный». "
+            f"{ui.e('lock')} Копии лотов в группу или канал есть на тарифах «Средний» и «Полный». "
             "Выбрать тариф можно в личном чате с ботом."
         )
         return
@@ -55,6 +55,33 @@ async def link_group(message: Message, bot: Bot):
         pass
 
 
+@router.my_chat_member(F.chat.type == ChatType.CHANNEL)
+async def link_channel(update: ChatMemberUpdated, bot: Bot):
+    """Nobody can send /start in a channel: the admin who made the bot an admin there owns the link."""
+    user = update.from_user
+    if not user or user.is_bot:
+        return
+    status = update.new_chat_member.status
+    if status != ChatMemberStatus.ADMINISTRATOR:
+        if status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED) and await database.get_mirror_chat(user.id) == update.chat.id:
+            await database.set_mirror_chat(user.id, None)
+        return
+    title = html.escape(update.chat.title or "")
+    if not await group_delivery_allowed(user.id):
+        text = (f"{ui.e('lock')} Канал «{title}»: копии лотов в группу или канал есть на тарифах «Средний» и «Полный».")
+    elif not getattr(update.new_chat_member, "can_post_messages", False):
+        text = (f"{ui.e('warn')} Канал «{title}»: дайте боту право публиковать сообщения, "
+                "иначе он не сможет присылать туда лоты.")
+    else:
+        await database.set_mirror_chat(user.id, update.chat.id)
+        log_user_event(user.id, user.username, user.first_name, "Канал для лотов", f"chat {update.chat.id}", status="OK")
+        text = f"{ui.e('ok')} Канал «{title}» подключён: копии новых лотов будут приходить и туда."
+    try:
+        await bot.send_message(user.id, text)
+    except Exception:
+        pass
+
+
 @router.message(F.chat.type.in_(GROUP_TYPES))
 async def ignore_group_messages(message: Message):
     """Everything else in groups is ignored: menus and radars live in the private chat."""
@@ -64,10 +91,11 @@ async def ignore_group_messages(message: Message):
 async def group_screen(user_id: int, bot: Bot) -> tuple[str, object]:
     me = await bot.me()
     add_url = f"https://t.me/{me.username}?startgroup={LINK_PAYLOAD}"
-    header = f"{ui.e('users')} <b>Лоты в группу</b>\n\n"
+    channel_url = f"https://t.me/{me.username}?startchannel&admin=post_messages"
+    header = f"{ui.e('users')} <b>Лоты в группу или канал</b>\n\n"
     if not await group_delivery_allowed(user_id):
         text = header + (
-            "Бот присылает копию каждого лота в вашу группу: удобно работать вдвоём или с командой.\n\n"
+            "Бот присылает копию каждого лота в вашу группу или канал: удобно работать вдвоём или с командой.\n\n"
             "<blockquote>Есть на тарифах «Средний» и «Полный».</blockquote>"
         )
         return text, ui.kb(
@@ -82,23 +110,26 @@ async def group_screen(user_id: int, bot: Bot) -> tuple[str, object]:
         except Exception:
             pass
         text = header + (
-            f"Подключена группа <b>{html.escape(title) or chat_id}</b>. Копия каждого лота приходит туда.\n\n"
-            "<blockquote>В группе только ссылки на объявление; скрыть продавца и настройки — здесь, в личном чате. "
-            "Если лотов очень много, Telegram ограничивает группу 20 сообщениями в минуту, и часть копий пропадёт.</blockquote>"
+            f"Подключено: <b>{html.escape(title) or chat_id}</b>. Копия каждого лота приходит туда.\n\n"
+            "<blockquote>Там только ссылки на объявление; скрыть продавца и настройки — здесь, в личном чате. "
+            "Если лотов очень много, Telegram ограничивает группу или канал примерно 20 сообщениями в минуту, "
+            "и часть копий пропадёт.</blockquote>"
         )
         return text, ui.kb(
-            [ui.btn("Отключить группу", "cancel", callback_data="group_off", style="danger")],
-            [ui.btn("Подключить другую", "users", url=add_url)],
+            [ui.btn("Отключить", "cancel", callback_data="group_off", style="danger")],
+            [ui.btn("Другая группа", "users", url=add_url), ui.btn("Другой канал", "users", url=channel_url)],
             [ui.btn("« Профиль", callback_data="refresh_profile"), ui.home_btn()],
         )
     text = header + (
-        "Бот будет присылать копию каждого лота в вашу группу: удобно работать вдвоём или с командой.\n\n"
-        "1. Нажмите «Добавить в группу» и выберите группу.\n"
-        "2. Бот напишет в группе, что она подключена.\n\n"
-        "<blockquote>Уже добавили бота? Отправьте в группе /start.</blockquote>"
+        "Бот будет присылать копию каждого лота в вашу группу или канал: удобно работать вдвоём или с командой.\n\n"
+        "<b>Группа:</b> нажмите «Добавить в группу» и выберите её. Бот напишет там, что она подключена.\n"
+        "<b>Канал:</b> нажмите «Добавить в канал», выберите его и разрешите публиковать сообщения. "
+        "Бот напишет здесь, что канал подключён.\n\n"
+        "<blockquote>Бот уже в группе? Отправьте там /start. Работает одна группа или один канал.</blockquote>"
     )
     return text, ui.kb(
         [ui.btn("Добавить в группу", "users", url=add_url, style="primary")],
+        [ui.btn("Добавить в канал", "users", url=channel_url, style="primary")],
         [ui.btn("« Профиль", callback_data="refresh_profile"), ui.home_btn()],
     )
 

@@ -85,6 +85,9 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_callback("buy_tariff:pro:3")
         text = self.methods("EditMessageText")[-1].text
         self.assertIn("2399 ₽", text)
+        labels = [b.text for row in self.last_markup().inline_keyboard for b in row]
+        self.assertIn("✓ 3 месяца −10%", labels)
+        self.assertIn("1 месяц", labels)
         self.assertIn("stars_buy:pro:3:2399", self.callback_values())
         await self.dispatch_callback("stars_buy:pro:3:899")
         self.assertEqual(self.methods("SendInvoice"), [])
