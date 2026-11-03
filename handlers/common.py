@@ -83,11 +83,18 @@ def plan_icon(plan: str) -> str:
 
 
 def plan_summary(plan: str) -> str:
-    """«🚀 Средний — 449 ₽ / 30 дней» plus its limits, for tariff lists."""
+    """«🚀 Средний — 449 ₽ / мес · 1212 ₽ / 3 мес» plus its limits, for tariff lists."""
     return (
-        f"{plan_icon(plan)} <b>{config.plan_title(plan)}</b> — {config.rub_price(plan)} ₽ / 30 дней\n"
+        f"{plan_icon(plan)} <b>{config.plan_title(plan)}</b> — {config.rub_price(plan)} ₽ / мес · "
+        f"{config.rub_price(plan, 3)} ₽ / 3 мес\n"
         f"{radars_word(config.plan_radars(plan))} · проверка раз в {config.plan_interval(plan)} с"
+        + (" · лоты в группу" if plan in config.GROUP_DELIVERY_PLANS else "")
     )
+
+
+def period_discount_text(months: int) -> str:
+    discount = config.PERIOD_DISCOUNT_PERCENT.get(months, 0)
+    return f" −{discount}%" if discount else ""
 
 
 def access_status(user: dict, user_id: int) -> str:
@@ -234,6 +241,8 @@ async def cmd_profile(event):
     night_mode, night_from, night_to = await database.get_night_settings(user_id)
     night = "выкл" if night_mode == database.NIGHT_OFF else f"{night_from:02d}–{night_to:02d}"
     rows.append([ui.btn(f"Ночной режим: {night}", "pause", callback_data="night_mode")])
+    group = "вкл" if await database.get_mirror_chat(user_id) else "выкл"
+    rows.append([ui.btn(f"Лоты в группу: {group}", "users", callback_data="group_delivery")])
     rows.append([ui.btn("Обновить", "refresh", callback_data="refresh_profile"), ui.home_btn()])
     await ui.show(event, text, ui.kb(*rows), answer=False)
 
@@ -343,7 +352,8 @@ async def cmd_subscription_menu(event):
         f"{plan_summary('standart')}\n\n"
         f"{plan_summary('pro')}\n\n"
         "<blockquote>Чем чаще проверка, тем раньше вы увидите лот и успеете написать первым.</blockquote>\n"
-        "Оплата разовая на 30 дней, без автосписаний. Оплаченные дни добавляются к текущему сроку."
+        f"Оплата разовая на 1 или 3 месяца, без автосписаний. За 3 месяца{period_discount_text(3)}. "
+        "Оплаченные дни добавляются к текущему сроку."
     )
 
     rows = []
@@ -370,7 +380,7 @@ PLAN_PERKS = {
 }
 
 
-async def plan_change_note(user_id: int, plan: str) -> str:
+async def plan_change_note(user_id: int, plan: str, months: int = 1) -> str:
     """What a purchase does to the current tariff; empty when nothing changes."""
     user = await database.get_user(user_id)
     if not user:
@@ -384,7 +394,7 @@ async def plan_change_note(user_id: int, plan: str) -> str:
         lines.append(
             f"Сейчас «{config.plan_title(user.get('tariff_plan'))}», осталось {days_left} дн. "
             f"Новый тариф начнёт действовать сразу, остаток пересчитается по цене: {new_days} дн. "
-            f"и ещё {config.STARS_SUBSCRIPTION_DAYS} оплаченных."
+            f"и ещё {config.period_days(months)} оплаченных."
         )
     if config.plan_radars(plan) < await database.count_user_searches(user_id):
         lines.append(f"Работать будут {radars_word(config.plan_radars(plan))}, остальные встанут на паузу.")
@@ -393,38 +403,56 @@ async def plan_change_note(user_id: int, plan: str) -> str:
 
 @router.callback_query(F.data.startswith("buy_tariff:"))
 async def cb_select_tariff(call: CallbackQuery):
-    tariff_key = call.data.split(":")[1]
+    # buy_tariff:<plan>[:<months>]; old buttons have no months and open one month.
+    parts = call.data.split(":")
+    tariff_key = parts[1] if len(parts) > 1 else ""
+    months = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
     test_enabled = config.STARS_TEST_ENABLED and tariff_key == "test"
     if tariff_key not in config.PAID_PLANS and not test_enabled:
         # Old buttons (removed tariffs) lead back to the current tariff list.
         await cmd_subscription_menu(call)
         return
-    title = config.plan_title(tariff_key)
-    stars = config.stars_price(tariff_key)
     is_test = tariff_key == "test"
-    price_label = f"{stars} ⭐" if is_test else f"{config.rub_price(tariff_key)} ₽"
-    log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Выбор тарифа", f"Тариф {title} ({price_label})", status="INFO")
+    if is_test or months not in config.PERIOD_MONTHS:
+        months = 1
+    title = config.plan_title(tariff_key)
+    stars = config.stars_price(tariff_key, months)
+    price_label = f"{stars} ⭐" if is_test else f"{config.rub_price(tariff_key, months)} ₽"
+    period_label = "1 день" if is_test else config.period_title(months)
+    log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Выбор тарифа",
+                   f"Тариф {title} ({price_label} / {period_label})", status="INFO")
 
     # "test" is a hidden 1-day plan for checking Stars checkout end to end; it grants the Средний tariff.
     plan = "standart" if is_test else tariff_key
+    saving = ""
+    if not is_test and months > 1:
+        saved = config.rub_price(tariff_key) * months - config.rub_price(tariff_key, months)
+        saving = f" <i>(выгода {saved} ₽)</i>" if saved > 0 else ""
     text = (
-        f"{plan_icon(plan)} <b>Тариф «{title}»</b> — {price_label} за {'1 день' if is_test else '30 дней'}\n\n"
+        f"{plan_icon(plan)} <b>Тариф «{title}»</b> — {price_label} за {period_label}{saving}\n\n"
         f"• До <b>{radars_word(config.plan_radars(plan))}</b>\n"
         f"• Проверка каждого радара раз в <b>{config.plan_interval(plan)} с</b>\n"
         "• Стоп-слова, чёрный список продавцов, поиск по заголовку\n"
-        "• Фильтры по цене и словам, сообщение продавцу в одно касание\n\n"
-        f"<i>{PLAN_PERKS[plan]}</i>\n\n"
-        f"{await plan_change_note(call.from_user.id, plan)}"
+        "• Фильтры по цене и словам, сообщение продавцу в одно касание\n"
+        + ("• Копии лотов в вашу группу — для работы вдвоём или командой\n" if plan in config.GROUP_DELIVERY_PLANS else "")
+        + f"\n<i>{PLAN_PERKS[plan]}</i>\n\n"
+        f"{await plan_change_note(call.from_user.id, plan, months)}"
         "Разовая оплата без автосписаний, доступ включается сразу. Оплачивая, вы соглашаетесь с /terms.\n\n"
-        "<b>Способ оплаты:</b>"
+        + ("<b>Способ оплаты:</b>" if is_test else "<b>Срок и способ оплаты:</b>")
     )
 
     rows = []
     if not is_test:
-        rows.append([ui.btn(f"СБП — {config.rub_price(tariff_key)} ₽", "card",
+        rows.append([
+            ui.btn(("✓ " if m == months else "") + config.period_title(m) + period_discount_text(m),
+                   callback_data=f"buy_tariff:{tariff_key}:{m}", style="primary" if m == months else None)
+            for m in config.PERIOD_MONTHS
+        ])
+        rows.append([ui.btn(f"СБП — {config.rub_price(tariff_key, months)} ₽", "card",
                             callback_data=f"pay_method:sbp:{tariff_key}", style="success")])
     if config.STARS_PAYMENTS_ENABLED:
-        rows.append([ui.btn(f"Telegram Stars — {stars} ⭐", "star", callback_data=f"stars_buy:{tariff_key}:{stars}")])
+        rows.append([ui.btn(f"Telegram Stars — {stars} ⭐", "star",
+                            callback_data=f"stars_buy:{tariff_key}:{months}:{stars}")])
     else:
         text += "\n\n⏸ Оплата Telegram Stars временно выключена."
     if not is_test:
@@ -501,7 +529,7 @@ async def cmd_support(event, state: Optional[FSMContext] = None):
     text = (
         f"{ui.e('support')} <b>Поддержка</b>\n\n"
         "Вопросы о работе бота, оплате и возвратах.\n"
-        "• Ежедневно с 09:00 до 23:00 (МСК), ответ за 5–15 минут\n"
+        "• Ежедневно с 09:00 до 23:00 (МСК)\n"
         "• Возвраты рассматриваем в течение 24 часов\n"
         f"• {ui.e('mail')} {legal_docs.SUPPORT_EMAIL}\n\n"
         "Нажмите кнопку ниже и опишите вопрос: оператор ответит в этом чате."

@@ -114,6 +114,10 @@ class AccessControlMiddleware(BaseMiddleware):
         user_id = user.id
         bot: Bot = data.get("bot")
 
+        # В группах бот только копирует лоты: там свой обработчик, без меню и предложений триала.
+        if isinstance(event, Message) and event.chat.type != "private":
+            return await handler(event, data)
+
         # Финансовые служебные события обязательны даже при истёкшем доступе
         # и выключенном checkout. Их проверяет отдельный платёжный обработчик.
         if isinstance(event, Message) and (event.successful_payment or event.refunded_payment):

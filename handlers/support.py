@@ -160,7 +160,7 @@ async def handle_user_support_message(message: Message, state: FSMContext, bot: 
 
     await message.answer(
         f"{ui.e('ok')} <b>Обращение отправлено</b>\n\n"
-        "Ответ придёт в этот чат. Обычно отвечаем за 5–15 минут с 09:00 до 23:00 (МСК).",
+        "Ответ придёт в этот чат. Поддержка работает с 09:00 до 23:00 (МСК).",
         reply_markup=ui.kb([ui.home_btn()]),
         parse_mode="HTML"
     )

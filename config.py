@@ -153,6 +153,8 @@ AVITO_MAX_PAGES_PER_SCAN = min(5, positive_int_setting("AVITO_MAX_PAGES_PER_SCAN
 PAID_PLANS: tuple[str, ...] = ("lite", "standart", "pro")
 PLAN_TITLES: dict[str, str] = {"lite": "Базовый", "standart": "Средний", "pro": "Полный", "test": "Тест", "base": "Пробный"}
 PLAN_RADARS: dict[str, int] = {"lite": 1, "standart": 2, "pro": 4}
+# Tariffs that also copy every lot into a group chat (the trial counts as Полный).
+GROUP_DELIVERY_PLANS: frozenset[str] = frozenset({"standart", "pro"})
 TRIAL_RADARS = 1
 TRIAL_HOURS = 24
 # The trial reminder goes out this many seconds before the end.
@@ -337,15 +339,49 @@ def apply_stars_prices(lite: int, standart: int, pro: int) -> None:
     STARS_PRICE_LITE, STARS_PRICE_STANDART, STARS_PRICE_PRO = lite, standart, pro
 
 
-def stars_price(plan: str) -> int:
+# A subscription is bought for one of these periods; longer ones are cheaper per month.
+PERIOD_MONTHS: tuple[int, ...] = (1, 3)
+PERIOD_DISCOUNT_PERCENT: dict[int, int] = {1: 0, 3: positive_int_setting("PERIOD_3M_DISCOUNT", "10")}
+if not all(0 <= PERIOD_DISCOUNT_PERCENT[m] < 100 for m in PERIOD_MONTHS):
+    raise ValueError("PERIOD_3M_DISCOUNT must be below 100")
+
+
+def period_days(months: int) -> int:
+    return STARS_SUBSCRIPTION_DAYS * months
+
+
+def period_months(days: int) -> int:
+    """Months of a paid order by its days; old orders are always 30 days."""
+    return max(1, int(days) // STARS_SUBSCRIPTION_DAYS)
+
+
+def period_title(months: int) -> str:
+    return "1 месяц" if months == 1 else f"{months} {plural(months, 'месяц', 'месяца', 'месяцев')}"
+
+
+def nice_price(value: int) -> int:
+    """Nearest price that ends in 9 (below 1000) or 99 (from 1000): 537 → 539, 1212 → 1199, 2427 → 2399."""
+    step = 100 if value >= 1000 else 10
+    return max(step - 1, int((value + 1) / step + 0.5) * step - 1)
+
+
+def _period_total(monthly: int, months: int) -> int:
+    if months not in PERIOD_MONTHS:
+        raise ValueError("Unknown subscription period")
+    if months == 1:
+        return monthly
+    return nice_price(int(monthly * months * (100 - PERIOD_DISCOUNT_PERCENT[months]) / 100 + 0.5))
+
+
+def stars_price(plan: str, months: int = 1) -> int:
     if plan == "test":
         return STARS_PRICE_TEST
     if plan == "lite":
-        return STARS_PRICE_LITE
+        return _period_total(STARS_PRICE_LITE, months)
     if plan == "standart":
-        return STARS_PRICE_STANDART
+        return _period_total(STARS_PRICE_STANDART, months)
     if plan == "pro":
-        return STARS_PRICE_PRO
+        return _period_total(STARS_PRICE_PRO, months)
     raise ValueError("Unknown tariff plan")
 
 
@@ -361,8 +397,8 @@ if max(PRICE_RUB.values()) > PAYMENT_LIMIT_RUB:
     raise ValueError(f"Цена тарифа не должна превышать {PAYMENT_LIMIT_RUB} ₽ за одну оплату")
 
 
-def rub_price(plan: str) -> int:
-    return PRICE_RUB[plan]
+def rub_price(plan: str, months: int = 1) -> int:
+    return _period_total(PRICE_RUB[plan], months)
 
 
 def plan_title(plan: str | None) -> str:

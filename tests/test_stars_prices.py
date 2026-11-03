@@ -72,7 +72,7 @@ class TestStarsPrices(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
     async def test_tariff_card_offers_the_new_price(self):
         await self.send_prices("250 500 1000")
         await self.dispatch_callback("buy_tariff:pro", self.user_id)
-        self.assertIn("stars_buy:pro:1000", self.callback_values())
+        self.assertIn("stars_buy:pro:1:1000", self.callback_values())
 
     async def test_bad_input_changes_nothing_and_keeps_asking(self):
         for text in ("100", "abc", "500 400 900", "0 1 2", "1 2 1000000", "1.5 2 3"):

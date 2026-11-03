@@ -15,6 +15,7 @@ from aiogram import Bot
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramForbiddenError,
+    TelegramMigrateToChat,
     TelegramNetworkError,
     TelegramRetryAfter,
 )
@@ -557,6 +558,72 @@ def _extract_photo_file_id(message_obj) -> Optional[str]:
     return None
 
 
+# Copies of lots for the user's group run beside delivery: the user's own chat never waits for the group.
+_MIRROR_TASKS: set[asyncio.Task] = set()
+
+
+def _group_keyboard(keyboard: Optional[InlineKeyboardMarkup]) -> Optional[InlineKeyboardMarkup]:
+    """Only link buttons go to the group: the others act on the owner's radars and blacklist."""
+    if not keyboard:
+        return None
+    rows = [[b for b in row if b.url] for row in keyboard.inline_keyboard]
+    rows = [row for row in rows if row]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+async def mirror_to_group(bot: Bot, user_id: int, message, keyboard: Optional[InlineKeyboardMarkup], silent: bool) -> bool:
+    """Copy a delivered lot into the user's group. Best effort: a failure never touches the user's delivery."""
+    chat_id = await database.get_mirror_chat(user_id)
+    if not chat_id or message is None or flood_seconds_left(chat_id) > 0:
+        return False
+    user = await database.get_user(user_id)
+    if not user or database.classify_user_tariff(user)[0] not in config.GROUP_DELIVERY_PLANS:
+        return False
+    for _ in range(2):
+        try:
+            await bot.copy_message(
+                chat_id=chat_id, from_chat_id=user_id, message_id=message.message_id,
+                reply_markup=_group_keyboard(keyboard), disable_notification=silent,
+            )
+            return True
+        except TelegramMigrateToChat as exc:
+            # The group became a supergroup and got a new id.
+            chat_id = int(exc.migrate_to_chat_id)
+            await database.set_mirror_chat(user_id, chat_id)
+        except TelegramRetryAfter as exc:
+            pause_flooded_chat(chat_id, float(exc.retry_after))
+            log_event(logger, logging.INFO, "send.group", f"Группа {chat_id} упёрлась в лимит Telegram, копии пропущены",
+                      chat=user_id, group=chat_id, retry_after=exc.retry_after)
+            return False
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            reason = str(exc).lower()
+            if isinstance(exc, TelegramBadRequest) and not any(
+                marker in reason for marker in ("chat not found", "not enough rights", "have no rights", "kicked")
+            ):
+                logger.debug("Group copy refused for chat %s: %s", user_id, exc)
+                return False
+            # The bot was removed from the group or the group is gone: stop copying until the user links it again.
+            await database.set_mirror_chat(user_id, None)
+            log_event(logger, logging.INFO, "send.group", f"Группа {chat_id} отключена: {exc}", chat=user_id, group=chat_id)
+            return False
+        except Exception as exc:
+            logger.debug("Group copy failed for chat %s: %s", user_id, exc)
+            return False
+    return False
+
+
+async def schedule_mirror(bot: Bot, user_id: int, message, keyboard: Optional[InlineKeyboardMarkup], silent: bool) -> None:
+    # Called right after a successful send: it must never raise, or the lot would be sent again.
+    try:
+        if not await database.get_mirror_chat(user_id):
+            return  # cached after the first lot: no task and no query for users without a group
+        task = asyncio.create_task(mirror_to_group(bot, user_id, message, keyboard, silent))
+        _MIRROR_TASKS.add(task)
+        task.add_done_callback(_MIRROR_TASKS.discard)
+    except Exception as exc:
+        logger.debug("Group copy not scheduled for chat %s: %s", user_id, exc)
+
+
 async def send_ad_to_user(
     bot: Bot,
     parser: Optional[AvitoParser],
@@ -614,7 +681,7 @@ async def send_ad_to_user(
         try:
             if not await prepare_send():
                 return False
-            await bot.send_photo(
+            msg = await bot.send_photo(
                 chat_id=user_id,
                 photo=cached_fid,
                 caption=caption,
@@ -625,6 +692,7 @@ async def send_ad_to_user(
             logger.debug(
                 f"Радар #{search_id}{owner_str}: file_id из кэша · {it.price} · «{it.title[:35]}»"
             )
+            await schedule_mirror(bot, user_id, msg, keyboard, silent)
             return True
         except (TelegramForbiddenError, TelegramRetryAfter):
             raise
@@ -650,6 +718,7 @@ async def send_ad_to_user(
             logger.debug(
                 f"Радар #{search_id}{owner_str}: фото по URL · {it.price} · «{it.title[:35]}»"
             )
+            await schedule_mirror(bot, user_id, msg, keyboard, silent)
             return True
         except (TelegramForbiddenError, TelegramRetryAfter):
             raise
@@ -662,7 +731,7 @@ async def send_ad_to_user(
                     try:
                         if not await prepare_send():
                             return False
-                        await bot.send_photo(
+                        msg = await bot.send_photo(
                             chat_id=user_id,
                             photo=fid_after_lock,
                             caption=caption,
@@ -670,6 +739,7 @@ async def send_ad_to_user(
                             disable_notification=silent,
                             parse_mode="HTML",
                         )
+                        await schedule_mirror(bot, user_id, msg, keyboard, silent)
                         return True
                     except (TelegramForbiddenError, TelegramRetryAfter):
                         raise
@@ -696,6 +766,7 @@ async def send_ad_to_user(
                             logger.debug(
                                 f"Радар #{search_id}{owner_str}: фото загрузкой · {it.price} · «{it.title[:35]}»"
                             )
+                            await schedule_mirror(bot, user_id, msg, keyboard, silent)
                             return True
                         except (TelegramForbiddenError, TelegramRetryAfter):
                             raise
@@ -707,7 +778,7 @@ async def send_ad_to_user(
         try:
             if not await prepare_send():
                 return False
-            await bot.send_message(
+            msg = await bot.send_message(
                 chat_id=user_id,
                 text=caption,
                 reply_markup=keyboard,
@@ -718,6 +789,7 @@ async def send_ad_to_user(
             logger.debug(
                 f"Радар #{search_id}{owner_str}: текстом · {it.price} · «{it.title[:35]}»"
             )
+            await schedule_mirror(bot, user_id, msg, keyboard, silent)
             return True
         except (TelegramForbiddenError, TelegramRetryAfter):
             raise
@@ -1452,14 +1524,16 @@ async def deliver_digest(bot: Bot, parser: Optional[AvitoParser], rows: list[dic
             if not row.get("send_started_at"):
                 await database.mark_event_send_started(ctx["id"], ctx["token"])
         await _await_rate_limit(user_id)
-        await bot.send_message(
+        digest_silent = all(ctx.get("silent") for _, ctx in ready)
+        digest_msg = await bot.send_message(
             chat_id=user_id,
             text=build_digest_text([ctx for _, ctx in ready]),
             parse_mode="HTML",
             disable_web_page_preview=True,
             reply_markup=build_digest_keyboard([ctx for _, ctx in ready]),
-            disable_notification=all(ctx.get("silent") for _, ctx in ready),
+            disable_notification=digest_silent,
         )
+        await schedule_mirror(bot, user_id, digest_msg, None, digest_silent)
     except asyncio.CancelledError:
         for row, ctx in ready:
             await asyncio.shield(database.release_notification(ctx["id"], ctx["token"], 0))

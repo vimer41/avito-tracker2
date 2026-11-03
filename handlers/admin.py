@@ -983,9 +983,13 @@ async def cb_admin_extend_go(call: CallbackQuery, state: FSMContext, bot: Bot):
 # ── Цены в Telegram Stars ──────────────────────────────────────────────
 
 def _stars_prices_screen() -> tuple[str, InlineKeyboardMarkup]:
-    prices = "\n".join(f"{config.plan_title(plan)}: <b>{config.stars_price(plan)}</b> ⭐" for plan in config.PAID_PLANS)
+    prices = "\n".join(
+        f"{config.plan_title(plan)}: <b>{config.stars_price(plan)}</b> ⭐ · 3 мес: {config.stars_price(plan, 3)} ⭐"
+        for plan in config.PAID_PLANS
+    )
     text = (
         f"{ui.e('star')} <b>Цены в Stars</b> за 30 дней\n\n{prices}\n\n"
+        f"<i>Цена за 3 месяца считается сама: месяц × 3 − {config.PERIOD_DISCOUNT_PERCENT[3]}%, округлённо до …9 или …99.</i>\n\n"
         "<blockquote>Новые цены действуют сразу. Счета со старой ценой оплатить нельзя: клиент откроет тариф заново. "
         "Цены в рублях на экране тарифов не меняются.</blockquote>"
     )

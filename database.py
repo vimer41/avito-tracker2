@@ -611,6 +611,7 @@ async def init_db():
             "night_from": "INTEGER NOT NULL DEFAULT 23",
             "night_to": "INTEGER NOT NULL DEFAULT 8",
             "reminded_key": "TEXT NOT NULL DEFAULT ''",
+            "mirror_chat_id": "INTEGER",
         })
 
         await db.execute("""
@@ -1404,6 +1405,28 @@ async def get_night_settings(user_id: int) -> tuple[int, int, int]:
             if row else (NIGHT_OFF, 23, 8)
         )
     return _NIGHT_MODE_CACHE[uid]
+
+
+# user_id -> group chat that gets a copy of every lot (Средний and Полный), or None.
+_MIRROR_CHAT_CACHE: dict[int, Optional[int]] = {}
+
+
+async def set_mirror_chat(user_id: int, chat_id: Optional[int]) -> None:
+    async with writer_connection() as db:
+        await db.execute("UPDATE users SET mirror_chat_id = ? WHERE user_id = ?", (chat_id, int(user_id)))
+        await db.commit()
+    _MIRROR_CHAT_CACHE[int(user_id)] = int(chat_id) if chat_id else None
+
+
+async def get_mirror_chat(user_id: int) -> Optional[int]:
+    """Cached per user: it is read for every delivered lot and changes only from the profile or the group."""
+    uid = int(user_id)
+    if uid not in _MIRROR_CHAT_CACHE:
+        async with reader_connection() as db:
+            async with db.execute("SELECT mirror_chat_id FROM users WHERE user_id = ?", (uid,)) as cursor:
+                row = await cursor.fetchone()
+        _MIRROR_CHAT_CACHE[uid] = int(row[0]) if row and row[0] else None
+    return _MIRROR_CHAT_CACHE[uid]
 
 
 async def get_users_with_subscription() -> List[Dict[str, Any]]:

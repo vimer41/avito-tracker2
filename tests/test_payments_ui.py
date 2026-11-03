@@ -69,7 +69,7 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
     async def test_invoice_is_one_xtr_price_without_provider_or_autobilling(self):
         before = await database.get_user(self.user_id)
         await self.dispatch_callback("buy_tariff:pro")
-        self.assertIn("stars_buy:pro:899", self.callback_values())
+        self.assertIn("stars_buy:pro:1:899", self.callback_values())
         await self.dispatch_callback("stars_buy:pro:899")
         invoice = self.methods("SendInvoice")[-1]
         self.assertEqual(invoice.currency, "XTR")
@@ -81,10 +81,24 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("subscription_period", invoice.model_dump())
         self.assertEqual(await database.get_user(self.user_id), before)
 
+    async def test_three_months_is_ten_percent_cheaper_and_gives_90_days(self):
+        await self.dispatch_callback("buy_tariff:pro:3")
+        text = self.methods("EditMessageText")[-1].text
+        self.assertIn("2399 ₽", text)
+        self.assertIn("stars_buy:pro:3:2399", self.callback_values())
+        await self.dispatch_callback("stars_buy:pro:3:899")
+        self.assertEqual(self.methods("SendInvoice"), [])
+        await self.dispatch_callback("stars_buy:pro:3:2399")
+        invoice = self.methods("SendInvoice")[-1]
+        self.assertEqual([p.amount for p in invoice.prices], [2399])
+        order = await billing.get_order(payload=invoice.payload)
+        self.assertEqual((order["total_amount"], order["days"]), (2399, 90))
+        await billing.approve_checkout("q3", self.user_id, invoice.payload, "XTR", 2399)
+
     @patch.object(config, "STARS_TEST_ENABLED", True)
     async def test_test_tariff_ui_and_invoice(self):
         await self.dispatch_callback("buy_tariff:test")
-        self.assertIn("stars_buy:test:10", self.callback_values())
+        self.assertIn("stars_buy:test:1:10", self.callback_values())
         await self.dispatch_callback("stars_buy:test:10")
         invoice = self.methods("SendInvoice")[-1]
         self.assertEqual(invoice.currency, "XTR")
@@ -124,7 +138,7 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
     async def test_tariff_card_offers_sbp_stars_and_crypto_but_only_stars_charges(self):
         await self.dispatch_callback("buy_tariff:lite")
         values = self.callback_values()
-        for value in ("pay_method:sbp:lite", "stars_buy:lite:199", "pay_method:crypto:lite"):
+        for value in ("pay_method:sbp:lite", "stars_buy:lite:1:199", "pay_method:crypto:lite"):
             self.assertIn(value, values)
         self.assertIn("199 ₽", self.methods("EditMessageText")[-1].text)
         for method in ("sbp", "crypto"):
@@ -255,7 +269,7 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         text = self.methods("SendMessage")[-1].text
         self.assertIn("Пользовательское соглашение", text)
         self.assertIn("mekbuda", text)
-        self.assertIn("31.10.2026", text)
+        self.assertIn("03.11.2026", text)
         self.assertIn("doc_page:agreement:1", self.callback_values())
 
         await self.dispatch_callback("doc_page:agreement:2")

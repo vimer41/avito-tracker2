@@ -13,13 +13,15 @@ class PaymentValidationError(ValueError):
     pass
 
 
-async def create_order(user_id: int, plan: str) -> dict[str, Any]:
+async def create_order(user_id: int, plan: str, months: int = 1) -> dict[str, Any]:
     if not config.STARS_PAYMENTS_ENABLED:
         raise PaymentValidationError("Приём платежей временно выключен.")
     if plan == "test" and not config.STARS_TEST_ENABLED:
         raise PaymentValidationError("Этот тариф недоступен. Откройте список тарифов заново.")
-    amount = config.stars_price(plan)
-    days = 1 if plan == "test" else config.STARS_SUBSCRIPTION_DAYS
+    if months not in config.PERIOD_MONTHS or (plan == "test" and months != 1):
+        raise PaymentValidationError("Такого срока нет. Откройте тариф заново.")
+    amount = config.stars_price(plan, months)
+    days = 1 if plan == "test" else config.period_days(months)
     user = await database.get_user(user_id)
     if not user:
         raise PaymentValidationError("Сначала откройте /start.")
@@ -70,7 +72,7 @@ async def approve_checkout(query_id: str, user_id: int, payload: str, currency: 
             raise PaymentValidationError("Счёт не найден или принадлежит другому пользователю.")
         if currency != "XTR" or amount != order["total_amount"]:
             raise PaymentValidationError("Валюта или сумма счёта не совпадает. Откройте тариф заново.")
-        if amount != config.stars_price(order["tariff_plan"]) or not order["valid"]:
+        if amount != config.stars_price(order["tariff_plan"], config.period_months(order["days"])) or not order["valid"]:
             raise PaymentValidationError("Счёт устарел. Откройте тариф и получите новый счёт.")
         if order["status"] == "approved" and order["pre_checkout_query_id"] == query_id:
             return

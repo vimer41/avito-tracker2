@@ -27,13 +27,14 @@ async def payment_terms(event):
         f"Редакция от {legal_docs.DOCS_DATE} · Код проверки: <code>{legal_docs.VERIFICATION_CODE}</code>\n\n"
         + "".join(
             f"• <b>{config.plan_title(plan)}:</b> {config.rub_price(plan)} ₽ или {config.stars_price(plan)} ⭐ / 30 дней, "
+            f"{config.rub_price(plan, 3)} ₽ или {config.stars_price(plan, 3)} ⭐ / 90 дней; "
             f"радаров — до {config.plan_radars(plan)}, проверка раз в {config.plan_interval(plan)} с.\n"
             for plan in config.PAID_PLANS
         ) + "\n"
         "<b>Правила предоставления услуги:</b>\n"
         "• Услуга является нематериальной цифровой услугой по программному мониторингу открытых объявлений.\n"
-        "• Разовая оплата за 30 дней доступа, <b>без автосписаний</b>. Подписка включается сразу после подтверждения транзакции.\n"
-        "• Неиспользованный оплаченный срок сохраняется: 30 дней суммируются к текущей дате окончания.\n"
+        "• Разовая оплата за 30 или 90 дней доступа, <b>без автосписаний</b>. Подписка включается сразу после подтверждения транзакции.\n"
+        "• Неиспользованный оплаченный срок сохраняется: оплаченные дни суммируются к текущей дате окончания.\n"
         f"• Максимальная сумма одной оплаты: не более {legal_docs.LIMIT_TEXT}.\n"
         "• Скорость и доступность объявлений зависят от площадки Авито, сетевых ограничений и нагрузки сервера.\n\n"
         "<b>Возврат средств и поддержка:</b>\n"
@@ -61,24 +62,32 @@ async def legacy_checkout(call: CallbackQuery):
 @router.callback_query(F.data.startswith("stars_buy:"))
 async def buy_stars(call: CallbackQuery, bot: Bot, state: FSMContext):
     try:
-        _, plan, displayed_price = call.data.split(":")
-        if int(displayed_price) != config.stars_price(plan):
+        # stars_buy:<plan>:<months>:<price>; buttons from before periods have no months and mean one month.
+        parts = call.data.split(":")
+        if len(parts) == 3:
+            parts.insert(2, "1")
+        _, plan, months_raw, displayed_price = parts
+        months = int(months_raw)
+        if months not in config.PERIOD_MONTHS:
+            raise billing.PaymentValidationError("Такого срока нет. Откройте тариф заново.")
+        if int(displayed_price) != config.stars_price(plan, months):
             raise billing.PaymentValidationError("Цена изменилась. Откройте тариф заново и подтвердите новые условия.")
         if not call.message or call.message.chat.type != "private" or call.message.chat.id != call.from_user.id:
             raise billing.PaymentValidationError("Оплата доступна только в личном чате с ботом.")
-        order = await billing.create_order(call.from_user.id, plan)
+        order = await billing.create_order(call.from_user.id, plan, months)
     except ValueError as exc:
         await call.answer(str(exc), show_alert=True)
         return
     await state.clear()
     await call.answer("Открываю счёт Telegram Stars")
     try:
-        plan_title = "AVITO RADAR · ТЕСТ · 1 день" if plan == "test" else f"AVITO RADAR · {config.plan_title(plan)} · 30 дней"
+        period = config.period_title(months)
+        plan_title = "AVITO RADAR · ТЕСТ · 1 день" if plan == "test" else f"AVITO RADAR · {config.plan_title(plan)} · {period}"
         plan_desc = "Тестовая проверка оплаты Telegram Stars (1 день)." if plan == "test" else (
             f"Радаров — до {config.plan_radars(plan)}, проверка раз в {config.plan_interval(plan)} с. "
             "Разовая подписка, без автосписания. Условия: /terms. Поддержка и возврат: /paysupport."
         )
-        label = "Тестовый доступ (1 день)" if plan == "test" else "Подписка на 30 дней"
+        label = "Тестовый доступ (1 день)" if plan == "test" else f"Подписка на {order['days']} дней ({period})"
         await bot.send_invoice(
             chat_id=call.from_user.id,
             title=plan_title,
