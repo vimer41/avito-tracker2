@@ -24,7 +24,7 @@ _alerted_at = 0.0
 
 def offer() -> tuple[str, InlineKeyboardMarkup]:
     text = (
-        f"{ui.e('trial')} <b>{config.TRIAL_HOURS} часов бесплатно</b>\n"
+        f"{ui.e('trial')} <b>{config.TRIAL_TEXT} бесплатно</b>\n"
         "Новые объявления Авито приходят в Telegram, как только появляются в поиске.\n"
         f"Один радар, остальное как на тарифе «Полный»: проверка раз в {config.plan_interval('pro')} с.\n\n"
         "Подпишитесь на наш канал, и пробный период включится сразу:\n"

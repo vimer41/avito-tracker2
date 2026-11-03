@@ -45,7 +45,7 @@ class TestAvitoRadarSystem(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await database.is_user_allowed(trial_user_id))
         self.assertTrue((await database.activate_trial(trial_user_id))["success"])
 
-        # Доступ активен в течение 6 часов
+        # Доступ активен на время триала
         is_allowed = await database.is_user_allowed(trial_user_id)
         self.assertTrue(is_allowed)
 

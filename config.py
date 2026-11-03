@@ -154,7 +154,25 @@ PAID_PLANS: tuple[str, ...] = ("lite", "standart", "pro")
 PLAN_TITLES: dict[str, str] = {"lite": "Базовый", "standart": "Средний", "pro": "Полный", "test": "Тест", "base": "Пробный"}
 PLAN_RADARS: dict[str, int] = {"lite": 1, "standart": 2, "pro": 4}
 TRIAL_RADARS = 1
-TRIAL_HOURS = 6
+TRIAL_HOURS = 24
+# The trial reminder goes out this many seconds before the end.
+TRIAL_REMIND_BEFORE = 1800
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """plural(24, "час", "часа", "часов") -> "24 часа"."""
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} {one}"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return f"{n} {few}"
+    return f"{n} {many}"
+
+
+def hours_word(n: int) -> str:
+    return plural(n, "час", "часа", "часов")
+
+
+TRIAL_TEXT = hours_word(TRIAL_HOURS)
 # The trial is granted for subscribing to this channel; the bot must be its admin to check that.
 TRIAL_CHANNEL = os.getenv("TRIAL_CHANNEL", "@avitoradar1").strip()
 TARIFF_SCAN_INTERVAL: dict[str, float] = {
@@ -172,7 +190,7 @@ TELEGRAM_CHAT_INTERVAL = positive_float_setting("TELEGRAM_CHAT_INTERVAL", "1.0")
 NOTIFICATION_DIGEST_MIN = positive_int_setting("NOTIFICATION_DIGEST_MIN", "4")
 # Daily admin report time (MSK) and renewal reminders.
 DAILY_REPORT_HOUR = 9
-REMINDER_CHECK_INTERVAL = 600
+REMINDER_CHECK_INTERVAL = 300
 
 
 def is_quiet_hour_msk(start_hour: int, end_hour: int, now_epoch: float | None = None) -> bool:
@@ -213,6 +231,8 @@ BROAD_RADAR_MAX_PAGES = positive_int_setting("BROAD_RADAR_MAX_PAGES", "3")
 SEEN_CACHE_TTL_HOURS = positive_float_setting("SEEN_CACHE_TTL_HOURS", "48")
 SEEN_CACHE_MAX_PER_SOURCE = positive_int_setting("SEEN_CACHE_MAX_PER_SOURCE", "1000")
 CATCHUP_MAX_AGE_MINUTES = positive_int_setting("CATCHUP_MAX_AGE_MINUTES", "30")
+# The first scan after a radar is resumed delivers lots up to this age.
+RESUME_MAX_AGE_MINUTES = 10
 CATCHUP_MAX_ITEMS = positive_int_setting("CATCHUP_MAX_ITEMS", "10")
 CATCHUP_MAX_PAGES = positive_int_setting("CATCHUP_MAX_PAGES", "5")
 METRICS_WINDOW_SECONDS = positive_int_setting("METRICS_WINDOW_SECONDS", "3600")

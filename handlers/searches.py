@@ -568,7 +568,10 @@ async def cb_toggle_search(call: CallbackQuery):
     status_str = "возобновлён 🟢" if new_status else "приостановлен ⏸"
     log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Статус радара", f"Радар #{search_id} -> {status_str}", status="OK")
     logger.info(f"⏯ [РАДАР] Пользователь ID:{call.from_user.id} переключил статус радара #{search_id} -> {status_str}")
-    await call.answer("Радар запущен" if new_status else "Радар на паузе")
+    await call.answer(
+        f"Радар запущен. Пришлю лоты за последние {config.RESUME_MAX_AGE_MINUTES} минут"
+        if new_status else "Радар на паузе"
+    )
 
     s = await database.get_search(search_id)
     if not s:

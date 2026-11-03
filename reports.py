@@ -33,16 +33,16 @@ def _until_epoch(raw) -> Optional[float]:
 
 
 def reminder_kind(user: dict, now: float) -> Optional[str]:
-    """Which reminder is due: '3d', '1d', '1h' (trial), 'end', or None."""
+    """Which reminder is due: '3d', '1d', '30m' (trial), 'end', or None."""
     until = _until_epoch(user.get("subscription_until"))
     if until is None or config.is_admin(int(user["user_id"])):
         return None
     left = until - now
-    is_trial = bool(user.get("trial_used")) and not bool(user.get("is_allowed"))
+    is_trial = _is_trial(user)
     if left <= 0:
         return "end" if left > -DAY else None
     if is_trial:
-        return "1h" if left <= 3600 else None
+        return "30m" if left <= config.TRIAL_REMIND_BEFORE else None
     if left <= DAY:
         return "1d"
     if left <= 3 * DAY:
@@ -50,13 +50,22 @@ def reminder_kind(user: dict, now: float) -> Optional[str]:
     return None
 
 
-def reminder_text(user: dict, kind: str) -> str:
+def _is_trial(user: dict) -> bool:
+    return bool(user.get("trial_used")) and not bool(user.get("is_allowed"))
+
+
+def reminder_text(user: dict, kind: str, found: Optional[int] = None) -> str:
     plan = config.plan_title(user.get("tariff_plan"))
-    is_trial = bool(user.get("trial_used")) and not bool(user.get("is_allowed"))
+    is_trial = _is_trial(user)
     date = database.format_subscription_date(user.get("subscription_until")).split(" · ")[0]
     if kind == "end" and is_trial:
+        result = ""
+        if found:
+            lots = config.plural(found, "новый лот", "новых лота", "новых лотов")
+            result = f"За пробный период радар прислал вам <b>{lots}</b>.\n"
         return (
             f"{ui.e('time')} <b>Пробный период закончился</b>\n\n"
+            f"{result}"
             "Радары и настройки сохранены. Выберите тариф, и бот сразу снова начнёт присылать новые лоты."
         )
     if kind == "end":
@@ -64,9 +73,10 @@ def reminder_text(user: dict, kind: str) -> str:
             f"{ui.e('time')} <b>Подписка «{plan}» закончилась</b>\n\n"
             "Новые лоты больше не приходят. Радары и стоп-слова сохранены: продлите подписку, и всё заработает сразу."
         )
-    if kind == "1h":
+    if kind == "30m":
+        minutes = config.plural(max(1, round(config.TRIAL_REMIND_BEFORE / 60)), "минуту", "минуты", "минут")
         return (
-            f"{ui.e('time')} <b>Пробный период закончится через час</b>\n\n"
+            f"{ui.e('time')} <b>Пробный период закончится через {minutes}</b>\n\n"
             "Чтобы не пропустить новые лоты, выберите тариф заранее."
         )
     when = "завтра" if kind == "1d" else "через 3 дня"
@@ -88,8 +98,15 @@ async def send_due_reminders(bot: Bot, now: Optional[float] = None) -> int:
         if user.get("reminded_key") == key:
             continue
         user_id = int(user["user_id"])
+        found = None
+        if kind == "end" and _is_trial(user):
+            until = _until_epoch(user.get("subscription_until")) or now
+            try:
+                found = await database.count_sent_lots(user_id, until - config.TRIAL_HOURS * 3600, until)
+            except Exception as exc:
+                logger.warning("Не посчитаны лоты за триал %s: %s", user_id, exc)
         try:
-            await bot.send_message(user_id, reminder_text(user, kind), parse_mode="HTML", reply_markup=ui.kb(
+            await bot.send_message(user_id, reminder_text(user, kind, found), parse_mode="HTML", reply_markup=ui.kb(
                 [ui.btn("Продлить" if kind != "end" else "Выбрать тариф", "tariffs",
                         callback_data="open_subscription_menu", style="success")],
             ))

@@ -1128,6 +1128,8 @@ async def is_user_allowed(user_id: int) -> bool:
 
 async def set_user_allowed(user_id: int, is_allowed: int = 1):
     async with writer_connection() as db:
+        if is_allowed:
+            await recalibrate_if_no_access_in_transaction(db, user_id)
         await db.execute(
             "UPDATE users SET is_allowed = ?, subscription_until = NULL, trial_used = 1, subscription_revision = subscription_revision + 1 WHERE user_id = ?",
             (int(bool(is_allowed)), user_id),
@@ -1178,9 +1180,25 @@ async def find_users_by_query(query: str) -> List[Dict[str, Any]]:
         return results
 
 
+async def recalibrate_if_no_access_in_transaction(db, user_id: int) -> None:
+    """Access is coming back after a gap: the first scan only remembers what is already listed.
+    Without this the user would get a catch-up of old lots, as after downtime."""
+    if int(user_id) in ADMIN_IDS:
+        return
+    async with db.execute(
+        "SELECT 1 FROM users WHERE user_id = ? AND ((is_allowed = 1 AND subscription_until IS NULL) "
+        "OR subscription_until > datetime('now'))",
+        (user_id,),
+    ) as cursor:
+        if await cursor.fetchone():
+            return
+    await db.execute("UPDATE searches SET initialized_at = NULL WHERE user_id = ?", (user_id,))
+
+
 async def grant_vip_access(user_id: int, tariff_plan: str = "pro") -> Dict[str, Any]:
     plan = tariff_plan.lower() if tariff_plan in config.PAID_PLANS else "pro"
     async with writer_connection() as db:
+        await recalibrate_if_no_access_in_transaction(db, user_id)
         await db.execute("""
             UPDATE users 
             SET is_allowed = 1,
@@ -1198,15 +1216,16 @@ async def grant_vip_access(user_id: int, tariff_plan: str = "pro") -> Dict[str, 
 
 async def reset_user_trial(user_id: int) -> Dict[str, Any]:
     async with writer_connection() as db:
+        await recalibrate_if_no_access_in_transaction(db, user_id)
         await db.execute("""
             UPDATE users 
             SET trial_used = 1,
-                subscription_until = datetime('now', '+6 hours'),
+                subscription_until = datetime('now', ?),
                 tariff_plan = 'standart',
                 is_allowed = 0,
                 subscription_revision = subscription_revision + 1
             WHERE user_id = ?
-        """, (user_id,))
+        """, (f"+{config.TRIAL_HOURS} hours", user_id))
         await sync_radar_limit_in_transaction(db, user_id)
         await db.commit()
     user = await get_user(user_id)
@@ -3086,7 +3105,14 @@ async def get_system_stats() -> Dict[str, int]:
         async with db.execute("SELECT COUNT(*) FROM searches") as cur:
             row = await cur.fetchone()
             total_searches = row[0] if row else 0
-        async with db.execute("SELECT COUNT(*) FROM searches WHERE is_active = 1") as cur:
+        query_active = f"""
+            SELECT COUNT(*) FROM searches s JOIN users u ON s.user_id = u.user_id
+            WHERE s.is_active = 1
+              AND (u.user_id IN ({admin_placeholders})
+                   OR (u.is_allowed = 1 AND u.subscription_until IS NULL)
+                   OR u.subscription_until > datetime('now'))
+        """
+        async with db.execute(query_active, ADMIN_IDS) as cur:
             row = await cur.fetchone()
             active_searches = row[0] if row else 0
         async with db.execute("SELECT COUNT(*) FROM seen_items") as cur:
@@ -3114,19 +3140,31 @@ async def activate_trial(user_id: int) -> Dict[str, Any]:
                 await db.commit()
                 return {"success": False, "message": "Пробный период уже был использован ранее."}
 
+        await recalibrate_if_no_access_in_transaction(db, user_id)
         await db.execute("""
             UPDATE users 
             SET trial_used = 1,
-                subscription_until = datetime('now', '+6 hours')
+                subscription_until = datetime('now', ?)
             WHERE user_id = ?
-        """, (user_id,))
+        """, (f"+{config.TRIAL_HOURS} hours", user_id))
         await db.commit()
 
         async with db.execute("SELECT subscription_until FROM users WHERE user_id = ?", (user_id,)) as cur:
             r = await cur.fetchone()
             until = r[0] if r else ""
 
-        return {"success": True, "message": "Пробный период 6 часов успешно активирован!", "until": until}
+        return {"success": True, "message": f"Пробный период {config.TRIAL_TEXT} успешно активирован!", "until": until}
+
+
+async def count_sent_lots(user_id: int, since_epoch: float, until_epoch: float) -> int:
+    """Lots delivered to the user in the window. Sent rows of notification_dedupe live 7 days."""
+    async with reader_connection() as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM notification_dedupe WHERE user_id = ? AND status = 'sent' AND sent_at >= ? AND sent_at <= ?",
+            (int(user_id), float(since_epoch), float(until_epoch)),
+        ) as cur:
+            row = await cur.fetchone()
+    return int(row[0]) if row else 0
 
 
 async def grant_subscription_in_transaction(db, user_id: int, days: int, tariff_plan: Optional[str] = None) -> str:
@@ -3142,6 +3180,7 @@ async def grant_subscription_in_transaction(db, user_id: int, days: int, tariff_
         current = await cursor.fetchone()
     if current is None:
         raise ValueError("Пользователь не найден")
+    await recalibrate_if_no_access_in_transaction(db, user_id)
     # A trial has is_allowed = 0: its hours are free and are not converted.
     if current[1] and effective_plan and effective_plan != (current[0] or "").lower():
         left = subscription_seconds_left({"subscription_until": current[2]})
@@ -3173,6 +3212,35 @@ async def grant_subscription(user_id: int, days: int = 30, tariff_plan: Optional
         until = await grant_subscription_in_transaction(db, user_id, days, tariff_plan)
         await db.commit()
         return until
+
+
+async def count_active_subscriptions() -> int:
+    """Non-admin users whose paid access or trial is running now."""
+    async with reader_connection() as db:
+        async with db.execute("SELECT user_id FROM users WHERE subscription_until > datetime('now')") as cur:
+            return sum(1 for r in await cur.fetchall() if int(r[0]) not in ADMIN_IDS)
+
+
+async def extend_active_subscriptions(seconds: int) -> list[tuple[int, str]]:
+    """Adds time to every running paid access and trial (compensation after downtime). Returns (user_id, new until)."""
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+        raise ValueError("seconds must be a positive integer")
+    async with writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT user_id FROM users WHERE subscription_until > datetime('now')") as cur:
+            ids = [int(r[0]) for r in await cur.fetchall() if int(r[0]) not in ADMIN_IDS]
+        await db.executemany(
+            "UPDATE users SET subscription_until = datetime(subscription_until, '+' || ? || ' seconds'), "
+            "subscription_revision = subscription_revision + 1 WHERE user_id = ?",
+            [(seconds, uid) for uid in ids],
+        )
+        result = []
+        for uid in ids:
+            async with db.execute("SELECT subscription_until FROM users WHERE user_id = ?", (uid,)) as cur:
+                row = await cur.fetchone()
+            result.append((uid, row[0] if row else ""))
+        await db.commit()
+    return result
 
 
 async def create_admin_subscription_action(admin_id: int, user_id: int, plan: str, days: int, page: int = 0) -> str:

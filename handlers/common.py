@@ -70,9 +70,6 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     )
 
 
-TRIAL_HOURS = config.TRIAL_HOURS
-
-
 def radars_word(count: int) -> str:
     if count % 10 == 1 and count % 100 != 11:
         return f"{count} радар"
@@ -162,7 +159,8 @@ async def cmd_help(event):
         f"{ui.e('radar')} <b>1. Добавьте радар</b>\n"
         "Откройте <code>avito.ru</code>, задайте запрос и фильтры: город, цену, состояние. "
         "Скопируйте ссылку из адресной строки и пришлите боту. "
-        "Сортировку по дате бот включит сам; уже выложенные лоты не придут, только новые.\n\n"
+        "Сортировку по дате бот включит сам; уже выложенные лоты не придут, только новые.\n"
+        f"После паузы радар пришлёт лоты за последние {config.RESUME_MAX_AGE_MINUTES} минут.\n\n"
         f"{ui.e('shield')} <b>2. Отсекайте лишнее</b>\n"
         "• <b>Стоп-слова</b>: лоты с этими словами не придут («запчасти», «реплика»).\n"
         "• <b>Чёрный список</b>: кнопка под лотом скрывает все объявления продавца.\n"
@@ -170,15 +168,17 @@ async def cmd_help(event):
         "• <b>Фильтры радара</b>: цена, обязательные слова, только с доставкой, без продвинутых.\n"
         "• <b>Сообщение продавцу</b>: кнопка под лотом копирует ваш текст.\n\n"
         f"{ui.e('tariffs')} <b>3. Тарифы</b>\n"
-        f"Пробный период за подписку на канал: {radars_word(config.TRIAL_RADARS)} на {TRIAL_HOURS} часов, "
+        f"Пробный период за подписку на канал: {radars_word(config.TRIAL_RADARS)} на {config.TRIAL_TEXT}, "
         "остальное как на тарифе «Полный».\n"
         f"{plan_summary('lite')}\n"
         f"{plan_summary('standart')}\n"
         f"{plan_summary('pro')}\n\n"
         f"{ui.e('time')} <b>4. Когда приходит лот</b>\n"
         "Бот проверяет ссылку с частотой вашего тарифа и присылает лот, как только найдёт его. "
-        "Но Авито показывает объявление в поиске не сразу, поэтому обычно лот приходит через 1–3 минуты "
-        "после публикации. При сбоях на Авито или в сети бывает дольше. "
+        "Новое объявление Авито сначала проверяет на модерации и только потом показывает в поиске. "
+        "Бот пришлёт лот сразу, как только тот пройдёт модерацию. При этом в лоте может стоять время "
+        "«3 минуты назад» или больше: Авито считает его от публикации, а не от появления в поиске. "
+        "При сбоях на Авито или в сети бывает дольше. "
         "Лоты старше лимита радара не приходят, по умолчанию лимит 5 минут."
     )
     markup = ui.kb(
@@ -222,7 +222,7 @@ async def cmd_profile(event):
 
     rows = []
     if can_take_trial(user, user_id):
-        rows.append([ui.btn(f"Пробный период {TRIAL_HOURS} часов", "trial", callback_data="activate_trial_btn", style="success")])
+        rows.append([ui.btn(f"Пробный период {config.TRIAL_TEXT}", "trial", callback_data="activate_trial_btn", style="success")])
     if not is_adm:
         has_plan = user.get("subscription_until") or user.get("is_allowed")
         rows.append([ui.btn("Продлить или сменить тариф" if has_plan else "Выбрать тариф", "tariffs",
@@ -348,7 +348,7 @@ async def cmd_subscription_menu(event):
 
     rows = []
     if can_take_trial(user, user_id):
-        rows.append([ui.btn(f"Пробный период {TRIAL_HOURS} часов", "trial", callback_data="activate_trial_btn")])
+        rows.append([ui.btn(f"Пробный период {config.TRIAL_TEXT}", "trial", callback_data="activate_trial_btn")])
     for plan in config.PAID_PLANS:
         mark = " · ваш" if plan == current else ""
         rows.append([ui.btn(

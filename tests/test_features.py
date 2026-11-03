@@ -35,8 +35,13 @@ class TestReminderRules(unittest.TestCase):
     def test_trial_gets_last_hour_and_end_only(self):
         now = time.time()
         self.assertIsNone(reports.reminder_kind(self.user(3 * 3600, trial=True), now))
-        self.assertEqual(reports.reminder_kind(self.user(1800, trial=True), now), "1h")
-        self.assertIn("Пробный период закончился", reports.reminder_text(self.user(-60, trial=True), "end"))
+        self.assertIsNone(reports.reminder_kind(self.user(3000, trial=True), now))
+        self.assertEqual(reports.reminder_kind(self.user(1700, trial=True), now), "30m")
+        self.assertIn("через 30 минут", reports.reminder_text(self.user(1700, trial=True), "30m"))
+        ended = reports.reminder_text(self.user(-60, trial=True), "end")
+        self.assertIn("Пробный период закончился", ended)
+        self.assertNotIn("прислал", ended)
+        self.assertIn("22 новых лота", reports.reminder_text(self.user(-60, trial=True), "end", 22))
 
     def test_admins_get_no_reminders(self):
         admin = next(iter(config.ADMIN_IDS))
@@ -186,6 +191,24 @@ class TestRadarEditing(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await reports.send_due_reminders(bot), 1)
         self.assertEqual(await reports.send_due_reminders(bot), 0)
         self.assertIn("через 3 дня", bot.send_message.await_args.args[1])
+
+    async def test_trial_end_counts_sent_lots(self):
+        user_id = 777003
+        await database.get_or_create_user(user_id)
+        await database.activate_trial(user_id)
+        until = reports._until_epoch((await database.get_user(user_id))["subscription_until"])
+        async with database.writer_connection() as db:
+            for i, sent_at in enumerate((until - 3600, until - 7200, until - (config.TRIAL_HOURS + 1) * 3600)):
+                await db.execute(
+                    "INSERT INTO notification_dedupe (user_id, item_id, status, first_queued_at, sent_at, updated_at) "
+                    "VALUES (?, ?, 'sent', ?, ?, ?)",
+                    (user_id, f"lot{i}", sent_at, sent_at, sent_at),
+                )
+            await db.commit()
+        self.assertEqual(await database.count_sent_lots(user_id, until - config.TRIAL_HOURS * 3600, until), 2)
+        bot = AsyncMock()
+        await reports.send_due_reminders(bot, now=until + 60)
+        self.assertIn("2 новых лота", bot.send_message.await_args.args[1])
 
     async def test_daily_report_renders(self):
         text = await reports.build_daily_report(reset=False)

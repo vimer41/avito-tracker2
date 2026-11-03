@@ -922,7 +922,7 @@ async def process_collected_group_fanout(
         )
         radar_created_epoch = parse_created_epoch(radar)
         if is_resumed_radar:
-            effective_age_min = 10
+            effective_age_min = config.RESUME_MAX_AGE_MINUTES
         elif is_downtime_catchup:
             effective_age_min = config.CATCHUP_MAX_AGE_MINUTES
         else:

@@ -25,6 +25,8 @@ class AdminStates(StatesGroup):
     waiting_for_emoji_pack = State()
     waiting_for_emoji_slot = State()
     waiting_for_stars_prices = State()
+    waiting_for_extend_time = State()
+    waiting_for_extend_reason = State()
 
 
 @router.callback_query(F.data == "admin_probe")
@@ -226,7 +228,7 @@ async def render_user_card_data(target_id: int, page: int = 0):
     blocked_count = len(await database.get_user_blocked_sellers_list(target_id))
 
     if has_access and not is_allowed and trial_used:
-        status_line = "🎁 <b>Бесплатный триал (6 ч)</b>"
+        status_line = f"🎁 <b>Бесплатный триал ({config.TRIAL_HOURS} ч)</b>"
     elif has_access and is_allowed and user.get("subscription_until"):
         status_line = f"🟢 <b>{plan_name} Подписка</b>"
     elif has_access and is_allowed:
@@ -246,7 +248,8 @@ async def render_user_card_data(target_id: int, page: int = 0):
         f"• Статус: {status_line}\n"
         f"• Тариф: <b>{plan_name}</b> (лимит: до {max_radars} радаров{extra_label})\n"
         f"• Срок подписки: <i>{until}</i>\n"
-        f"• Радары: <b>{active_radars}</b> акт. / <b>{len(user_radars)}</b> всего\n"
+        f"• Радары: <b>{active_radars}</b> акт. / <b>{len(user_radars)}</b> всего"
+        + (" (не проверяются: нет доступа)" if active_radars and not has_access else "") + "\n"
         f"• Чёрный список: <b>{blocked_count}</b> продавцов\n"
         f"• Триал использован: <b>{'Да' if trial_used else 'Нет'}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -275,7 +278,7 @@ async def render_user_card_data(target_id: int, page: int = 0):
 
     buttons = [
         [InlineKeyboardButton(text="💳 Выдать / продлить → выбрать тариф", callback_data=f"admin_sub_menu:{target_id}:{page}")],
-        [InlineKeyboardButton(text="🎁 Выдать / обновить триал (6 ч)", callback_data=f"admin_reset_trial_prompt:{target_id}:{page}")],
+        [InlineKeyboardButton(text=f"🎁 Выдать / обновить триал ({config.TRIAL_HOURS} ч)", callback_data=f"admin_reset_trial_prompt:{target_id}:{page}")],
         [InlineKeyboardButton(text=f"📁 Радары ({len(user_radars)})", callback_data=f"admin_user_radars:{target_id}:{page}"),
          InlineKeyboardButton(text="⭐ Платежи / возврат", callback_data=f"admin_payments:{target_id}")],
         limit_row,
@@ -455,13 +458,14 @@ async def cb_admin_reset_trial_prompt(call: CallbackQuery):
     parts = call.data.split(":")
     target_id, page = int(parts[1]), int(parts[2])
     text = (
-        f"🎁 <b>АКТИВАЦИЯ ТРИАЛА (6 ЧАСОВ)</b>\n\n"
+        f"🎁 <b>Активация триала ({config.TRIAL_TEXT})</b>\n\n"
         f"Пользователь: <code>{target_id}</code>\n\n"
-        f"Пользователю будет выдан бесплатный пробный доступ на <b>6 часов</b> (1 радар, проверка раз в {config.plan_interval('base')} с). "
+        f"Пользователю будет выдан бесплатный пробный доступ на <b>{config.TRIAL_TEXT}</b> "
+        f"({config.TRIAL_RADARS} радар, проверка раз в {config.plan_interval('pro')} с, как на «Полном»). "
         "Пользователь получит мгновенное уведомление в чат."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Активировать триал 6 ч", callback_data=f"admin_confirm_trial:{target_id}:{page}")],
+        [InlineKeyboardButton(text=f"✅ Активировать триал {config.TRIAL_HOURS} ч", callback_data=f"admin_confirm_trial:{target_id}:{page}")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{target_id}:{page}")]
     ])
     await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -478,7 +482,7 @@ async def cb_admin_confirm_trial(call: CallbackQuery, bot: Bot):
     user = await database.reset_user_trial(target_id)
     until = database.format_subscription_date(user.get("subscription_until"))
 
-    logger.info("👑 [АДМИН] Администратор ID:%s активировал триал 6ч для пользователя ID:%s", call.from_user.id, target_id)
+    logger.info("👑 [АДМИН] Администратор ID:%s активировал триал %sч для пользователя ID:%s", call.from_user.id, config.TRIAL_HOURS, target_id)
 
     try:
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -488,10 +492,10 @@ async def cb_admin_confirm_trial(call: CallbackQuery, bot: Bot):
         await bot.send_message(
             chat_id=target_id,
             text=(
-                f"🎁 <b>Администратор активировал вам бесплатный пробный период на 6 часов!</b>\n"
+                f"🎁 <b>Администратор активировал вам бесплатный пробный период на {config.TRIAL_TEXT}!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎯 Доступен: <b>1 радар</b>\n"
-                f"📅 Срок действия: <b>{until}</b> (6 ч.)\n\n"
+                f"🎯 Доступен: <b>{config.TRIAL_RADARS} радар</b>\n"
+                f"📅 Срок действия: <b>{until}</b> ({config.TRIAL_HOURS} ч.)\n\n"
                 f"Отправьте ссылку на поиск с Авито прямо в чат или нажмите кнопку ниже:"
             ),
             reply_markup=kb,
@@ -500,7 +504,7 @@ async def cb_admin_confirm_trial(call: CallbackQuery, bot: Bot):
     except Exception as e:
         logger.warning("Не удалось уведомить пользователя %s об активации триала: %s", target_id, e)
 
-    await call.answer("Триал 6 часов активирован!", show_alert=True)
+    await call.answer(f"Триал {config.TRIAL_TEXT} активирован!", show_alert=True)
     text, kb = await render_user_card_data(target_id, page)
     if text:
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -769,9 +773,211 @@ async def cmd_admin_home(event):
         [ui.btn("Отчёт за сутки", "note", callback_data="admin_daily_report"),
          ui.btn("Премиум-эмодзи", "palette", callback_data="admin_emoji")],
         [ui.btn("Цены в Stars", "star", callback_data="admin_prices"),
-         ui.btn("Обновить", "refresh", callback_data="admin_refresh")],
+         ui.btn("Продлить всем", "time", callback_data="admin_extend_all")],
+        [ui.btn("Обновить", "refresh", callback_data="admin_refresh")],
     )
     await _show(event, text, kb)
+
+
+# ── Продлить всем (компенсация после техработ) ─────────────────────────
+
+EXTEND_MAX_SECONDS = 30 * 86400
+EXTEND_REASON_MAX = 2000
+_EXTEND_UNITS = (
+    (("д", "дн", "дня", "дней", "день", "d"), 86400),
+    (("ч", "час", "часа", "часов", "h"), 3600),
+    (("м", "мин", "минут", "минуты", "минуту", "m"), 60),
+)
+
+
+def parse_extend_duration(text: str) -> int:
+    """'2ч', '1д 6ч', '30 мин', '3' (часы) -> seconds. ValueError when it can't be read."""
+    import re
+    raw = (text or "").strip().lower().replace(",", " ")
+    if re.fullmatch(r"\d+", raw):
+        seconds = int(raw) * 3600
+    else:
+        parts = re.findall(r"(\d+)\s*([a-zа-яё]+)", raw)
+        if not parts or re.sub(r"(\d+)\s*([a-zа-яё]+)", "", raw).strip():
+            raise ValueError("bad duration")
+        seconds = 0
+        for number, unit in parts:
+            size = next((s for names, s in _EXTEND_UNITS if unit in names), None)
+            if size is None:
+                raise ValueError("bad unit")
+            seconds += int(number) * size
+    if not 0 < seconds <= EXTEND_MAX_SECONDS:
+        raise ValueError("out of range")
+    return seconds
+
+
+def format_extend_duration(seconds: int) -> str:
+    days, rest = divmod(int(seconds), 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    parts = []
+    if days:
+        parts.append(config.plural(days, "день", "дня", "дней"))
+    if hours:
+        parts.append(config.hours_word(hours))
+    if minutes:
+        parts.append(config.plural(minutes, "минуту", "минуты", "минут"))
+    return " ".join(parts) or "0 минут"
+
+
+def extend_notice_text(seconds: int, reason: str, until: str) -> str:
+    return (
+        f"{ui.e('trial')} <b>Мы добавили вам {format_extend_duration(seconds)}</b>\n\n"
+        f"{html.escape(reason)}\n\n"
+        f"Доступ до: <b>{database.format_subscription_date(until)}</b>"
+    )
+
+
+def _extend_cancel_kb() -> InlineKeyboardMarkup:
+    return ui.kb([ui.btn("Отмена", "cancel", callback_data="admin_extend_cancel")])
+
+
+@router.callback_query(F.data == "admin_extend_all")
+async def cb_admin_extend_all(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminStates.waiting_for_extend_time)
+    await call.answer()
+    count = await database.count_active_subscriptions()
+    await _show(
+        call,
+        f"{ui.e('time')} <b>Продлить всем</b>\n\n"
+        f"Время добавится всем, у кого сейчас идёт подписка или пробный период: <b>{count}</b>.\n\n"
+        "Сколько добавить? Пришлите, например: <code>2ч</code>, <code>30м</code>, <code>1д 6ч</code>. "
+        "Просто число — это часы. Не больше 30 дней.",
+        _extend_cancel_kb(),
+    )
+
+
+@router.callback_query(F.data == "admin_extend_cancel")
+async def cb_admin_extend_cancel(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    await state.clear()
+    await call.answer("Отменено")
+    await cmd_admin_home(call)
+
+
+@router.message(AdminStates.waiting_for_extend_time)
+async def msg_admin_extend_time(message: Message, state: FSMContext):
+    if not config.is_admin(message.from_user.id):
+        return
+    from handlers.searches import route_menu_text
+    if await route_menu_text(message, state):
+        return
+    try:
+        seconds = parse_extend_duration(message.text or "")
+    except ValueError:
+        await message.answer(
+            "Не понял срок. Примеры: <code>2ч</code>, <code>30м</code>, <code>1д 6ч</code>, <code>3</code> (часы). "
+            "Не больше 30 дней.",
+            parse_mode="HTML", reply_markup=_extend_cancel_kb(),
+        )
+        return
+    await state.update_data(extend_seconds=seconds)
+    await state.set_state(AdminStates.waiting_for_extend_reason)
+    await message.answer(
+        f"{ui.e('write')} <b>Добавим {format_extend_duration(seconds)}</b>\n\n"
+        "Напишите, за что добавили время. Этот текст получат все пользователи.\n"
+        "<blockquote>Например: «Извините за технические работы 3 ноября с 14:00 до 16:00, "
+        "бот не присылал лоты. Добавили время, которое вы потеряли.»</blockquote>",
+        parse_mode="HTML", reply_markup=_extend_cancel_kb(),
+    )
+
+
+@router.message(AdminStates.waiting_for_extend_reason)
+async def msg_admin_extend_reason(message: Message, state: FSMContext):
+    if not config.is_admin(message.from_user.id):
+        return
+    from handlers.searches import route_menu_text
+    if await route_menu_text(message, state):
+        return
+    reason = (message.text or "").strip()
+    if not reason or len(reason) > EXTEND_REASON_MAX:
+        await message.answer(
+            f"Пришлите текст сообщения, до {EXTEND_REASON_MAX} символов.", reply_markup=_extend_cancel_kb()
+        )
+        return
+    data = await state.get_data()
+    seconds = int(data.get("extend_seconds") or 0)
+    if seconds <= 0:
+        await state.clear()
+        await message.answer("Срок потерялся, начните заново.", reply_markup=ui.kb(
+            [ui.btn("Продлить всем", "time", callback_data="admin_extend_all")]))
+        return
+    await state.update_data(extend_reason=reason)
+    count = await database.count_active_subscriptions()
+    from datetime import datetime, timedelta, timezone
+    sample_until = (datetime.now(timezone.utc) + timedelta(days=7, seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
+    await message.answer(
+        f"{ui.e('time')} <b>Проверьте перед отправкой</b>\n\n"
+        f"Получат: <b>{count}</b> · добавим <b>{format_extend_duration(seconds)}</b>\n\n"
+        "Так будет выглядеть сообщение (дата у каждого своя):\n"
+        f"<blockquote>{extend_notice_text(seconds, reason, sample_until)}</blockquote>",
+        parse_mode="HTML",
+        reply_markup=ui.kb(
+            [ui.btn("Продлить и отправить", "ok", callback_data="admin_extend_go", style="success")],
+            [ui.btn("Отмена", "cancel", callback_data="admin_extend_cancel")],
+        ),
+    )
+
+
+@router.callback_query(F.data == "admin_extend_go")
+async def cb_admin_extend_go(call: CallbackQuery, state: FSMContext, bot: Bot):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    data = await state.get_data()
+    seconds = int(data.get("extend_seconds") or 0)
+    reason = str(data.get("extend_reason") or "")
+    await state.clear()  # a second press must not extend twice
+    if seconds <= 0 or not reason:
+        await call.answer("Данные устарели, начните заново", show_alert=True)
+        return
+    await call.answer("Продлеваю…")
+    granted = await database.extend_active_subscriptions(seconds)
+    logger.info("Админ %s продлил всем %s с: пользователей %s", call.from_user.id, seconds, len(granted))
+    await _show(call, f"{ui.e('wait')} Время добавлено: <b>{len(granted)}</b>. Рассылаю сообщения…", ui.kb())
+
+    from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+    delivered = failed = 0
+    for user_id, until in granted:
+        text = extend_notice_text(seconds, reason, until)
+        for attempt in range(2):
+            try:
+                await bot.send_message(user_id, text, parse_mode="HTML")
+                delivered += 1
+                break
+            except TelegramRetryAfter as exc:
+                if attempt:
+                    failed += 1
+                else:
+                    await asyncio.sleep(float(exc.retry_after) + 0.5)
+            except TelegramForbiddenError:
+                failed += 1
+                break
+            except Exception as exc:
+                logger.warning("Сообщение о продлении не отправлено %s: %s", user_id, exc)
+                failed += 1
+                break
+        await asyncio.sleep(0.05)  # ~20 messages per second, under Telegram's limit
+
+    await _show(
+        call,
+        f"{ui.e('ok')} <b>Готово</b>\n\n"
+        f"Добавили {format_extend_duration(seconds)}: <b>{len(granted)}</b>\n"
+        f"Сообщение получили: <b>{delivered}</b>"
+        + (f" · не доставлено: <b>{failed}</b> (бот заблокирован или ошибка)" if failed else ""),
+        ui.kb([ui.btn("В админку", "admin", callback_data="admin_refresh")]),
+    )
 
 
 # ── Цены в Telegram Stars ──────────────────────────────────────────────

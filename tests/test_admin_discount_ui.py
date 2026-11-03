@@ -297,7 +297,7 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         user_trial = await database.get_user(self.user_id)
         self.assertIsNotNone(user_trial["subscription_until"])
         notices2 = [m for m in self.methods("SendMessage") if m.chat_id == self.user_id]
-        self.assertTrue(any("6 часов" in m.text for m in notices2))
+        self.assertTrue(any(config.TRIAL_TEXT in m.text for m in notices2))
 
     async def test_admin_view_user_radars(self):
         await self.dispatch_callback(f"admin_user_radars:{self.user_id}:0", config.ADMIN_ID)
