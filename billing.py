@@ -150,21 +150,17 @@ async def create_rub_order(user_id: int, plan: str, months: int = 1, method: str
     """A new order, or this user's still-open order for the same purchase (reused=True): one link per purchase."""
     if not config.PLATEGA_ENABLED:
         raise PaymentValidationError("Оплата рублями временно недоступна.")
-    is_test = plan == "test"
-    if is_test and not config.PLATEGA_TEST_RUB:
-        raise PaymentValidationError("Этот тариф недоступен. Откройте список тарифов заново.")
-    if not is_test and plan not in config.PAID_PLANS:
+    if plan not in config.PAID_PLANS:
         raise PaymentValidationError("Такого тарифа нет. Откройте список тарифов заново.")
-    if months not in config.PERIOD_MONTHS or (is_test and months != 1):
+    if months not in config.PERIOD_MONTHS:
         raise PaymentValidationError("Такого срока нет. Откройте тариф заново.")
     user = await database.get_user(user_id)
     if not user:
         raise PaymentValidationError("Сначала откройте /start.")
-    # Тест разрешён и админу: им проверяют кассу.
-    if not is_test and (config.is_admin(user_id) or (user["is_allowed"] and not user["subscription_until"])):
+    if config.is_admin(user_id) or (user["is_allowed"] and not user["subscription_until"]):
         raise PaymentValidationError("У вас уже есть бессрочный доступ. Оплата не требуется.")
     amount = config.rub_price(plan, months)
-    days = 1 if is_test else config.period_days(months)
+    days = config.period_days(months)
     async with aiosqlite.connect(database.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         await db.execute("BEGIN IMMEDIATE")

@@ -120,14 +120,15 @@ class TestOfferInMiddleware(unittest.IsolatedAsyncioTestCase):
             await common.cmd_start(message, self.state)
         return [call.args[0] for call in message.answer.await_args_list]
 
-    async def test_new_user_gets_code_as_own_message_before_the_offer(self):
+    async def test_new_user_gets_the_offer_without_the_review_code(self):
+        # The review code word was only for the payment provider's shop check: /start sends just the menu
+        # note and the screen, with no separate code message, for anyone.
         texts = await self.start({"trial_used": 0})
-        self.assertEqual(texts[1], legal_docs.VERIFICATION_CODE)
+        self.assertEqual(len(texts), 2)
         self.assertIn("бесплатно", texts[-1])
-
-    async def test_code_is_not_repeated_after_the_trial_or_for_admins(self):
-        self.assertNotIn(legal_docs.VERIFICATION_CODE, await self.start({"trial_used": 1}))
-        self.assertNotIn(legal_docs.VERIFICATION_CODE, await self.start({"trial_used": 0}, config.ADMIN_IDS[0]))
+        for record, user_id in (({"trial_used": 1}, 123456), ({"trial_used": 0}, config.ADMIN_IDS[0])):
+            self.assertEqual(len(await self.start(record, user_id)), 2)
+        self.assertFalse(hasattr(legal_docs, "VERIFICATION_CODE"))
 
     def test_offer_has_channel_and_check_buttons(self):
         _text, markup = trial_gate.offer()

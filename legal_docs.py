@@ -3,8 +3,6 @@
 import config
 
 DOCS_DATE = "03.11.2026"
-# Asked for by the bank during the payment review; remove it once the cashbox is registered.
-VERIFICATION_CODE = "mekbuda"
 SUPPORT_EMAIL = "avitoradar.help.support@gmail.com"
 SERVICE_NAME = "Avito Radar"
 LIMIT_TEXT = f"{config.PAYMENT_LIMIT_RUB:,}".replace(",", " ") + " ₽"
@@ -144,7 +142,7 @@ DOCS: dict[str, tuple[str, str, list[str]]] = {
 
 HUB_TEXT = (
     f"<b>Документы {SERVICE_NAME}</b>\n"
-    f"Редакция от {DOCS_DATE} · Код проверки: <code>{VERIFICATION_CODE}</code>\n\n"
+    f"Редакция от {DOCS_DATE}\n\n"
     "• Услуга: цифровой мониторинг открытых объявлений Авито и уведомления в Telegram.\n"
     f"• Лимит одной оплаты: не более {LIMIT_TEXT}.\n"
     "• Заявление на возврат рассматриваем в течение 24 часов.\n"
@@ -156,4 +154,4 @@ HUB_TEXT = (
 def doc_header(name: str, page: int) -> str:
     title, _, pages = DOCS[name]
     pager = f" · стр. {page + 1}/{len(pages)}" if len(pages) > 1 else ""
-    return f"<b>{title}</b>\nРедакция от {DOCS_DATE} · Код проверки: <code>{VERIFICATION_CODE}</code>{pager}\n\n"
+    return f"<b>{title}</b>\nРедакция от {DOCS_DATE}{pager}\n\n"

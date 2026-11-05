@@ -297,11 +297,11 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await database.is_user_allowed(self.user_id))
         self.assertIn("Деньги не списаны", self.methods("SendMessage")[-1].text)
 
-    async def test_legal_documents_and_verification_code(self):
+    async def test_legal_documents_show_edition_without_review_code(self):
         await self.dispatch_message(text="/agreement")
         text = self.methods("SendMessage")[-1].text
         self.assertIn("Пользовательское соглашение", text)
-        self.assertIn("mekbuda", text)
+        self.assertNotIn("Код проверки", text)
         self.assertIn("03.11.2026", text)
         self.assertIn("doc_page:agreement:1", self.callback_values())
 
@@ -314,13 +314,13 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_message(text="/privacy")
         text = self.methods("SendMessage")[-1].text
         self.assertIn("Политика конфиденциальности", text)
-        self.assertIn("mekbuda", text)
+        self.assertNotIn("Код проверки", text)
         self.assertIn("avitoradar.help.support@gmail.com", text)
 
         await self.dispatch_message(text="/terms")
         text = self.methods("SendMessage")[-1].text
         self.assertIn("Условия подписки", text)
-        self.assertIn("mekbuda", text)
+        self.assertNotIn("Код проверки", text)
         self.assertIn("10 000 ₽", text)
         self.assertIn("24 часов", text)
         self.assertIn(f"{config.rub_price('pro')} ₽", text)

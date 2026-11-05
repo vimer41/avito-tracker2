@@ -26,7 +26,7 @@ async def payment_terms(event):
     message = event.message if isinstance(event, CallbackQuery) else event
     text = (
         "<b>Условия подписки и оплаты</b>\n"
-        f"Редакция от {legal_docs.DOCS_DATE} · Код проверки: <code>{legal_docs.VERIFICATION_CODE}</code>\n\n"
+        f"Редакция от {legal_docs.DOCS_DATE}\n\n"
         + "".join(
             f"• <b>{config.plan_title(plan)}:</b> {config.rub_price(plan)} ₽ или {config.stars_price(plan)} ⭐ / 30 дней, "
             f"{config.rub_price(plan, 3)} ₽ или {config.stars_price(plan, 3)} ⭐ / 90 дней; "
@@ -141,17 +141,6 @@ async def rub_check(call: CallbackQuery, bot: Bot):
         await call.answer("Касса не ответила, попробуйте через минуту", show_alert=True)
         return
     await call.answer(RUB_CHECK_ANSWERS.get(status, "Статус обновлён"), show_alert=status != "CONFIRMED")
-
-
-@router.message(Command("testpay"))
-async def test_pay(message: Message):
-    if not config.PLATEGA_ENABLED or not config.PLATEGA_TEST_RUB:
-        return
-    await message.answer(
-        f"{ui.e('card')} <b>Тест оплаты — {config.PLATEGA_TEST_RUB} ₽</b>\n\n"
-        "1 день тарифа «Средний». Выберите способ:",
-        reply_markup=ui.kb(*rub_payments.method_buttons("test", 1, config.PLATEGA_TEST_RUB)),
-    )
 
 
 @router.callback_query(F.data.startswith("admin_rubproof:"))

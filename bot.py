@@ -154,8 +154,8 @@ async def main():
                 platega_runner = await platega_webhook.start(bot)
             except OSError as exc:
                 logger.error("Platega callback server did not start: %s", exc)
-            logger.info("Platega checkout: enabled, test=%s ₽, watchers resumed=%s, webhook=%s",
-                        config.PLATEGA_TEST_RUB, resumed, "on" if platega_runner else "off")
+            logger.info("Platega checkout: enabled, watchers resumed=%s, webhook=%s",
+                        resumed, "on" if platega_runner else "off")
         version = release_version()
         log_event(
             logger,

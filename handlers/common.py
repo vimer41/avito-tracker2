@@ -170,8 +170,6 @@ async def cmd_start(event, state: FSMContext):
         return
     # A typed /start also refreshes the bottom keyboard (new labels, admin button).
     await event.answer("Меню закреплено внизу экрана.", reply_markup=get_main_keyboard(user.id))
-    if is_new:
-        await event.answer(legal_docs.VERIFICATION_CODE)
     await event.answer(text, reply_markup=markup, parse_mode="HTML")
 
 

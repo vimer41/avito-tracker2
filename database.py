@@ -2095,12 +2095,6 @@ async def get_all_active_searches() -> List[Dict[str, Any]]:
                          AND so.status = 'paid'
                          AND so.tariff_plan = 'test'
                          AND so.subscription_after = u.subscription_until
-                   ) OR EXISTS (
-                       SELECT 1 FROM rub_orders ro
-                       WHERE ro.user_id = u.user_id
-                         AND ro.status = 'paid'
-                         AND ro.tariff_plan = 'test'
-                         AND ro.subscription_after = u.subscription_until
                    ) AS is_test_order,
                    CAST(strftime('%s', s.created_at) AS REAL) AS created_epoch,
                    CAST(strftime('%s', s.initialized_at) AS REAL) AS initialized_epoch
