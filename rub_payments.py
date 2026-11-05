@@ -53,6 +53,14 @@ UNPAID_RECHECKS = (30 * 60, 3 * 3600, 24 * 3600)
 PAID_RECHECKS = tuple(int(hours * 3600) for hours in (1, 6, 24, 72, 168, 336, 720, 1440, 2160, 2880))
 DISPUTE_RECHECK_SECONDS = 6 * 3600
 DISPUTE_WATCH_DAYS = 90
+# Возврат по кнопке админа (от запроса): ждём CHARGEBACKED; на последней проверке без него — предупреждение.
+REFUND_RECHECKS = (10 * 60, 3600, 6 * 3600, 24 * 3600, 72 * 3600)
+REFUND_ERRORS = {
+    "INSUFFICIENT_FUNDS": "на балансе Platega не хватает денег на возврат",
+    "PARTIAL_REFUND_EXISTS": "по платежу уже был частичный возврат, остаток можно вернуть только в кабинете Platega",
+    "AMOUNT_EXCEEDS_REFUNDABLE": "по платежу уже нечего возвращать",
+    "REFUND_IN_PROGRESS": "возврат по этому платежу уже выполняется",
+}
 
 _watchers: dict[int, asyncio.Task] = {}
 _order_locks: "weakref.WeakValueDictionary[int, asyncio.Lock]" = weakref.WeakValueDictionary()
@@ -150,6 +158,8 @@ def next_check_at(order: dict, now: float | None = None) -> float | None:
         base, steps = _epoch(order.get("created_at")), UNPAID_RECHECKS
     elif status == "paid":
         base, steps = _epoch(order.get("paid_at")), PAID_RECHECKS
+    elif status == "refunded" and order.get("refund_requested_at") and not order.get("refund_result"):
+        base, steps = _epoch(order.get("refund_requested_at")), REFUND_RECHECKS
     else:  # refunded, review, failed: an admin takes it from here
         return None
     if base is None:
@@ -410,6 +420,8 @@ async def check_order(bot: Bot, order_id: int, reported: dict | None = None) -> 
 async def _apply(order: dict, status: str, info: dict):
     """(result, [notices]) — the database is changed here, the messages are sent by the caller."""
     order_id = order["id"]
+    if order["status"] == "refunded" and order.get("refund_requested_at") and not order.get("refund_result"):
+        return await _apply_refund_wait(order, status, info)
     if status == "CONFIRMED":
         if not order["paid_at"] and order["status"] == "review":
             return "MISMATCH", []  # an admin reconciles it by hand; the bot never grants it on its own
@@ -457,6 +469,117 @@ async def _apply(order: dict, status: str, info: dict):
     return status, []
 
 
+async def _apply_refund_wait(order: dict, status: str, info: dict):
+    """An admin's refund from the bot: the access is already taken back, this only learns how Platega ended it."""
+    order_id = order["id"]
+    if status == "CHARGEBACKED":
+        declined = str(info.get("refundStatus") or "").lower() == "declined"
+        if not await billing.set_rub_refund_result(order_id, "declined" if declined else "done"):
+            return status, []
+        if declined:
+            return status, [lambda bot: _alert(bot, order, (
+                "❌ <b>Platega отклонила возврат</b>: деньги остались у вас.\n"
+                "Доступ покупателю уже отозван. Если нужно, выдайте заново: карточка → 💳 Выдать / продлить."
+            ))]
+        return status, [lambda bot: _alert(bot, order, "✅ <b>Platega подтвердила возврат</b>: деньги ушли покупателю.")]
+    requested = _epoch(order.get("refund_requested_at"))
+    overdue = requested is not None and time.time() >= requested + REFUND_RECHECKS[-1] - 60
+    if overdue and await billing.set_rub_refund_result(order_id, "overdue"):
+        return status, [lambda bot: _alert(bot, order, (
+            f"⚠️ <b>Platega за {REFUND_RECHECKS[-1] // 86400} дня не подтвердила возврат.</b>\n"
+            "Проверьте платёж в кабинете Platega: если возврат не прошёл, деньги у вас, а доступ покупателю уже отозван."
+        ))]
+    return status, []
+
+
+# ---------- возврат по кнопке админа ----------
+
+def refund_problem(order: dict | None) -> str | None:
+    """Why the bot cannot refund this order by itself, or None when it can."""
+    if not order or not order.get("paid_at") or not order.get("transaction_id"):
+        return "Оплаченный заказ не найден."
+    if order["status"] == "disputed":
+        return "По заказу открыт спор: пока идёт проверка, Platega возврат не даёт. Отправьте доказательства."
+    if order["status"] == "refunded":
+        return "Деньги по этому заказу уже возвращены."
+    if order["status"] != "paid":
+        return f"Возврат недоступен: заказ «{STATUS_TITLES.get(order['status'], order['status'])}»."
+    if float(order.get("refunded_amount") or 0) > 0:
+        return "По заказу уже был частичный возврат: остаток можно вернуть только в кабинете Platega."
+    return None
+
+
+def refund_error_text(exc: platega.PlategaError) -> str:
+    if exc.code in REFUND_ERRORS:
+        return REFUND_ERRORS[exc.code]
+    if exc.status in (401, 403):
+        return "Platega не приняла ключи магазина"
+    if exc.status == 404:
+        return "Platega не нашла этот платёж"
+    if exc.status == 429:
+        return "Platega просит не спешить, повторите через минуту"
+    return "касса не ответила, повторите позже"
+
+
+async def refund_quote(order_id: int) -> dict[str, Any]:
+    """What a full refund would cost, from Platega; nothing moves. {order, error} or {order, quote, review}."""
+    order = await billing.get_rub_order(order_id)
+    problem = refund_problem(order)
+    if problem:
+        return {"order": order, "error": problem}
+    try:
+        quote = await platega.refund_check(order["transaction_id"])
+    except platega.PlategaError as exc:
+        logger.warning("Platega refund check failed: order=%s error=%s", order_id, exc)
+        return {"order": order, "error": f"Не удалось узнать условия возврата: {refund_error_text(exc)}."}
+    if not quote.get("supported"):
+        reason = str(quote.get("blockReason") or "")
+        text = REFUND_ERRORS.get(reason) or (
+            f"Platega не даёт вернуть платёж ({reason})" if reason else "Platega не даёт вернуть этот платёж")
+        return {"order": order, "error": html.escape(text) + "."}
+    return {"order": order, "quote": quote, "review": await billing.rub_revoke_needs_review(order_id)}
+
+
+async def refund_order(bot: Bot, order_id: int, admin_id: int) -> dict[str, Any]:
+    """Full refund through Platega, then the access this order paid for is taken back at once.
+
+    {ok: False, error} or {ok: True, order, manual, in_progress, review}. The bot keeps asking Platega
+    until the payment turns CHARGEBACKED and tells admins how the refund ended."""
+    async with _lock(_order_locks, order_id):
+        order = await billing.get_rub_order(order_id)
+        problem = refund_problem(order)
+        if problem:
+            return {"ok": False, "error": problem}
+        try:
+            reply = await platega.refund(order["transaction_id"])
+        except platega.PlategaError as exc:
+            if exc.code != "REFUND_IN_PROGRESS":
+                logger.warning("Platega refund failed: order=%s error=%s", order_id, exc)
+                return {"ok": False, "error": f"Возврат не прошёл: {refund_error_text(exc)}."}
+            reply = {"accepted": False, "message": exc.message}
+        operation = str(reply.get("refundOperationId") or "")
+        await billing.mark_rub_refund_requested(order_id, admin_id, operation)
+        revoked = await billing.revoke_rub_order(order_id)
+        fresh = await billing.get_rub_order(order_id) or revoked
+        await billing.schedule_rub_check(order_id, next_check_at(fresh))
+    logger.info("Platega refund requested: order=%s admin=%s accepted=%s manual=%s operation=%s",
+                order_id, admin_id, reply.get("accepted"), reply.get("manualControlRequired"), operation or "-")
+    await database.log_admin_action(admin_id, order["user_id"], "refund", f"R{order_id} · {rub(order['amount'])} ₽")
+    review = bool(revoked.get("refund_needs_review"))
+    try:
+        await bot.send_message(
+            order["user_id"],
+            f"↩️ Возврат по заказу <code>R{order_id}</code> оформлен: деньги вернутся тем же способом, "
+            "обычно за несколько дней (срок зависит от банка)."
+            + ("" if review else " Доступ, оплаченный этим заказом, отменён.") + " Вопросы: /paysupport.",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        logger.warning("Platega refund notice to user failed: order=%s error=%s", order_id, type(exc).__name__)
+    return {"ok": True, "order": fresh, "manual": bool(reply.get("manualControlRequired")),
+            "in_progress": not reply.get("accepted"), "review": review}
+
+
 # ---------- уведомления ----------
 
 async def _edit_invoice(bot: Bot, order: dict, text: str, *, with_pay: bool = False):
@@ -480,6 +603,14 @@ def _buyer(order: dict) -> str:
     name = html.escape(order.get("buyer_name") or "Без имени")
     tag = f" @{html.escape(order['buyer_username'])}" if order.get("buyer_username") else ""
     return f"{name}{tag} · <code>{order['user_id']}</code>"
+
+
+buyer_line = _buyer  # for admin screens
+
+REFUND_RESULT_TITLES = {
+    None: "⏳ ждём подтверждения Platega", "done": "возврат подтверждён Platega",
+    "declined": "❌ Platega отклонила возврат", "overdue": "⚠️ Platega не подтвердила возврат",
+}
 
 
 async def _alert(bot: Bot, order: dict, text: str):

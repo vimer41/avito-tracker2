@@ -1982,7 +1982,34 @@ async def cb_admin_purge_user(call: CallbackQuery):
 
     parts = call.data.split(":")
     target_user_id = parts[1]
-    page = int(parts[2]) if len(parts) > 2 else 0
+    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    # The button only asks; the user is erased by «Да, удалить» (admin_purge_yes).
+    user = await database.get_user(int(target_user_id)) if target_user_id.isdigit() else None
+    who = f"<code>{target_user_id}</code>"
+    if user:
+        name = html.escape(user.get("first_name") or "")
+        username = f" @{html.escape(user['username'])}" if user.get("username") else ""
+        who = f"{name}{username} · {who}".strip(" ·")
+    await _show(call, (
+        f"{ui.e('warn')} <b>Точно удалить пользователя?</b>\n\n"
+        f"{who}\n\n"
+        "Сотрутся пользователь, его радары, история лотов и логи. Отменить нельзя."
+    ), InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"admin_purge_yes:{target_user_id}:{page}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{target_user_id}:{page}")],
+    ]))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_purge_yes:"))
+async def cb_admin_purge_user_yes(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+
+    parts = call.data.split(":")
+    target_user_id = parts[1]
+    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
 
     res = await database.purge_user_by_pattern(target_user_id)
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} стер пользователя ID:{target_user_id}: {res['message']}")
@@ -2545,13 +2572,42 @@ async def _set_direct_legacy(enabled: bool) -> dict:
     return await pool.set_net_mode_async(mode)
 
 
+def _net_mode_confirm(mode: str, yes_data: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Every network switch asks first: a wrong tap can stop scanning or burn the server IP."""
+    text = (
+        "🌐 <b>Точно переключить режим сети?</b>\n\n"
+        f"Сейчас: <b>{NET_MODE_TITLES.get(config.NET_MODE, config.NET_MODE)}</b>\n"
+        f"Станет: <b>{NET_MODE_TITLES.get(mode, mode)}</b>\n\n"
+        f"<i>{NET_MODE_HINTS.get(mode, '')}</i>"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, переключить", callback_data=yes_data)],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_net")],
+    ])
+
+
 @router.callback_query(F.data.startswith("admin_toggle_direct_avito"))
 async def cb_admin_toggle_direct_avito(call: CallbackQuery):
     if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав администратора", show_alert=True)
         return
+    from proxy_pool import get_proxy_pool
+
     new_state = not bool(config.ALLOW_DIRECT_AVITO)
+    target = ("smart" if get_proxy_pool().has_configured_proxy() else "direct") if new_state else "proxy"
+    text, kb = _net_mode_confirm(target, f"admin_direct_yes:{int(new_state)}")
+    await _show(call, text, kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_direct_yes:"))
+async def cb_admin_direct_yes(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    new_state = call.data.split(":", 1)[1] == "1"
     res = await _set_direct_legacy(new_state)
+    await database.log_admin_action(call.from_user.id, None, "net_mode", NET_MODE_TITLES.get(config.NET_MODE, config.NET_MODE))
     await call.answer(
         f"{'✅ IP сервера подключён к сканированию' if new_state else '🛑 IP сервера отключён от сканирования'} "
         f"(каналов: {res['total']})",
@@ -2977,19 +3033,43 @@ async def cb_admin_net(call: CallbackQuery, state: FSMContext):
     await _show(call, text, kb)
 
 
+async def _net_mode_refusal(call: CallbackQuery, mode: str) -> bool:
+    """Answers and returns True when this mode cannot be switched on now."""
+    from proxy_pool import get_proxy_pool
+
+    if mode not in config.NET_MODES:
+        await call.answer("Неизвестный режим", show_alert=True)
+        return True
+    if mode in ("proxy", "both", "smart") and not get_proxy_pool().has_configured_proxy():
+        await call.answer("Сначала добавьте прокси: кнопка «➕ Добавить прокси».", show_alert=True)
+        return True
+    return False
+
+
 @router.callback_query(F.data.startswith("admin_net_mode:"))
 async def cb_admin_net_mode(call: CallbackQuery):
+    """A mode button only asks; the switch happens on «Да, переключить» (admin_net_mode_yes)."""
     if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав администратора", show_alert=True)
         return
-    from proxy_pool import get_proxy_pool
-
     mode = call.data.split(":", 1)[1]
-    if mode not in config.NET_MODES:
-        await call.answer("Неизвестный режим", show_alert=True)
+    if await _net_mode_refusal(call, mode):
         return
-    if mode in ("proxy", "both", "smart") and not get_proxy_pool().has_configured_proxy():
-        await call.answer("Сначала добавьте прокси: кнопка «➕ Добавить прокси».", show_alert=True)
+    if mode == config.NET_MODE:
+        await call.answer(f"Уже включён: {NET_MODE_TITLES.get(mode, mode)}")
+        return
+    text, kb = _net_mode_confirm(mode, f"admin_net_mode_yes:{mode}")
+    await _show(call, text, kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_net_mode_yes:"))
+async def cb_admin_net_mode_yes(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    mode = call.data.split(":", 1)[1]
+    if await _net_mode_refusal(call, mode):
         return
     await _set_net_mode(mode)
     await database.log_admin_action(call.from_user.id, None, "net_mode", NET_MODE_TITLES.get(mode, mode))

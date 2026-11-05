@@ -295,7 +295,8 @@ async def unscheduled_rub_orders() -> list[dict[str, Any]]:
         async with db.execute("""
             SELECT * FROM rub_orders
             WHERE next_check_at IS NULL AND transaction_id IS NOT NULL
-              AND status IN ('pending', 'paid', 'disputed', 'canceled', 'expired')
+              AND (status IN ('pending', 'paid', 'disputed', 'canceled', 'expired')
+                   OR (status = 'refunded' AND refund_requested_at IS NOT NULL AND refund_result IS NULL))
         """) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
@@ -367,9 +368,60 @@ async def note_rub_partial_refund(order_id: int, refunded: float) -> bool:
         return cursor.rowcount == 1
 
 
+async def _rub_revoke_review(db, row) -> tuple[Any, bool]:
+    """(user, review): review = the subscription changed after this payment, so undoing it would erase
+    a later payment or an admin's change. Then nothing is overwritten and an admin fixes the term by hand."""
+    async with db.execute("SELECT * FROM users WHERE user_id = ?", (row["user_id"],)) as cursor:
+        user = await cursor.fetchone()
+    async with db.execute("""
+        SELECT 1 FROM rub_orders WHERE user_id = ? AND refund_needs_review = 1
+        UNION ALL SELECT 1 FROM stars_orders WHERE user_id = ? AND refund_needs_review = 1 LIMIT 1
+    """, (row["user_id"], row["user_id"])) as cursor:
+        prior_review = await cursor.fetchone()
+    review = bool(user) and (
+        bool(prior_review) or row["allowed_before"] is None or row["revision_after"] is None
+        or user["subscription_revision"] != row["revision_after"]
+        or user["subscription_until"] != row["subscription_after"] or user["tariff_plan"] != row["tariff_after"]
+    )
+    return user, review
+
+
+async def rub_revoke_needs_review(order_id: int) -> bool:
+    """For the refund confirmation: True when a refund will not take the access back by itself."""
+    async with aiosqlite.connect(database.DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        row = await _rub_row(db, order_id)
+        if not row or not row["paid_at"]:
+            return True
+        _user, review = await _rub_revoke_review(db, row)
+        return review
+
+
+async def mark_rub_refund_requested(order_id: int, admin_id: int, operation_id: str | None):
+    """Platega took an admin's refund: the bot now waits for CHARGEBACKED (refund_result stays NULL until then)."""
+    async with aiosqlite.connect(database.DB_PATH) as db:
+        await db.execute("""
+            UPDATE rub_orders SET refund_requested_at = datetime('now'), refund_admin_id = ?, refund_operation_id = ?,
+                refund_result = NULL
+            WHERE id = ?
+        """, (admin_id, operation_id or None, order_id))
+        await db.commit()
+
+
+async def set_rub_refund_result(order_id: int, result: str) -> bool:
+    """done / declined / overdue, once per refund; True the first time."""
+    async with aiosqlite.connect(database.DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE rub_orders SET refund_result = ? WHERE id = ? AND refund_requested_at IS NOT NULL AND refund_result IS NULL",
+            (result, order_id),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
 async def revoke_rub_order(order_id: int) -> dict[str, Any]:
-    """Money went back to the buyer (CHARGEBACKED): undo this order's grant once. If the subscription
-    changed after the payment (another payment, an admin), nothing is overwritten: the order is flagged."""
+    """Money went back to the buyer (CHARGEBACKED, or an admin's refund from the bot): undo this order's grant once.
+    If the subscription changed after the payment (another payment, an admin), nothing is overwritten: the order is flagged."""
     async with aiosqlite.connect(database.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         await db.execute("BEGIN IMMEDIATE")
@@ -378,18 +430,7 @@ async def revoke_rub_order(order_id: int) -> dict[str, Any]:
             raise PaymentValidationError("Оплаченный заказ не найден.")
         if row["status"] == "refunded":
             return dict(row, applied=False)
-        async with db.execute("SELECT * FROM users WHERE user_id = ?", (row["user_id"],)) as cursor:
-            user = await cursor.fetchone()
-        async with db.execute("""
-            SELECT 1 FROM rub_orders WHERE user_id = ? AND refund_needs_review = 1
-            UNION ALL SELECT 1 FROM stars_orders WHERE user_id = ? AND refund_needs_review = 1 LIMIT 1
-        """, (row["user_id"], row["user_id"])) as cursor:
-            prior_review = await cursor.fetchone()
-        review = bool(user) and (
-            bool(prior_review) or row["allowed_before"] is None or row["revision_after"] is None
-            or user["subscription_revision"] != row["revision_after"]
-            or user["subscription_until"] != row["subscription_after"] or user["tariff_plan"] != row["tariff_after"]
-        )
+        user, review = await _rub_revoke_review(db, row)
         if user and not review:
             await db.execute("""
                 UPDATE users SET subscription_until = ?, tariff_plan = ?, is_allowed = ?, trial_used = ?,

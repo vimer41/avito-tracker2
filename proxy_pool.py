@@ -22,7 +22,11 @@ from logger_setup import log_event
 from runtime_metrics import METRICS, mask_proxy_url, sanitize_proxy_credentials, short_channel
 
 log = logging.getLogger("proxy_pool")
-SMART_BLOCK_ALERT_INTERVAL = 3600.0
+# Smart mode pushes only real danger: Avito blocks most of the server's answers AND no proxy can take over.
+# Proxies joining the load is routine and stays in the log (net.smart).
+SMART_BLOCK_ALERT_INTERVAL = 6 * 3600.0
+SMART_CRITICAL_BLOCK_RATIO = 0.5
+SMART_CRITICAL_MIN_ANSWERS = 10
 
 ALLOWED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 
@@ -876,13 +880,14 @@ class ProxyPool:
                 rps=round(self._demand_rps, 3),
                 blocks=round(blocks, 3),
             )
-            if not server_first and self._smart_reason.startswith("Авито блокирует") \
-                    and now - self._block_alerted_at >= SMART_BLOCK_ALERT_INTERVAL:
-                self._block_alerted_at = now
-                self._alerts.append(
-                    f"⚠️ {self._smart_reason}.\nУмный режим включил прокси в работу: сканы не остановятся. "
-                    "Если повторяется часто, IP сервера стоит сменить."
-                )
+        if answers >= SMART_CRITICAL_MIN_ANSWERS and blocks >= SMART_CRITICAL_BLOCK_RATIO \
+                and now - self._block_alerted_at >= SMART_BLOCK_ALERT_INTERVAL \
+                and not any(not c.is_direct and c.is_available(now) for c in clients):
+            self._block_alerted_at = now
+            self._alerts.append(
+                f"🚨 Авито блокирует IP сервера ({blocks:.0%} ответов), а рабочих прокси нет.\n"
+                "Лоты могут опаздывать. Добавьте прокси (Админ-панель → Сеть и прокси) или смените IP сервера."
+            )
         return server_first
 
     def pop_alerts(self) -> list[str]:

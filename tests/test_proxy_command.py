@@ -185,6 +185,11 @@ class TestNetworkScreen(ProxyEnvMixin, DispatcherFixture, unittest.IsolatedAsync
         self.assertIn("admin_net_list:0", self.callback_values())
 
         await self.dispatch_callback("admin_net_mode:proxy", config.ADMIN_ID)
+        self.assertIn("Точно переключить режим сети?", self.methods("EditMessageText")[-1].text)
+        self.assertEqual(self.channels(), ["direct", PROXY_URL, PROXY_B], "the first tap only asks")
+        self.assertIn("admin_net_mode_yes:proxy", self.callback_values())
+        self.assertIn("admin_net", self.callback_values())
+        await self.dispatch_callback("admin_net_mode_yes:proxy", config.ADMIN_ID)
         self.assertEqual(self.channels(), [PROXY_URL, PROXY_B])
 
         await self.dispatch_callback("admin_net_list:0", config.ADMIN_ID)
@@ -273,6 +278,7 @@ class TestNetworkScreen(ProxyEnvMixin, DispatcherFixture, unittest.IsolatedAsync
 
     async def test_non_admin_cannot_switch_modes(self):
         await self.dispatch_callback("admin_net_mode:direct", 123456)
+        await self.dispatch_callback("admin_net_mode_yes:direct", 123456)
         self.assertEqual(config.NET_MODE, "auto")
 
 

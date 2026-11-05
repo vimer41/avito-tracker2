@@ -480,9 +480,23 @@ def calculate_required_bot_workers(
     return max(1, math.ceil(rate * float(p95_service_time_seconds) * 1.2))
 
 
+# Admin alerts are for real trouble only (the owner asked on 2026-11-06: no noise about load, server or proxies).
+# A rule must stay bad for its whole streak, repeats at most every ALERT_REPEAT_SECONDS while still bad,
+# and says «recovered» only after ALERT_RECOVER_MINUTES good minutes in a row. Day-to-day load lives in /stats,
+# the 09:00 report and the readiness report, not in pushes.
+ALERT_REPEAT_SECONDS = 6 * 3600
+ALERT_RECOVER_MINUTES = 10
+CRITICAL_DELIVERY_P95_SECONDS = 60.0   # lots wait over a minute after they were due
+CRITICAL_DELIVERY_MINUTES = 10
+CRITICAL_OUTBOX_MINUTES = 5            # the send queue stays above OUTBOX_ALERT_DEPTH
+CRITICAL_CAPACITY_SHARE = 0.5          # the channels give less than half of what the tariff intervals need
+CRITICAL_CAPACITY_MINUTES = 30
+
+
 @dataclass
 class AlertRuleState:
     consecutive_bad: int = 0
+    consecutive_ok: int = 0
     active: bool = False
     last_sent_at: float = -1e9
 
@@ -508,9 +522,8 @@ class RuntimeMetricsRegistry:
             "outbox_depth": AlertRuleState(),
             "capacity_deficit": AlertRuleState(),
         }
-        self._pending_depth_history: list[int] = []
         self._source_stats: dict[str, dict[str, Any]] = {}
-        self._alert_cooldown_seconds: float = 300.0
+        self._alert_cooldown_seconds: float = ALERT_REPEAT_SECONDS
         self._last_capacity_report: dict[str, Any] = {}
         # Scans per second the planner aims for (sum of 1/interval over URLs); None = uniform SCAN_INTERVAL_* range.
         self._planned_scan_rate: float | None = None
@@ -1256,11 +1269,11 @@ class RuntimeMetricsRegistry:
         full_coverage_age_seconds: float | None = None,
     ) -> list[str]:
         """
-        Вызывается раз в минуту. Возвращает список сообщений алертов и восстановлений на русском языке.
-        Учитывает:
-        - p95(deliver_at -> t_sent) > 2 с в течение 5 минут подряд (только при sample_count > 0)
-        - pending outbox > 200 или монотонный рост 3 минуты подряд
-        - deficit_now > 0 или число здоровых прокси ниже резервного порога 3 минуты подряд
+        Вызывается раз в минуту. Возвращает алерты и восстановления — только о серьёзных сбоях:
+        - лоты ждут отправки дольше CRITICAL_DELIVERY_P95_SECONDS (p95) CRITICAL_DELIVERY_MINUTES минут подряд;
+        - очередь отправки больше OUTBOX_ALERT_DEPTH CRITICAL_OUTBOX_MINUTES минут подряд;
+        - каналы дают меньше половины нужной скорости CRITICAL_CAPACITY_MINUTES минут подряд.
+        Повтор того же алерта — не чаще ALERT_REPEAT_SECONDS, «восстановлено» — после ALERT_RECOVER_MINUTES хороших минут.
         """
         now = self._monotonic()
         current_bucket = self._bucket()
@@ -1289,71 +1302,62 @@ class RuntimeMetricsRegistry:
                 return
             if is_bad:
                 st.consecutive_bad += 1
+                st.consecutive_ok = 0
                 if st.consecutive_bad >= threshold_minutes:
                     if not st.active or (now - st.last_sent_at) >= self._alert_cooldown_seconds:
                         st.active = True
                         st.last_sent_at = now
                         messages.append(alert_text)
             else:
-                if st.active:
+                st.consecutive_bad = 0
+                st.consecutive_ok += 1
+                # One good minute in a bad hour is not a recovery: no «восстановлено» / alert ping-pong.
+                if st.active and st.consecutive_ok >= ALERT_RECOVER_MINUTES:
                     st.active = False
-                    st.consecutive_bad = 0
-                    st.last_sent_at = now
                     messages.append(recovery_text)
-                else:
-                    st.consecutive_bad = 0
 
-        # 1. Delivery SLA (current 1-minute bucket)
+        # 1. Lots go out late: a Telegram flood limit or a stuck sender.
         cur_deliv = summarize_histograms([current_bucket.deliver_at_to_sent_all], SUBSECOND_LATENCY_BOUNDS)
         has_deliv_data = cur_deliv["sample_count"] > 0
-        sla_limit = float(config.DELIVERY_SLA_ALERT_SECONDS)
-        deliv_bad = bool(has_deliv_data and cur_deliv["p95"] is not None and cur_deliv["p95"] > sla_limit)
+        deliv_bad = bool(has_deliv_data and cur_deliv["p95"] is not None
+                         and cur_deliv["p95"] > CRITICAL_DELIVERY_P95_SECONDS)
         _process_rule(
             "delivery_sla",
             deliv_bad,
-            5,
+            CRITICAL_DELIVERY_MINUTES,
             has_deliv_data,
-            f"⚠️ Алерт SLA доставки: p95(deliver_at -> sent) = {cur_deliv['p95']} с (> {sla_limit:g} с) 5 минут подряд.",
-            f"✅ Восстановлено SLA доставки: p95(deliver_at -> sent) вернулся в норму (<= {sla_limit:g} с).",
+            f"🚨 Лоты уходят с опозданием уже {CRITICAL_DELIVERY_MINUTES} мин: отправка ждёт до {cur_deliv['p95']} с.\n"
+            "Обычно это ограничение Telegram или зависшая отправка. Пришлите «Отчёт для отладки» (Админ-панель → Логи).",
+            "✅ Лоты снова уходят без задержки.",
         )
 
-        # 2. Outbox depth
+        # 2. The send queue does not drain.
         pending_depth = int(outbox["pending_depth"])
-        self._pending_depth_history.append(pending_depth)
-        if len(self._pending_depth_history) > 4:
-            self._pending_depth_history = self._pending_depth_history[-4:]
-        growing_3m = (
-            len(self._pending_depth_history) >= 4
-            and self._pending_depth_history[-4] < self._pending_depth_history[-3] < self._pending_depth_history[-2] < self._pending_depth_history[-1]
-            and self._pending_depth_history[-1] > 0
-        )
-        outbox_bad = pending_depth > config.OUTBOX_ALERT_DEPTH or growing_3m
         _process_rule(
             "outbox_depth",
-            outbox_bad,
-            1 if pending_depth > config.OUTBOX_ALERT_DEPTH else 1,
+            pending_depth > config.OUTBOX_ALERT_DEPTH,
+            CRITICAL_OUTBOX_MINUTES,
             True,
-            f"⚠️ Алерт очереди доставки: pending={pending_depth} (порог {config.OUTBOX_ALERT_DEPTH}, рост={growing_3m}).",
-            f"✅ Восстановлено: очередь доставки стабилизировалась (pending={pending_depth}).",
+            f"🚨 Очередь отправки не разгребается {CRITICAL_OUTBOX_MINUTES} мин: ждут {pending_depth} лотов.\n"
+            "Пришлите «Отчёт для отладки» (Админ-панель → Логи).",
+            "✅ Очередь отправки разобрана.",
         )
 
-        # 3. Capacity deficit / proxy health
+        # 3. Far too little network: links are scanned at well under half of their tariff speed.
+        # A few weak or resting proxies are normal and stay out of pushes; the 09:00 report shows them.
         total_p = cap["total_proxies"]
-        healthy_p = cap["healthy_proxies"]
         is_direct_only = (total_p == 1 and bool((proxy_snapshots or [{}])[0].get("is_direct", False)))
-        reserve_floor = math.floor(total_p * (1.0 - config.PROXY_CAPACITY_RESERVE)) if total_p >= 2 else total_p
-        has_cap_data = cap["unique_sources"] > 0 or total_p > 0
-        cap_bad = not is_direct_only and (cap["deficit_now"] > 0 or (total_p > 0 and healthy_p < max(1, reserve_floor)))
+        need = float(cap["required_rate_at_max"] or 0.0)
+        have = float(cap["available_rate_now"] or 0.0)
+        cap_bad = not is_direct_only and need > 0 and have < need * CRITICAL_CAPACITY_SHARE
         _process_rule(
             "capacity_deficit",
             cap_bad,
-            3,
-            has_cap_data,
-            (
-                f"⚠️ Алерт емкости прокси: deficit_now={cap['deficit_now']:.2f} req/s, "
-                f"здоровых прокси {healthy_p}/{total_p}. Рекомендация: {cap['recommendation_ru']}."
-            ),
-            f"✅ Восстановлено: емкость пула прокси достаточна (здоровых {healthy_p}/{total_p}).",
+            CRITICAL_CAPACITY_MINUTES,
+            cap["unique_sources"] > 0 or total_p > 0,
+            f"🚨 Сети не хватает уже {CRITICAL_CAPACITY_MINUTES} мин: каналы дают {have:.2f} запр/с из нужных {need:.2f}.\n"
+            "Ссылки проверяются заметно реже, лоты опаздывают. Добавьте прокси: Админ-панель → Сеть и прокси.",
+            "✅ Мощности сети снова хватает.",
         )
 
         return messages

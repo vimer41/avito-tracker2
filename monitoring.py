@@ -35,12 +35,14 @@ SLOW_SCAN_MS = 15000
 LOOP_PROBE_SECONDS = 0.25
 LOOP_STALL_SECONDS = 1.0
 STALL_DUMP_SECONDS = 4.0
-LONG_STALL_ALERT_SECONDS = 30.0
-LONG_STALL_ALERT_INTERVAL = 1800.0
+# Pushes only for a real freeze: shorter ones (and the one-off first import of the captcha solver)
+# are in the debug report, section «Зависания».
+LONG_STALL_ALERT_SECONDS = 180.0
+LONG_STALL_ALERT_INTERVAL = 3 * 3600.0
 STALL_DUMP_REARM_SECONDS = 1.0
 SOURCE_STATS_SECONDS = 600
 WORKER_CRASH_PAUSE = 1.0
-CRASH_ALERT_INTERVAL = 3600
+CRASH_ALERT_INTERVAL = 24 * 3600  # the same code error pushes once a day; every repeat is in errors.log
 # Failures that describe the page itself. Blocks and timeouts say nothing about the link.
 DEAD_LINK_KINDS = frozenset({"catalog_missing", "invalid_redirect", "invalid_html", "invalid_response", "http_client"})
 DEAD_LINK_OK_WINDOW = 120.0
@@ -279,13 +281,9 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         )
 
     async def alert_long_stall(lag: float):
-        system = METRICS.system_now()
-        details = ", ".join(f"{label} {system[key]}" for key, label in (
-            ("load1", "нагрузка"), ("swap_mb", "swap МБ"), ("mem_avail_mb", "свободно памяти МБ")) if key in system)
         await notify_admins_text(
-            f"⚠️ Бот завис на {lag:.0f} с: все сканы и отправки стояли.\n"
-            + (f"Сервер сейчас: {details}.\n" if details else "")
-            + "Причина — в отчёте для отладки, раздел «Зависания» (Админка → Логи)."
+            f"🚨 Бот завис на {lag / 60:.0f} мин: сканы и отправки стояли.\n"
+            "Если повторится, пришлите «Отчёт для отладки» (Админ-панель → Логи), раздел «Зависания»."
         )
 
     dead_link_warned_at: dict[int, float] = {}

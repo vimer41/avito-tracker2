@@ -193,6 +193,9 @@ class TestAdminDiscountUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.NET_MODE, "proxy")
 
         await self.dispatch_callback("admin_toggle_direct_avito:alert", config.ADMIN_ID)
+        self.assertFalse(config.ALLOW_DIRECT_AVITO, "the button only asks")
+        self.assertIn("admin_direct_yes:1", self.callback_values())
+        await self.dispatch_callback("admin_direct_yes:1", config.ADMIN_ID)
         self.assertTrue(config.ALLOW_DIRECT_AVITO)
         self.assertEqual(await database.get_bot_setting("allow_direct_avito"), "1")
         self.assertEqual(config.NET_MODE, "direct")

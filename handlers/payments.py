@@ -318,26 +318,122 @@ async def admin_payments(call: CallbackQuery):
              "Этот номер покупатель видит в сообщении об оплате.</i>", ""]
     buttons = []
     for order in rub_orders:
+        refund_note = (f" · {rub_payments.REFUND_RESULT_TITLES.get(order.get('refund_result'), '')}"
+                       if order.get("refund_requested_at") else "")
         lines.append(
             f"R{order['id']} · {html.escape(rub_payments.order_title(order))} · {rub_payments.rub(order['amount'])} ₽ · "
             f"{rub_payments.method_title(order)} · {rub_payments.STATUS_TITLES.get(order['status'], order['status'])}"
-            + (" · ⚠️ сверить подписку вручную" if order["refund_needs_review"] else "")
+            + refund_note + (" · ⚠️ сверить подписку вручную" if order["refund_needs_review"] else "")
         )
         if order["paid_at"]:  # evidence is for paid orders only: an unpaid link has nothing to prove
-            buttons.append([InlineKeyboardButton(text=f"📄 Доказательства R{order['id']}",
-                                                 callback_data=f"admin_rubproof:{order['id']}")])
+            row = [InlineKeyboardButton(text=f"📄 Доказательства R{order['id']}",
+                                        callback_data=f"admin_rubproof:{order['id']}")]
+            if rub_payments.refund_problem(order) is None:
+                row.append(InlineKeyboardButton(text=f"↩️ Вернуть R{order['id']}",
+                                                callback_data=f"admin_rubrefund:{order['id']}"))
+            buttons.append(row)
     for order in orders:
         lines.append(f"#{order['id']} · {config.plan_title(order['tariff_plan'])} · {order['total_amount']} ⭐ · {order['status']}"
                      + (" · ⚠️ сверить подписку вручную" if order["refund_needs_review"] else ""))
         if order["status"] in ("paid", "refunding"):
             buttons.append([InlineKeyboardButton(text=f"↩️ Вернуть #{order['id']} ({order['total_amount']} ⭐)", callback_data=f"admin_refund_prompt:{order['id']}")])
     if rub_orders:
-        lines.append("\nРубли возвращаются в кабинете Platega; после спора возврат делать нельзя.")
+        lines.append("\n«↩️ Вернуть» отправляет полный возврат в Platega и сразу отзывает оплаченный доступ. "
+                     "Во время спора возврат недоступен.")
     if not orders and not rub_orders:
         lines.append("Подтверждённых платежей пока нет.")
     buttons.append([InlineKeyboardButton(text="« Карточка пользователя", callback_data=f"admin_user:{user_id}:0")])
     await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     await call.answer()
+
+
+def _rub_back(order: dict | None) -> InlineKeyboardMarkup:
+    target = f"admin_payments:{order['user_id']}" if order else "admin_refresh"
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Платежи пользователя", callback_data=target)]])
+
+
+def _rub_order_id(call: CallbackQuery) -> int | None:
+    try:
+        return int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        return None
+
+
+@router.callback_query(F.data.startswith("admin_rubrefund:"))
+async def admin_rub_refund_prompt(call: CallbackQuery):
+    """Step 1 of a ruble refund: Platega says whether it is possible and what it costs; nothing moves yet."""
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    order_id = _rub_order_id(call)
+    if order_id is None:
+        await call.answer("Некорректный заказ", show_alert=True)
+        return
+    await call.answer("Спрашиваю Platega…")
+    result = await rub_payments.refund_quote(order_id)
+    order = result.get("order")
+    if result.get("error"):
+        await ui.show(call, f"{ui.e('warn')} <b>Вернуть R{order_id} нельзя</b>\n\n{result['error']}",
+                      _rub_back(order), answer=False)
+        return
+    quote = result["quote"]
+    rub = rub_payments.rub
+    paid = order.get("paid_amount") or order["amount"]
+    lines = [
+        "↩️ <b>Точно вернуть деньги?</b>",
+        "",
+        f"Заказ <code>R{order_id}</code> · {html.escape(rub_payments.order_title(order))} · "
+        f"{rub_payments.method_title(order)}",
+        f"Покупатель: {rub_payments.buyer_line(order)}",
+        f"Он заплатил <b>{rub(paid)} ₽</b>: вернётся вся сумма платежа.",
+    ]
+    fee = rub_payments._num(quote.get("penaltyNativeAmount"))
+    if fee:
+        currency = str(quote.get("penaltyNativeCurrency") or "RUB").upper()
+        lines.append(f"Комиссия провайдера за возврат: <b>{rub(fee)} {'₽' if currency == 'RUB' else html.escape(currency)}</b>.")
+    deduct = rub_payments._num(quote.get("totalDeductUsdt"))
+    if deduct:
+        lines.append(f"С баланса Platega спишется <b>{deduct:g} USDT</b> (возврат и комиссия).")
+    lines += [
+        "",
+        "⚠️ После этой оплаты подписка менялась: доступ сам не отзовётся, срок поправите вручную в карточке."
+        if result["review"] else "Доступ, оплаченный этим заказом, отзовётся сразу.",
+        "Отменить возврат будет нельзя.",
+    ]
+    await ui.show(call, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Да, вернуть {rub(paid)} ₽", callback_data=f"admin_rubrefund_yes:{order_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_payments:{order['user_id']}")],
+    ]), answer=False)
+
+
+@router.callback_query(F.data.startswith("admin_rubrefund_yes:"))
+async def admin_rub_refund_confirm(call: CallbackQuery, bot: Bot):
+    """Step 2: the refund goes to Platega and the access this order paid for is taken back at once."""
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    order_id = _rub_order_id(call)
+    if order_id is None:
+        await call.answer("Некорректный заказ", show_alert=True)
+        return
+    await call.answer("Отправляю возврат…")
+    result = await rub_payments.refund_order(bot, order_id, call.from_user.id)
+    order = result.get("order") or await billing.get_rub_order(order_id)
+    if not result["ok"]:
+        await ui.show(call, f"{ui.e('warn')} <b>Возврат R{order_id} не сделан</b>\n\n{result['error']}",
+                      _rub_back(order), answer=False)
+        return
+    lines = [f"{ui.e('ok')} <b>Возврат R{order_id} отправлен в Platega</b>", ""]
+    if result["in_progress"]:
+        lines.append("Platega ответила, что возврат по этому платежу уже выполняется.")
+    if result["manual"]:
+        lines.append("Platega проверит возврат вручную, решение придёт позже.")
+    lines += [
+        "⚠️ После оплаты подписка менялась: срок не тронут, поправьте его вручную в карточке пользователя."
+        if result["review"] else "Доступ, оплаченный этим заказом, отозван.",
+        "Покупатель получил сообщение. Когда Platega завершит возврат, бот напишет.",
+    ]
+    await ui.show(call, "\n".join(lines), _rub_back(order), answer=False)
 
 
 @router.callback_query(F.data.startswith("admin_refund_prompt:"))

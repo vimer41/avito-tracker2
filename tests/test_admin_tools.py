@@ -178,6 +178,15 @@ class TestUserCardAndNotes(AdminToolsBase):
         await self.dispatch_callback("admin_alog", config.ADMIN_ID)
         self.assertIn(f"→ <code>{USER_ID}</code>", self.texts(config.ADMIN_ID)[-1])
 
+    async def test_delete_user_button_asks_first(self):
+        await self.dispatch_callback(f"admin_purge_user:{USER_ID}:0", config.ADMIN_ID)
+        self.assertIn("Точно удалить пользователя?", self.texts(config.ADMIN_ID)[-1])
+        self.assertIsNotNone(await database.get_user(USER_ID), "the first tap only asks")
+        self.assertIn(f"admin_purge_yes:{USER_ID}:0", self.callback_values())
+        self.assertIn(f"admin_user:{USER_ID}:0", self.callback_values())
+        await self.dispatch_callback(f"admin_purge_yes:{USER_ID}:0", config.ADMIN_ID)
+        self.assertIsNone(await database.get_user(USER_ID))
+
     async def test_admin_actions_are_journaled(self):
         await self.dispatch_callback(f"admin_radar_limit:{USER_ID}:5:0", config.ADMIN_ID)
         actions = await database.get_admin_actions(USER_ID)
@@ -188,7 +197,8 @@ class TestUserCardAndNotes(AdminToolsBase):
         scan_journal.record_scan([radar_id], ok=True, at=time.time() - 7, ms=300)
         await self.dispatch_callback(f"open_search:{radar_id}", USER_ID)
         card = self.texts(USER_ID)[-1]
-        self.assertIn("Проверен:</b> 7 с назад", card)
+        # A slow machine may cross a second between the scan and the card: 7 or 8 is the same answer.
+        self.assertRegex(card, r"Проверен:</b> [78] с назад")
         self.assertIn("Прислано за сутки:</b> 0", card)
         scan_journal.forget(radar_id)
 
@@ -243,23 +253,98 @@ class TestQuietRoutineErrors(unittest.TestCase):
 
 
 class TestServerBlockAlert(unittest.TestCase):
-    def test_blocked_server_alerts_admins_once_an_hour(self):
+    """Admins hear about a blocked server only when no proxy can take the scans over."""
+
+    def blocked_pool(self, folder, clock):
         from proxy_pool import ProxyPool
 
+        pfile = Path(folder) / "proxies.txt"
+        pfile.write_text("http://u:p@192.0.2.1:8001\n", encoding="utf-8")
+        pool = ProxyPool(proxy_pool_file=pfile, fallback_proxy_url="", allow_direct=True, monotonic_fn=lambda: clock[0])
+        direct = next(c for c in pool.clients if c.is_direct)
+        for status in [403, 200] * 10:
+            direct.record_raw_http_response(status, 0.1)
+        return pool
+
+    def test_blocked_server_is_quiet_while_a_proxy_can_take_over(self):
         clock = [1000.0]
-        with tempfile.TemporaryDirectory() as folder:
-            pfile = Path(folder) / "proxies.txt"
-            pfile.write_text("http://u:p@192.0.2.1:8001\n", encoding="utf-8")
-            with patch.object(config, "NET_MODE", "smart"):
-                pool = ProxyPool(proxy_pool_file=pfile, fallback_proxy_url="", allow_direct=True, monotonic_fn=lambda: clock[0])
-                direct = next(c for c in pool.clients if c.is_direct)
-                for status in [403, 200] * 10:
-                    direct.record_raw_http_response(status, 0.1)
-                pool.smart_status()
-                alerts = pool.pop_alerts()
-                self.assertEqual(len(alerts), 1)
-                self.assertIn("Авито блокирует сервер", alerts[0])
-                self.assertEqual(pool.pop_alerts(), [])
+        with tempfile.TemporaryDirectory() as folder, patch.object(config, "NET_MODE", "smart"):
+            pool = self.blocked_pool(folder, clock)
+            self.assertFalse(pool.smart_status()["server_first"], "the proxy still joins the load")
+            self.assertEqual(pool.pop_alerts(), [])
+
+    def test_blocked_server_without_working_proxies_alerts_once(self):
+        clock = [1000.0]
+        with tempfile.TemporaryDirectory() as folder, patch.object(config, "NET_MODE", "smart"):
+            pool = self.blocked_pool(folder, clock)
+            proxy = next(c for c in pool.clients if not c.is_direct)
+            proxy._enter_quarantine(clock[0], 3600, reason="test")
+            pool.smart_status()
+            alerts = pool.pop_alerts()
+            self.assertEqual(len(alerts), 1)
+            self.assertIn("рабочих прокси нет", alerts[0])
+            clock[0] += 3600
+            pool.smart_status()
+            self.assertEqual(pool.pop_alerts(), [], "the same trouble repeats at most every 6 hours")
+
+
+class TestCriticalOnlyMinuteAlerts(unittest.TestCase):
+    """Minute alerts need a long bad streak, repeat rarely and recover only after a calm stretch."""
+
+    def evaluate(self, metrics, *, pending=0, need=1.0, have=1.0):
+        import runtime_metrics
+
+        cap = {"total_proxies": 3, "unique_sources": 5, "required_rate_at_max": need, "available_rate_now": have}
+        snap = {"capacity": cap, "outbox": {"pending_depth": pending}}
+        with patch.object(metrics, "snapshot", return_value=snap):
+            return metrics.evaluate_minute_alerts(proxy_snapshots=[{"is_direct": True}, {}, {}])
+
+    def test_short_capacity_dips_and_weak_proxies_stay_silent(self):
+        import runtime_metrics
+
+        clock = [0.0]
+        metrics = runtime_metrics.RuntimeMetricsRegistry(monotonic_fn=lambda: clock[0])
+        sent = []
+        for minute in range(runtime_metrics.CRITICAL_CAPACITY_MINUTES - 1):
+            clock[0] += 60
+            sent += self.evaluate(metrics, need=2.0, have=0.5)
+        sent += self.evaluate(metrics, need=2.0, have=1.5)  # 75 % of the need is no emergency
+        self.assertEqual(sent, [])
+
+    def test_long_deficit_alerts_once_and_recovers_after_calm(self):
+        import runtime_metrics
+
+        clock = [0.0]
+        metrics = runtime_metrics.RuntimeMetricsRegistry(monotonic_fn=lambda: clock[0])
+        sent = []
+        for _ in range(runtime_metrics.CRITICAL_CAPACITY_MINUTES + 60):
+            clock[0] += 60
+            sent += self.evaluate(metrics, need=2.0, have=0.5)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Сети не хватает", sent[0])
+        clock[0] += 60
+        self.assertEqual(self.evaluate(metrics, need=2.0, have=2.0), [], "one good minute is not a recovery")
+        for _ in range(runtime_metrics.ALERT_RECOVER_MINUTES):
+            clock[0] += 60
+            sent += self.evaluate(metrics, need=2.0, have=2.0)
+        self.assertEqual(sent[-1], "✅ Мощности сети снова хватает.")
+        self.assertEqual(len(sent), 2)
+
+    def test_send_queue_alert_needs_five_full_minutes(self):
+        import runtime_metrics
+
+        clock = [0.0]
+        metrics = runtime_metrics.RuntimeMetricsRegistry(monotonic_fn=lambda: clock[0])
+        over = config.OUTBOX_ALERT_DEPTH + 1
+        sent = []
+        for _ in range(runtime_metrics.CRITICAL_OUTBOX_MINUTES - 1):
+            clock[0] += 60
+            sent += self.evaluate(metrics, pending=over)
+        self.assertEqual(sent, [])
+        clock[0] += 60
+        sent += self.evaluate(metrics, pending=over)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Очередь отправки", sent[0])
 
 
 if __name__ == "__main__":

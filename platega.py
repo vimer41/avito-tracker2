@@ -1,4 +1,4 @@
-"""Platega API: create a payment and read its status (docs.platega.io)."""
+"""Platega API: create a payment, read its status, refund it (docs.platega.io)."""
 
 import json
 from typing import Any
@@ -12,7 +12,13 @@ TIMEOUT = aiohttp.ClientTimeout(total=20)
 
 
 class PlategaError(Exception):
-    pass
+    """`status` is the HTTP code, `code` Platega's error code (REFUND_IN_PROGRESS, …) when the body had one."""
+
+    def __init__(self, text: str, *, status: int | None = None, code: str = "", message: str = ""):
+        super().__init__(text)
+        self.status = status
+        self.code = code
+        self.message = message
 
 
 async def _request(method: str, path: str, body: dict | None = None) -> dict[str, Any]:
@@ -22,7 +28,13 @@ async def _request(method: str, path: str, body: dict | None = None) -> dict[str
             async with session.request(method, BASE_URL + path, json=body, headers=headers) as response:
                 text = await response.text()
                 if response.status != 200:
-                    raise PlategaError(f"HTTP {response.status}: {text[:300]}")
+                    try:
+                        error = json.loads(text)
+                    except json.JSONDecodeError:
+                        error = {}
+                    error = error if isinstance(error, dict) else {}
+                    raise PlategaError(f"HTTP {response.status}: {text[:300]}", status=response.status,
+                                       code=str(error.get("code") or ""), message=str(error.get("message") or ""))
                 return json.loads(text)
     except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError) as exc:
         raise PlategaError(f"{type(exc).__name__}: {exc}") from exc
@@ -58,3 +70,19 @@ async def create_payment(*, amount: int, description: str, order_id: int, user_i
 async def get_status(transaction_id: str) -> dict[str, Any]:
     """status: PENDING, CONFIRMED, CANCELED (and later CHARGEBACKED and others)."""
     return await _request("GET", f"/transaction/{transaction_id}")
+
+
+async def refund_check(transaction_id: str) -> dict[str, Any]:
+    """Whether a full refund is possible and what it costs; moves no money.
+
+    supported, blockReason (INSUFFICIENT_FUNDS…), totalDeductUsdt (taken from the USDT balance with the fee),
+    penaltyNativeAmount / penaltyNativeCurrency (the provider's refund fee, when it takes one)."""
+    return await _request("GET", f"/transaction/{transaction_id}/cancel-supported")
+
+
+async def refund(transaction_id: str) -> dict[str, Any]:
+    """Full refund to the payer. accepted, manualControlRequired, refundOperationId, message.
+
+    The result comes later: the payment turns CHARGEBACKED. A repeat while one runs answers accepted=false
+    (or HTTP 409 REFUND_IN_PROGRESS); after a partial refund Platega answers 400 PARTIAL_REFUND_EXISTS."""
+    return await _request("POST", f"/transaction/{transaction_id}/cancel")

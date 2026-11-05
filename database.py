@@ -731,7 +731,11 @@ async def init_db():
                 refunded_at TIMESTAMP,
                 refund_needs_review INTEGER NOT NULL DEFAULT 0,
                 last_checked_at TIMESTAMP,
-                next_check_at REAL
+                next_check_at REAL,
+                refund_requested_at TIMESTAMP,
+                refund_admin_id INTEGER,
+                refund_operation_id TEXT,
+                refund_result TEXT
             )
         """)
         # Базы, созданные до появления части колонок (локальные тесты кассы), догоняют схему.
@@ -741,6 +745,9 @@ async def init_db():
             "buyer_name": "TEXT", "allowed_before": "INTEGER", "trial_before": "INTEGER", "tariff_after": "TEXT",
             "revision_after": "INTEGER", "disputed_at": "TIMESTAMP", "refunded_at": "TIMESTAMP",
             "refund_needs_review": "INTEGER NOT NULL DEFAULT 0", "last_checked_at": "TIMESTAMP", "next_check_at": "REAL",
+            # A refund an admin started from the bot: who, Platega's operation, and how it ended (done / declined / overdue).
+            "refund_requested_at": "TIMESTAMP", "refund_admin_id": "INTEGER", "refund_operation_id": "TEXT",
+            "refund_result": "TEXT",
         })
         await db.execute("CREATE INDEX IF NOT EXISTS rub_orders_user ON rub_orders(user_id, id)")
         await db.execute("CREATE INDEX IF NOT EXISTS rub_orders_status ON rub_orders(status)")
