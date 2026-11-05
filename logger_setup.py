@@ -93,8 +93,21 @@ def log_event(logger: logging.Logger, level: int, event: str, message: str, **fi
         logger.log(level, message, extra={"ev": event, "fields": fields})
 
 
+_SECRETS: set[str] = set()
+
+
+def register_secret(value: str | None) -> None:
+    """A key that must never reach a log file (Platega's API key and the like)."""
+    if value and len(value) >= 8:
+        _SECRETS.add(value)
+
+
 def _redact(text: str) -> str:
-    return _TOKEN_RE.sub("<token>", sanitize_proxy_credentials(text))
+    text = _TOKEN_RE.sub("<token>", sanitize_proxy_credentials(text))
+    for secret in _SECRETS:
+        if secret in text:
+            text = text.replace(secret, "<secret>")
+    return text
 
 
 def _msk_stamp(created: float) -> str:

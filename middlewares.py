@@ -137,7 +137,7 @@ class AccessControlMiddleware(BaseMiddleware):
         # Публичные меню доступны и после истечения подписки.
         if isinstance(event, CallbackQuery) and event.data:
             allowed_callbacks = (
-                "buy_tariff:", "pay_request:", "demo_tariff:", "stars_buy:", "pay_method:", "doc_page:",
+                "buy_tariff:", "pay_request:", "demo_tariff:", "stars_buy:", "pay_method:", "rub_check:", "doc_page:",
             )
             allowed_exact = {
                 "open_subscription_menu", "activate_trial_btn", "trial_check", "support_start_ticket", "support_cancel",
@@ -151,7 +151,7 @@ class AccessControlMiddleware(BaseMiddleware):
         if isinstance(event, Message) and event.text:
             public_commands = {
                 "/start", "/help", "/profile", "/subscribe", "/tariffs", "/cancel",
-                "/paysupport", "/terms", "/agreement", "/privacy", "/policy", "/offer", "/docs",
+                "/paysupport", "/testpay", "/terms", "/agreement", "/privacy", "/policy", "/offer", "/docs",
             }
             command = (event.text.split(maxsplit=1) or [""])[0].split("@", 1)[0]
             public_menu = ui.menu_texts("tariffs", "support", "profile", "help", "docs") | ui.CANCEL_TEXTS

@@ -407,7 +407,25 @@ if max(PRICE_RUB.values()) > PAYMENT_LIMIT_RUB:
 
 
 def rub_price(plan: str, months: int = 1) -> int:
+    if plan == "test":
+        return PLATEGA_TEST_RUB
     return _period_total(PRICE_RUB[plan], months)
+
+
+# Platega: СБП, карта и крипта на их странице оплаты. Без обоих ключей кнопки оплаты рублями
+# только объясняют, что оплата скоро появится.
+PLATEGA_MERCHANT_ID = os.getenv("PLATEGA_MERCHANT_ID", "").strip()
+PLATEGA_SECRET = os.getenv("PLATEGA_SECRET", "").strip()
+PLATEGA_ENABLED = bool(PLATEGA_MERCHANT_ID and PLATEGA_SECRET)
+# Скрытый тест на 1 день тарифа «Средний» за столько рублей (/testpay). 0 — выключен; на проде не задавать.
+PLATEGA_TEST_RUB = int(non_negative_float_setting("PLATEGA_TEST_RUB", "0"))
+# Вебхук Platega: локальный порт, который обратный прокси с HTTPS открывает наружу. 0 — выключен,
+# тогда бот узнаёт статусы сам, запросами по расписанию.
+PLATEGA_CALLBACK_PORT = int(non_negative_float_setting("PLATEGA_CALLBACK_PORT", "0"))
+PLATEGA_CALLBACK_HOST = os.getenv("PLATEGA_CALLBACK_HOST", "127.0.0.1").strip() or "127.0.0.1"
+PLATEGA_CALLBACK_PATH = "/" + (os.getenv("PLATEGA_CALLBACK_PATH", "platega/callback").strip().strip("/") or "platega/callback")
+if PLATEGA_CALLBACK_PORT > 65535:
+    raise ValueError("PLATEGA_CALLBACK_PORT должен быть от 1 до 65535 (0 — вебхук выключен)")
 
 
 def plan_title(plan: str | None) -> str:

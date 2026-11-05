@@ -693,6 +693,69 @@ async def init_db():
                 await db.execute("INSERT INTO stars_orders SELECT * FROM stars_orders_old;")
                 await db.execute("DROP TABLE stars_orders_old;")
         await db.execute("CREATE INDEX IF NOT EXISTS stars_orders_user ON stars_orders(user_id, id)")
+        # Рублёвые оплаты через Platega. status — наш учёт:
+        # new → pending (ссылка выдана) → paid | canceled | expired | review (сумма не сошлась) | failed (касса не ответила);
+        # paid → disputed (спор, деньги удержаны) → paid | refunded (деньги вернули покупателю).
+        # paid_at ставится один раз, вместе с выдачей тарифа: по нему повторный CONFIRMED тариф не продлевает.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS rub_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                tariff_plan TEXT NOT NULL,
+                amount INTEGER NOT NULL CHECK(amount > 0),
+                days INTEGER NOT NULL CHECK(days > 0),
+                provider TEXT NOT NULL DEFAULT 'platega',
+                payment_method TEXT,
+                transaction_id TEXT UNIQUE,
+                pay_url TEXT,
+                pay_total REAL,
+                expires_at REAL,
+                status TEXT NOT NULL DEFAULT 'new',
+                provider_status TEXT,
+                paid_amount REAL,
+                refunded_amount REAL NOT NULL DEFAULT 0,
+                buyer_username TEXT,
+                buyer_name TEXT,
+                chat_id INTEGER,
+                message_id INTEGER,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                paid_at TIMESTAMP,
+                subscription_before TIMESTAMP,
+                tariff_before TEXT,
+                allowed_before INTEGER,
+                trial_before INTEGER,
+                subscription_after TIMESTAMP,
+                tariff_after TEXT,
+                revision_after INTEGER,
+                disputed_at TIMESTAMP,
+                refunded_at TIMESTAMP,
+                refund_needs_review INTEGER NOT NULL DEFAULT 0,
+                last_checked_at TIMESTAMP,
+                next_check_at REAL
+            )
+        """)
+        # Базы, созданные до появления части колонок (локальные тесты кассы), догоняют схему.
+        await ensure_columns(db, "rub_orders", {
+            "payment_method": "TEXT", "pay_total": "REAL", "expires_at": "REAL", "provider_status": "TEXT",
+            "paid_amount": "REAL", "refunded_amount": "REAL NOT NULL DEFAULT 0", "buyer_username": "TEXT",
+            "buyer_name": "TEXT", "allowed_before": "INTEGER", "trial_before": "INTEGER", "tariff_after": "TEXT",
+            "revision_after": "INTEGER", "disputed_at": "TIMESTAMP", "refunded_at": "TIMESTAMP",
+            "refund_needs_review": "INTEGER NOT NULL DEFAULT 0", "last_checked_at": "TIMESTAMP", "next_check_at": "REAL",
+        })
+        await db.execute("CREATE INDEX IF NOT EXISTS rub_orders_user ON rub_orders(user_id, id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS rub_orders_status ON rub_orders(status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS rub_orders_next_check ON rub_orders(next_check_at)")
+        # Использование бота по дням (МСК) для доказательств по спорам: notification_events живут сутки,
+        # а спор по платежу приходит через месяцы. Лоты переносятся сюда при чистке событий, заходы — из touch_user.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS usage_daily (
+                user_id INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                lots_sent INTEGER NOT NULL DEFAULT 0,
+                opens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, day)
+            ) WITHOUT ROWID
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS admin_subscription_actions (
                 token TEXT PRIMARY KEY,
@@ -1455,6 +1518,8 @@ async def get_ever_subscribed_user_ids() -> set[int]:
             WHERE COALESCE(trial_used, 0) = 1 OR COALESCE(is_allowed, 0) = 1 OR subscription_until IS NOT NULL
             UNION
             SELECT user_id FROM stars_orders WHERE status IN ('paid', 'refunding')
+            UNION
+            SELECT user_id FROM rub_orders WHERE status IN ('paid', 'disputed')
         """) as cursor:
             return {int(row[0]) for row in await cursor.fetchall()}
 
@@ -1479,7 +1544,34 @@ async def find_lot_traces(item_id: str) -> dict[str, list[dict]]:
     return {"seen": seen, "deliveries": deliveries}
 
 
+_MSK_DAY_SQL = "date({} + 10800, 'unixepoch')"
+
+
+async def get_usage_by_day(user_id: int, since_day: str) -> List[tuple]:
+    """[(day МСК, lots delivered, bot opens)] from since_day on: archived days plus the last 24 hours still in the log."""
+    async with reader_connection() as db:
+        async with db.execute(f"""
+            SELECT day, SUM(lots), SUM(opens) FROM (
+                SELECT day, lots_sent AS lots, opens FROM usage_daily WHERE user_id = ? AND day >= ?
+                UNION ALL
+                SELECT {_MSK_DAY_SQL.format('sent_at')}, 1, 0 FROM notification_events
+                WHERE user_id = ? AND status = 'sent' AND sent_at IS NOT NULL
+                  AND {_MSK_DAY_SQL.format('sent_at')} >= ?
+            ) GROUP BY day ORDER BY day
+        """, (int(user_id), since_day, int(user_id), since_day)) as cursor:
+            return [(row[0], int(row[1] or 0), int(row[2] or 0)) for row in await cursor.fetchall()]
+
+
 PAID_STATUSES = "('paid', 'refunding')"
+# Рублёвый заказ на споре всё ещё оплачен: деньги удержаны, но не возвращены.
+RUB_PAID_STATUSES = "('paid', 'disputed')"
+# Все оплаченные заказы обоих видов: Stars (⭐) и рубли через Platega (₽).
+PAID_ORDERS_SQL = (
+    f"(SELECT user_id, paid_at, total_amount AS amount, tariff_plan, 'stars' AS kind FROM stars_orders "
+    f"WHERE status IN {PAID_STATUSES} "
+    f"UNION ALL SELECT user_id, paid_at, amount, tariff_plan, 'rub' AS kind FROM rub_orders "
+    f"WHERE status IN {RUB_PAID_STATUSES})"
+)
 
 
 async def log_admin_action(admin_id: int, user_id: Optional[int], action: str, detail: str = "") -> None:
@@ -1522,6 +1614,12 @@ async def touch_user(user_id: int) -> None:
     try:
         async with writer_connection() as db:
             await db.execute("UPDATE users SET last_seen_at = datetime('now') WHERE user_id = ?", (int(user_id),))
+            # A day with activity, for payment-dispute evidence (at most one write per TOUCH_INTERVAL).
+            await db.execute(
+                "INSERT INTO usage_daily (user_id, day, opens) VALUES (?, date('now', '+3 hours'), 1) "
+                "ON CONFLICT(user_id, day) DO UPDATE SET opens = opens + 1",
+                (int(user_id),),
+            )
             await db.commit()
     except Exception:
         logger.debug("Не удалось обновить last_seen_at", exc_info=True)
@@ -1544,12 +1642,19 @@ async def get_user_activity(user_id: int) -> Dict[str, Any]:
         ) as cursor:
             paid_count, paid_total, last_paid = await cursor.fetchone()
         async with db.execute(
+            f"SELECT COUNT(*), COALESCE(SUM(amount), 0), MAX(paid_at) FROM rub_orders "
+            f"WHERE user_id = ? AND status IN {RUB_PAID_STATUSES}",
+            (int(user_id),),
+        ) as cursor:
+            rub_count, rub_total, last_rub = await cursor.fetchone()
+        async with db.execute(
             "SELECT COUNT(*) FROM searches WHERE user_id = ? AND pause_reason = ?", (int(user_id), PAUSE_BLOCKED)
         ) as cursor:
             blocked = (await cursor.fetchone())[0] > 0
     return {
         "lots_total": int(total or 0), "lots_day": int(day or 0), "lots_week": int(week or 0), "last_sent": last_sent,
         "paid_count": int(paid_count or 0), "paid_total": int(paid_total or 0), "last_paid": last_paid,
+        "rub_count": int(rub_count or 0), "rub_total": int(rub_total or 0), "last_rub": last_rub,
         "blocked_bot": bool(blocked),
     }
 
@@ -1557,30 +1662,35 @@ async def get_user_activity(user_id: int) -> Dict[str, Any]:
 async def get_money_stats() -> Dict[str, Any]:
     """Revenue by period, the trial → payment funnel of the last 30 days, renewals and churn."""
     async with reader_connection() as db:
-        revenue = {}
+        # revenue[key] = (оплат, ⭐, платили человек); revenue_rub[key] = (оплат, ₽, платили человек).
+        revenue, revenue_rub = {}, {}
         for key, since in (("day", "-1 day"), ("week", "-7 days"), ("month", "-30 days"), ("all", "-100 years")):
-            async with db.execute(
-                f"SELECT COUNT(*), COALESCE(SUM(total_amount), 0), COUNT(DISTINCT user_id) FROM stars_orders "
-                f"WHERE status IN {PAID_STATUSES} AND paid_at > datetime('now', ?)",
-                (since,),
-            ) as cursor:
-                revenue[key] = tuple(int(v or 0) for v in await cursor.fetchone())
+            for table, amount, statuses, target in (
+                ("stars_orders", "total_amount", PAID_STATUSES, revenue),
+                ("rub_orders", "amount", RUB_PAID_STATUSES, revenue_rub),
+            ):
+                async with db.execute(
+                    f"SELECT COUNT(*), COALESCE(SUM({amount}), 0), COUNT(DISTINCT user_id) FROM {table} "
+                    f"WHERE status IN {statuses} AND paid_at > datetime('now', ?)",
+                    (since,),
+                ) as cursor:
+                    target[key] = tuple(int(v or 0) for v in await cursor.fetchone())
         async with db.execute(
-            f"SELECT tariff_plan, COUNT(*), COALESCE(SUM(total_amount), 0) FROM stars_orders "
-            f"WHERE status IN {PAID_STATUSES} AND paid_at > datetime('now', '-30 days') GROUP BY tariff_plan"
+            f"SELECT tariff_plan, kind, COUNT(*), COALESCE(SUM(amount), 0) FROM {PAID_ORDERS_SQL} "
+            f"WHERE paid_at > datetime('now', '-30 days') GROUP BY tariff_plan, kind ORDER BY tariff_plan, kind"
         ) as cursor:
-            by_plan = [(row[0], int(row[1]), int(row[2])) for row in await cursor.fetchall()]
+            by_plan = [(row[0], row[1], int(row[2]), int(row[3])) for row in await cursor.fetchall()]
         async with db.execute(f"""
             SELECT COUNT(*),
                    SUM(CASE WHEN COALESCE(u.trial_used, 0) = 1 OR u.subscription_until IS NOT NULL THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN EXISTS (SELECT 1 FROM stars_orders o WHERE o.user_id = u.user_id
-                                         AND o.status IN {PAID_STATUSES}) THEN 1 ELSE 0 END)
+                   SUM(CASE WHEN EXISTS (SELECT 1 FROM {PAID_ORDERS_SQL} o WHERE o.user_id = u.user_id)
+                       THEN 1 ELSE 0 END)
             FROM users u WHERE u.created_at > datetime('now', '-30 days')
         """) as cursor:
             new_users, tried, paid = (int(v or 0) for v in await cursor.fetchone())
         async with db.execute(f"""
             SELECT COUNT(*), SUM(CASE WHEN n >= 2 THEN 1 ELSE 0 END)
-            FROM (SELECT user_id, COUNT(*) AS n FROM stars_orders WHERE status IN {PAID_STATUSES} GROUP BY user_id)
+            FROM (SELECT user_id, COUNT(*) AS n FROM {PAID_ORDERS_SQL} GROUP BY user_id)
         """) as cursor:
             payers, renewed = (int(v or 0) for v in await cursor.fetchone())
         async with db.execute("""
@@ -1589,13 +1699,20 @@ async def get_money_stats() -> Dict[str, Any]:
         """) as cursor:
             active_paid, active_trial = (int(v or 0) for v in await cursor.fetchone())
         async with db.execute(f"""
-            SELECT COUNT(*), SUM(CASE WHEN EXISTS (SELECT 1 FROM stars_orders o WHERE o.user_id = u.user_id
-                                                   AND o.status IN {PAID_STATUSES}) THEN 1 ELSE 0 END)
+            SELECT COUNT(*), SUM(CASE WHEN EXISTS (SELECT 1 FROM {PAID_ORDERS_SQL} o WHERE o.user_id = u.user_id)
+                                 THEN 1 ELSE 0 END)
             FROM users u WHERE u.subscription_until <= datetime('now') AND u.subscription_until > datetime('now', '-30 days')
         """) as cursor:
             lapsed, lapsed_paid = (int(v or 0) for v in await cursor.fetchone())
+        async with db.execute(
+            "SELECT SUM(CASE WHEN status = 'disputed' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN status = 'refunded' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN status = 'review' OR refund_needs_review = 1 THEN 1 ELSE 0 END) FROM rub_orders"
+        ) as cursor:
+            disputed, refunded, review = (int(v or 0) for v in await cursor.fetchone())
     return {
-        "revenue": revenue, "by_plan": by_plan,
+        "revenue": revenue, "revenue_rub": revenue_rub, "by_plan": by_plan,
+        "rub_disputed": disputed, "rub_refunded": refunded, "rub_review": review,
         "funnel": {"new": new_users, "tried": tried, "paid": paid},
         "payers": payers, "renewed": renewed,
         "active_paid": active_paid, "active_trial": active_trial,
@@ -1606,7 +1723,7 @@ async def get_money_stats() -> Dict[str, Any]:
 async def count_paid_orders(user_id: int) -> int:
     async with reader_connection() as db:
         async with db.execute(
-            f"SELECT COUNT(*) FROM stars_orders WHERE user_id = ? AND status IN {PAID_STATUSES}", (int(user_id),)
+            f"SELECT COUNT(*) FROM {PAID_ORDERS_SQL} WHERE user_id = ?", (int(user_id),)
         ) as cursor:
             return int((await cursor.fetchone())[0])
 
@@ -1624,7 +1741,7 @@ async def count_radar_lots(search_id: int, hours: int = 24) -> int:
 
 async def get_paid_user_ids() -> set[int]:
     async with reader_connection() as db:
-        async with db.execute("SELECT DISTINCT user_id FROM stars_orders WHERE status IN ('paid', 'refunding')") as cursor:
+        async with db.execute(f"SELECT DISTINCT user_id FROM {PAID_ORDERS_SQL}") as cursor:
             return {int(row[0]) for row in await cursor.fetchall()}
 
 
@@ -1741,11 +1858,17 @@ async def get_daily_report_stats(hours: int = 24) -> Dict[str, Any]:
         ) as cur:
             payments = [(r[0], int(r[1]), int(r[2])) for r in await cur.fetchall()]
         async with db.execute(
+            f"SELECT tariff_plan, COUNT(*), COALESCE(SUM(amount), 0) FROM rub_orders "
+            f"WHERE paid_at > datetime('now', ?) AND status IN {RUB_PAID_STATUSES} GROUP BY tariff_plan",
+            (since,),
+        ) as cur:
+            payments_rub = [(r[0], int(r[1]), int(r[2])) for r in await cur.fetchall()]
+        async with db.execute(
             "SELECT COUNT(*) FROM users WHERE subscription_until > datetime('now') "
             "AND subscription_until < datetime('now', '+3 days') AND is_allowed = 1"
         ) as cur:
             expiring = (await cur.fetchone())[0]
-    return {"new_users": new_users, "payments": payments, "expiring_3d": expiring}
+    return {"new_users": new_users, "payments": payments, "payments_rub": payments_rub, "expiring_3d": expiring}
 
 
 async def get_search(search_id: int) -> Optional[Dict[str, Any]]:
@@ -1972,6 +2095,12 @@ async def get_all_active_searches() -> List[Dict[str, Any]]:
                          AND so.status = 'paid'
                          AND so.tariff_plan = 'test'
                          AND so.subscription_after = u.subscription_until
+                   ) OR EXISTS (
+                       SELECT 1 FROM rub_orders ro
+                       WHERE ro.user_id = u.user_id
+                         AND ro.status = 'paid'
+                         AND ro.tariff_plan = 'test'
+                         AND ro.subscription_after = u.subscription_until
                    ) AS is_test_order,
                    CAST(strftime('%s', s.created_at) AS REAL) AS created_epoch,
                    CAST(strftime('%s', s.initialized_at) AS REAL) AS initialized_epoch
@@ -3340,6 +3469,18 @@ async def cleanup_terminal_notification_events(
 
     async with writer_connection() as db:
         await db.execute("BEGIN IMMEDIATE")
+        # Before the delivered lots are dropped, their per-day count goes to usage_daily: evidence for
+        # payment disputes outlives the 24-hour event log. Each row is counted once, at its deletion.
+        await db.execute(
+            f"""
+            INSERT INTO usage_daily (user_id, day, lots_sent)
+            SELECT user_id, {_MSK_DAY_SQL.format('sent_at')}, COUNT(*) FROM notification_events
+            WHERE status = 'sent' AND sent_at IS NOT NULL AND sent_at < ?
+            GROUP BY user_id, {_MSK_DAY_SQL.format('sent_at')}
+            ON CONFLICT(user_id, day) DO UPDATE SET lots_sent = lots_sent + excluded.lots_sent
+            """,
+            (cutoff,),
+        )
         c1 = await db.execute(
             """
             DELETE FROM notification_events
@@ -3903,6 +4044,7 @@ async def purge_user_by_pattern(pattern: str) -> Dict[str, Any]:
             await db.execute("DELETE FROM notification_outbox WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM searches WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM radar_history WHERE user_id = ?", (uid,))
+            await db.execute("DELETE FROM usage_daily WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM blocked_sellers WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM support_outbox WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM admin_subscription_actions WHERE user_id = ? AND applied_at IS NULL", (uid,))

@@ -332,7 +332,9 @@ async def _activity_lines(target_id: int, user: dict) -> str:
         f"• Лотов получил: <b>{activity['lots_day']}</b> за сутки, <b>{activity['lots_week']}</b> за неделю, "
         f"всего {activity['lots_total']} · последний {_ago(activity['last_sent'])}",
         f"• Оплат: <b>{activity['paid_count']}</b> на <b>{activity['paid_total']} ⭐</b>"
-        + (f" · последняя {_ago(activity['last_paid'])}" if activity["paid_count"] else ""),
+        + (f" · последняя {_ago(activity['last_paid'])}" if activity["paid_count"] else "")
+        + (f"; рублями <b>{activity['rub_count']}</b> на <b>{activity['rub_total']} ₽</b> · последняя {_ago(activity['last_rub'])}"
+           if activity["rub_count"] else ""),
     ]
     if activity["blocked_bot"]:
         lines.append("• ⛔️ <b>Заблокировал бота</b>: радары на паузе, сообщения не доходят")
@@ -1885,11 +1887,24 @@ async def cb_admin_money(event):
     stats = await database.get_money_stats()
     revenue, funnel = stats["revenue"], stats["funnel"]
 
+    revenue_rub = stats["revenue_rub"]
+
     def period(key: str, title: str) -> str:
         orders, stars, payers = revenue[key]
-        return f"{title}: <b>{stars} ⭐</b> · оплат {orders} · платили {payers} чел."
+        rub_orders, rubles, rub_payers = revenue_rub[key]
+        return (f"{title}: <b>{rubles} ₽</b> ({rub_orders} опл.) · <b>{stars} ⭐</b> ({orders} опл.) · "
+                f"платили {payers + rub_payers} чел.")
 
-    plans = ", ".join(f"«{config.plan_title(p)}» {n} шт. на {s} ⭐" for p, n, s in stats["by_plan"]) or "нет"
+    plans = ", ".join(
+        f"«{config.plan_title(p)}» {n} шт. на {s} {'₽' if kind == 'rub' else '⭐'}" for p, kind, n, s in stats["by_plan"]
+    ) or "нет"
+    trouble = []
+    if stats["rub_disputed"]:
+        trouble.append(f"⚠️ Споров по оплатам: <b>{stats['rub_disputed']}</b> — доказательства в карточке пользователя")
+    if stats["rub_review"]:
+        trouble.append(f"⚠️ На сверке: <b>{stats['rub_review']}</b> (сумма не сошлась или срок менялся после возврата)")
+    if stats["rub_refunded"]:
+        trouble.append(f"Возвращено рублёвых оплат: {stats['rub_refunded']}")
     lines = [
         f"{ui.e('coin')} <b>Деньги</b>",
         "",
@@ -1898,6 +1913,7 @@ async def cb_admin_money(event):
         period("month", "30 дней"),
         period("all", "Всё время"),
         f"По тарифам за 30 дней: {plans}",
+        *([""] + trouble if trouble else []),
         "",
         "<b>Воронка за 30 дней</b>",
         f"Новых: <b>{funnel['new']}</b> → попробовали (триал или выдача): <b>{funnel['tried']}</b> "
@@ -1908,7 +1924,8 @@ async def cb_admin_money(event):
         f"Платили хоть раз: <b>{stats['payers']}</b>, из них продлевали: <b>{stats['renewed']}</b> ({_share(stats['renewed'], stats['payers'])})",
         f"Доступ закончился за 30 дней: <b>{stats['lapsed']}</b>, из них платившие: <b>{stats['lapsed_paid']}</b>",
         "",
-        "<blockquote>Сумма — оплаты Stars без возвращённых. «С подпиской» включает выданные админом.</blockquote>",
+        "<blockquote>Суммы — оплаты без возвращённых; рубли — цена тарифа, без комиссии платёжной системы. "
+        "«С подпиской» включает выданные админом.</blockquote>",
     ]
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📣 Написать ушедшим", callback_data="admin_bc:lost")],

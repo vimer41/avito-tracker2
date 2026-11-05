@@ -129,7 +129,7 @@ class TestPaymentNoticeAndMoney(AdminToolsBase):
         order = await self.pay()
         await self.dispatch_callback("admin_money", config.ADMIN_ID)
         text = self.texts(config.ADMIN_ID)[-1]
-        self.assertIn(f"Сутки: <b>{order['total_amount']} ⭐</b>", text)
+        self.assertIn(f"Сутки: <b>0 ₽</b> (0 опл.) · <b>{order['total_amount']} ⭐</b> (1 опл.)", text)
         self.assertIn("Платили хоть раз: <b>1</b>", text)
 
         await self.dispatch_callback("admin_money", USER_ID)

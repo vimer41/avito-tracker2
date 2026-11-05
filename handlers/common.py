@@ -2,7 +2,7 @@ import html
 import logging
 import re
 from typing import Optional
-from aiogram import Router, F
+from aiogram import Bot, Router, F
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import CommandStart, Command
 from aiogram.enums import ChatMemberStatus, ChatType
@@ -10,6 +10,7 @@ from aiogram.types import CallbackQuery, ChatMemberUpdated, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 
 import config
+import rub_payments
 import database
 import legal_docs
 import trial_gate
@@ -462,7 +463,10 @@ async def cb_select_tariff(call: CallbackQuery):
         + ("• Копии лотов в вашу группу или канал — для работы вдвоём или командой\n" if plan in config.GROUP_DELIVERY_PLANS else "")
         + f"\n<i>{PLAN_PERKS[plan]}</i>\n\n"
         f"{await plan_change_note(call.from_user.id, plan, months)}"
-        "Разовая оплата без автосписаний, доступ включается сразу. Оплачивая, вы соглашаетесь с /terms.\n\n"
+        "Разовая оплата без автосписаний, доступ включается сразу. Оплачивая, вы соглашаетесь с /terms.\n"
+        + ("При оплате рублями платёжная система добавляет свою комиссию, точная сумма будет в счёте.\n"
+           if config.PLATEGA_ENABLED and not is_test else "")
+        + "\n"
         + ("<b>Способ оплаты:</b>" if is_test else "<b>Срок и способ оплаты:</b>")
     )
 
@@ -473,15 +477,12 @@ async def cb_select_tariff(call: CallbackQuery):
                    callback_data=f"buy_tariff:{tariff_key}:{m}", style="primary" if m == months else None)
             for m in config.PERIOD_MONTHS
         ])
-        rows.append([ui.btn(f"СБП — {config.rub_price(tariff_key, months)} ₽", "card",
-                            callback_data=f"pay_method:sbp:{tariff_key}", style="success")])
+        rows.extend(rub_payments.method_buttons(tariff_key, months, config.rub_price(tariff_key, months)))
     if config.STARS_PAYMENTS_ENABLED:
         rows.append([ui.btn(f"Telegram Stars — {stars} ⭐", "star",
                             callback_data=f"stars_buy:{tariff_key}:{months}:{stars}")])
     else:
         text += "\n\n⏸ Оплата Telegram Stars временно выключена."
-    if not is_test:
-        rows.append([ui.btn("Криптовалюта", "coin", callback_data=f"pay_method:crypto:{tariff_key}")])
     rows.append([
         ui.btn("« Все тарифы", callback_data="open_subscription_menu"),
         ui.btn("Вопрос по оплате", "support", callback_data="payment_support"),
@@ -489,13 +490,24 @@ async def cb_select_tariff(call: CallbackQuery):
     await ui.show(call, text, ui.kb(*rows))
 
 
-PAY_METHOD_TITLES = {"sbp": "СБП", "crypto": "криптовалютой"}
+PAY_METHOD_TITLES = {"sbp": "СБП", "card": "картой", "crypto": "криптовалютой"}
 
 
 @router.callback_query(F.data.startswith("pay_method:"))
-async def cb_pay_method(call: CallbackQuery):
-    # СБП and crypto checkouts are not connected yet: the buttons only explain that and point to Stars.
-    method = call.data.split(":")[1] if call.data.count(":") >= 1 else ""
+async def cb_pay_method(call: CallbackQuery, bot: Bot):
+    # pay_method:<sbp|card|crypto>:<plan>[:<months>]. With Platega keys each opens its own Platega payment page.
+    parts = call.data.split(":")
+    method = parts[1] if len(parts) > 1 else ""
+    if config.PLATEGA_ENABLED and method in rub_payments.METHODS and len(parts) > 2:
+        months = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
+        if not call.message or call.message.chat.type != "private":
+            await call.answer("Оплата доступна только в личном чате с ботом.", show_alert=True)
+            return
+        await call.answer("Создаю счёт")
+        error = await rub_payments.start_checkout(bot, call.from_user, parts[2], months, method)
+        if error:
+            await call.message.answer(error)
+        return
     title = PAY_METHOD_TITLES.get(method, "этим способом")
     stars_hint = " Сейчас можно оплатить через Telegram Stars." if config.STARS_PAYMENTS_ENABLED else ""
     await call.answer(f"Оплата {title} скоро появится.{stars_hint}", show_alert=True)

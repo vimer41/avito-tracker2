@@ -29,8 +29,9 @@ if sys.platform == "win32":
         pass
 
 # Настройка логирования: описание файлов и уровней в logger_setup.py
-from logger_setup import log_event, setup_logging
+from logger_setup import log_event, register_secret, setup_logging
 setup_logging()
+register_secret(config.PLATEGA_SECRET)
 logger = logging.getLogger("bot")
 
 
@@ -100,6 +101,7 @@ async def main():
     web_runner = await start_health_server()
     bot = None
     background_tasks = []
+    platega_runner = None
 
     try:
         await database.init_db()
@@ -143,6 +145,17 @@ async def main():
             config.STARS_SUBSCRIPTION_DAYS,
         )
         background_tasks = start_background_services(bot)
+        if config.PLATEGA_ENABLED:
+            import platega_webhook
+            import rub_payments
+            resumed = await rub_payments.resume(bot)
+            background_tasks.append(asyncio.create_task(rub_payments.sweep_forever(bot), name="platega-sweep"))
+            try:
+                platega_runner = await platega_webhook.start(bot)
+            except OSError as exc:
+                logger.error("Platega callback server did not start: %s", exc)
+            logger.info("Platega checkout: enabled, test=%s ₽, watchers resumed=%s, webhook=%s",
+                        config.PLATEGA_TEST_RUB, resumed, "on" if platega_runner else "off")
         version = release_version()
         log_event(
             logger,
@@ -166,6 +179,8 @@ async def main():
             await bot.session.close()
         if web_runner:
             await web_runner.cleanup()
+        if platega_runner:
+            await platega_runner.cleanup()
         log_event(logger, logging.INFO, "app.stop", "Бот остановлен", clean=True)
 
 

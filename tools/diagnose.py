@@ -63,6 +63,10 @@ def print_database_summary(path: Path):
         if "stars_orders" in tables:
             print("Stars order states:", json.dumps(dict(db.execute("SELECT status, COUNT(*) FROM stars_orders GROUP BY status"))))
             print("Refunds requiring subscription review:", db.execute("SELECT COUNT(*) FROM stars_orders WHERE refund_needs_review = 1").fetchone()[0])
+        if "rub_orders" in tables:
+            print("Ruble order states:", json.dumps(dict(db.execute("SELECT status, COUNT(*) FROM rub_orders GROUP BY status"))))
+            print("Ruble orders requiring review:", db.execute(
+                "SELECT COUNT(*) FROM rub_orders WHERE status = 'review' OR refund_needs_review = 1").fetchone()[0])
 
 
 async def telegram_probe(config, notify_admin: bool = False):

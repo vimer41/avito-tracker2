@@ -1,6 +1,7 @@
 import asyncio
 import html
 import logging
+import time
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -12,6 +13,7 @@ import billing
 import config
 import database
 import legal_docs
+import rub_payments
 import ui
 
 logger = logging.getLogger(__name__)
@@ -99,6 +101,89 @@ async def buy_stars(call: CallbackQuery, bot: Bot, state: FSMContext):
     except Exception as exc:
         logger.warning("Stars invoice delivery failed: order=%s error=%s", order["id"], type(exc).__name__)
         await call.message.answer("Не удалось отправить счёт. Деньги не списаны; попробуйте снова или откройте /paysupport.")
+
+
+# ---------- Рубли через Platega: логика в rub_payments, здесь только кнопки и команды ----------
+
+RUB_CHECK_COOLDOWN = 3.0
+RUB_CHECK_PRESSED: dict[int, float] = {}
+RUB_CHECK_ANSWERS = {
+    "CONFIRMED": "Оплата получена",
+    "PENDING": "Оплата ещё не пришла. Если уже оплатили, подождите минуту",
+    "CANCELED": "Платёж не состоялся, деньги не списаны",
+    "MISMATCH": "Платёж на сверке: поддержка уже видит его и напишет вам",
+    "DISPUTED": "Платёж на проверке у платёжной системы",
+    "CHARGEBACKED": "Платёж возвращён",
+}
+
+
+@router.callback_query(F.data.startswith("rub_check:"))
+async def rub_check(call: CallbackQuery, bot: Bot):
+    try:
+        order = await billing.get_rub_order(int(call.data.split(":")[1]))
+    except (ValueError, IndexError):
+        order = None
+    if not order or order["user_id"] != call.from_user.id:
+        await call.answer("Счёт не найден", show_alert=True)
+        return
+    # Each press is a request to Platega: a few seconds between presses is enough.
+    now = time.monotonic()
+    if now - RUB_CHECK_PRESSED.get(order["id"], -RUB_CHECK_COOLDOWN) < RUB_CHECK_COOLDOWN:
+        await call.answer("Проверяю, подождите пару секунд")
+        return
+    RUB_CHECK_PRESSED[order["id"]] = now
+    if len(RUB_CHECK_PRESSED) > 1000:
+        RUB_CHECK_PRESSED.clear()
+    try:
+        status = await rub_payments.check_order(bot, order["id"])
+    except Exception as exc:
+        logger.warning("Platega status failed: order=%s error=%s", order["id"], type(exc).__name__)
+        await call.answer("Касса не ответила, попробуйте через минуту", show_alert=True)
+        return
+    await call.answer(RUB_CHECK_ANSWERS.get(status, "Статус обновлён"), show_alert=status != "CONFIRMED")
+
+
+@router.message(Command("testpay"))
+async def test_pay(message: Message):
+    if not config.PLATEGA_ENABLED or not config.PLATEGA_TEST_RUB:
+        return
+    await message.answer(
+        f"{ui.e('card')} <b>Тест оплаты — {config.PLATEGA_TEST_RUB} ₽</b>\n\n"
+        "1 день тарифа «Средний». Выберите способ:",
+        reply_markup=ui.kb(*rub_payments.method_buttons("test", 1, config.PLATEGA_TEST_RUB)),
+    )
+
+
+@router.callback_query(F.data.startswith("admin_rubproof:"))
+async def admin_rub_proof(call: CallbackQuery, bot: Bot):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        order_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректный заказ", show_alert=True)
+        return
+    await call.answer("Собираю файл")
+    if not await rub_payments.send_evidence(bot, call.from_user.id, order_id):
+        await call.message.answer("Заказ не найден.")
+
+
+@router.message(Command("proof"))
+async def admin_proof_command(message: Message, bot: Bot):
+    """/proof R12 · /proof 12 · /proof <номер транзакции Platega из письма о споре>."""
+    if not config.is_admin(message.from_user.id):
+        return
+    arg = (message.text or "").split(maxsplit=1)[1].strip() if len((message.text or "").split(maxsplit=1)) > 1 else ""
+    number = arg[1:] if arg[:1] in ("R", "r") else arg
+    if number.isdigit():
+        order = await billing.get_rub_order(int(number))
+    else:
+        order = await billing.find_rub_order(transaction_id=arg) if arg else None
+    if not order:
+        await message.answer("Укажите заказ: /proof R12 или номер транзакции Platega.")
+        return
+    await rub_payments.send_evidence(bot, message.chat.id, order["id"])
 
 
 @router.pre_checkout_query()
@@ -194,12 +279,15 @@ async def payment_support(event, state: FSMContext):
     from handlers.support import SupportStates
     user = event.from_user
     orders = await billing.list_orders(user.id)
+    rub_orders = await billing.list_rub_orders(user.id, 5)
     text = f"{ui.e('support')} <b>Оплата и возврат</b>\n\n{ui.e('mail')} {legal_docs.SUPPORT_EMAIL}\n\n"
-    if orders:
+    if orders or rub_orders:
         text += "<b>Последние платежи:</b>\n" + "\n".join(
-            f"• #{o['id']} · {config.plan_title(o['tariff_plan'])} · {o['total_amount']} ⭐ · "
-            f"{'возвращён' if o['status'] == 'refunded' else 'возврат обрабатывается' if o['status'] == 'refunding' else 'оплачен'}"
-            for o in orders
+            [f"• R{o['id']} · {html.escape(rub_payments.order_title(o))} · {rub_payments.rub(o['amount'])} ₽ · "
+             f"{rub_payments.STATUS_TITLES.get(o['status'], o['status'])}" for o in rub_orders]
+            + [f"• #{o['id']} · {config.plan_title(o['tariff_plan'])} · {o['total_amount']} ⭐ · "
+               f"{'возвращён' if o['status'] == 'refunded' else 'возврат обрабатывается' if o['status'] == 'refunding' else 'оплачен'}"
+               for o in orders]
         ) + "\n\n"
     text += "Опишите проблему или запрос возврата следующим сообщением, укажите номер заказа, если знаете. Ответим прямо здесь."
     await state.set_state(SupportStates.waiting_for_user_message)
@@ -223,14 +311,25 @@ async def admin_payments(call: CallbackQuery):
         await call.answer("Некорректный пользователь", show_alert=True)
         return
     orders = await billing.list_orders(user_id)
+    rub_orders = await billing.list_rub_orders(user_id, 10)
     lines = [f"⭐ <b>ПЛАТЕЖИ ПОЛЬЗОВАТЕЛЯ {user_id}</b>"]
     buttons = []
+    for order in rub_orders:
+        lines.append(
+            f"R{order['id']} · {html.escape(rub_payments.order_title(order))} · {rub_payments.rub(order['amount'])} ₽ · "
+            f"{rub_payments.method_title(order)} · {rub_payments.STATUS_TITLES.get(order['status'], order['status'])}"
+            + (" · ⚠️ сверить подписку вручную" if order["refund_needs_review"] else "")
+        )
+        buttons.append([InlineKeyboardButton(text=f"📄 Доказательства R{order['id']}",
+                                             callback_data=f"admin_rubproof:{order['id']}")])
     for order in orders:
         lines.append(f"#{order['id']} · {config.plan_title(order['tariff_plan'])} · {order['total_amount']} ⭐ · {order['status']}"
                      + (" · ⚠️ сверить подписку вручную" if order["refund_needs_review"] else ""))
         if order["status"] in ("paid", "refunding"):
             buttons.append([InlineKeyboardButton(text=f"↩️ Вернуть #{order['id']} ({order['total_amount']} ⭐)", callback_data=f"admin_refund_prompt:{order['id']}")])
-    if not orders:
+    if rub_orders:
+        lines.append("\nРубли возвращаются в кабинете Platega; после спора возврат делать нельзя.")
+    if not orders and not rub_orders:
         lines.append("Подтверждённых платежей пока нет.")
     buttons.append([InlineKeyboardButton(text="« Карточка пользователя", callback_data=f"admin_user:{user_id}:0")])
     await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")

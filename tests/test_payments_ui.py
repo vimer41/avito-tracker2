@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -138,10 +139,39 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_callback("other_payment_methods")
         self.assertIn("buy_tariff:pro", self.callback_values())
 
+    async def platega_order(self, status_reply):
+        import platega
+        import rub_payments
+        created = AsyncMock(return_value={"transactionId": "tx-1", "url": "https://pay.platega.io/?id=tx-1", "status": "PENDING"})
+        with patch.object(config, "PLATEGA_ENABLED", True), patch.object(platega, "create_payment", created), \
+                patch.object(platega, "get_status", AsyncMock(return_value=status_reply)):
+            await self.dispatch_callback("pay_method:sbp:lite:1")
+            watchers = list(rub_payments._watchers.values())
+            for task in watchers:
+                task.cancel()
+            await asyncio.gather(*watchers, return_exceptions=True)
+            kwargs = created.await_args.kwargs
+            self.assertEqual((kwargs["amount"], kwargs["user_id"]), (199, self.user_id))
+            await self.dispatch_callback(f"rub_check:{kwargs['order_id']}")
+            await self.dispatch_callback(f"rub_check:{kwargs['order_id']}")
+        return await billing.get_rub_order(kwargs["order_id"])
+
+    async def test_platega_confirmed_grants_tariff_once(self):
+        order = await self.platega_order({"id": "tx-1", "status": "CONFIRMED", "paymentDetails": {"amount": 199, "currency": "RUB"}})
+        self.assertEqual(order["status"], "paid")
+        self.assertEqual((await database.get_user(self.user_id))["tariff_plan"], "lite")
+        paid = [m for m in self.methods("SendMessage") if "Оплата 199 ₽ прошла" in (m.text or "")]
+        self.assertEqual(len(paid), 1)
+
+    async def test_platega_canceled_or_short_payment_grants_nothing(self):
+        order = await self.platega_order({"id": "tx-1", "status": "CANCELED"})
+        self.assertEqual(order["status"], "canceled")
+        self.assertFalse((await database.get_user(self.user_id))["is_allowed"])
+
     async def test_tariff_card_offers_sbp_stars_and_crypto_but_only_stars_charges(self):
         await self.dispatch_callback("buy_tariff:lite")
         values = self.callback_values()
-        for value in ("pay_method:sbp:lite", "stars_buy:lite:1:199", "pay_method:crypto:lite"):
+        for value in ("pay_method:sbp:lite:1", "pay_method:card:lite:1", "stars_buy:lite:1:199", "pay_method:crypto:lite:1"):
             self.assertIn(value, values)
         self.assertIn("199 ₽", self.methods("EditMessageText")[-1].text)
         for method in ("sbp", "crypto"):
@@ -315,4 +345,4 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
 
     def test_tariff_prices_stay_under_the_payment_limit(self):
         self.assertLessEqual(max(config.PRICE_RUB.values()), config.PAYMENT_LIMIT_RUB)
-
+

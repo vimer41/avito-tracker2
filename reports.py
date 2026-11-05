@@ -160,6 +160,10 @@ async def build_daily_report(reset: bool = True) -> str:
         f"• {config.plan_title(plan)}: {count} шт · {amount} ⭐" for plan, count, amount in stats["payments"]
     ] or ["• нет"]
     stars_total = sum(amount for _plan, _count, amount in stats["payments"])
+    rub_total = sum(amount for _plan, _count, amount in stats["payments_rub"])
+    pay_lines += [f"• {config.plan_title(plan)}: {count} шт · {amount} ₽" for plan, count, amount in stats["payments_rub"]]
+    if stats["payments_rub"] and pay_lines[0] == "• нет":
+        pay_lines = pay_lines[1:]
     lat = day["pub_to_sent"]
     try:
         deficit = float(METRICS.snapshot(window_minutes=60)["capacity"].get("deficit_now") or 0.0)
@@ -170,7 +174,7 @@ async def build_daily_report(reset: bool = True) -> str:
         "",
         f"{ui.e('users')} Новых пользователей: <b>{stats['new_users']}</b> · всего {system['total_users']}, с доступом {system['allowed_users']}",
         f"{ui.e('time')} Подписка кончается за 3 дня: <b>{stats['expiring_3d']}</b>",
-        f"{ui.e('star')} Оплаты: <b>{stars_total} ⭐</b>",
+        f"{ui.e('star')} Оплаты: <b>{rub_total} ₽</b> · <b>{stars_total} ⭐</b>",
         *pay_lines,
         "",
         f"{ui.e('radar')} Радары: {system['active_searches']} активных из {system['total_searches']}",
