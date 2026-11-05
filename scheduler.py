@@ -30,6 +30,7 @@ from logger_setup import get_trace, log_event, set_trace
 from runtime_metrics import METRICS
 from parser import AvitoParser, AvitoItem
 import radar_filters
+import scan_journal
 from collector import SourceCollection, collect_source
 from source_cache import SOURCE_SNAPSHOTS, SourceSnapshot
 
@@ -848,9 +849,27 @@ def log_new_lots(radar_id: int, items: list, collection: SourceCollection, previ
     positions = {item.item_id: index for index, item in enumerate(collection.items)}
     for item in items[:MAX_LOT_LOGS_PER_SCAN]:
         published = normalize_timestamp(item.timestamp)
+        seen_at = collection.discovery_times.get(item.item_id, collection.captured_at)
+        try:
+            scan_journal.record_lot(
+                radar_id,
+                item_id=item.item_id,
+                title=item.title,
+                url=item.url,
+                published=published,
+                seen_at=seen_at,
+                scan_at=collection.captured_at,
+                previous_scan_at=previous_scan_at,
+                reliable=bool(getattr(item, "t_pub_reliable", False)),
+                fresh=bool(fresh.get(item.item_id)),
+                promo=bool(item.is_promotion),
+                pos=positions.get(item.item_id),
+                channel=collection.channel,
+            )
+        except Exception:
+            logger.debug("Журнал лотов не записан", exc_info=True)
         if published is None:
             continue
-        seen_at = collection.discovery_times.get(item.item_id, collection.captured_at)
         age = max(0.0, seen_at - published)
         log_event(
             logger,
@@ -975,8 +994,12 @@ async def process_collected_group_fanout(
                         )
                 new_items = matching_title_items
 
+        items_by_id = {it.item_id: it for it in items}
         if not new_items:
             METRICS.record_fanout_items(new=len(all_new_candidates), title=len(all_new_candidates))
+            scan_journal.record_decisions(
+                radar_id, now_epoch, {item_id: ("title", "") for item_id in all_new_candidates}, items_by_id
+            )
             for item_id, price in all_new_candidates.items():
                 seen_batch.append((radar_id, item_id, price or 0))
             continue
@@ -1015,19 +1038,27 @@ async def process_collected_group_fanout(
 
         deliverable_items = []
         stop_word_hits = seller_hits = filter_hits = 0
+        verdicts: dict[str, tuple[str, str]] = {item_id: ("title", "") for item_id in all_new_candidates}
+        for it in new_items:
+            verdicts[it.item_id] = ("unknown_age", "") if it.item_id in unknown_ids else (
+                ("old", f"лимит {effective_age_min} мин") if ages[it.item_id] is not True else ("queued", "")
+            )
         for it in fresh_items:
             matched_stop = is_stop_word_matched(it, stop_words)
             if matched_stop:
                 stop_word_hits += 1
+                verdicts[it.item_id] = ("stop", str(matched_stop))
                 logger.debug(f"Отсеяно по стоп-слову «{matched_stop}» [{user_str}]: «{it.title[:30]}»")
                 continue
             if radar_filters.seller_is_blocked(it, blocked_sellers):
                 seller_hits += 1
+                verdicts[it.item_id] = ("seller", str(it.seller_name or ""))
                 logger.debug(f"Отсеян продавец «{it.seller_name}» из ЧС [{user_str}]")
                 continue
             filter_reason = radar_filters.filter_reason(it, radar)
             if filter_reason:
                 filter_hits += 1
+                verdicts[it.item_id] = ("filter", str(filter_reason))
                 logger.debug(f"Отсеяно фильтром {filter_reason} [{user_str}]: «{it.title[:30]}»")
                 continue
             deliverable_items.append(it)
@@ -1057,6 +1088,9 @@ async def process_collected_group_fanout(
                 len(omitted),
             )
 
+        for item_id in omitted_catchup_ids:
+            verdicts[item_id] = ("catchup", "")
+        scan_journal.record_decisions(radar_id, now_epoch, verdicts, items_by_id)
         deliverable_ids = {it.item_id for it in deliverable_items}
         for item_id, price in all_new_candidates.items():
             if item_id in omitted_catchup_ids or (item_id not in deliverable_ids and item_id not in unknown_ids):
@@ -1356,6 +1390,7 @@ async def _acknowledge_delivery(row: dict, ctx: dict) -> bool:
         )
         t_pub_val = row.get("t_pub") or item.timestamp
         pub_age = max(0.0, t_sent - float(t_pub_val)) if t_pub_val and row.get("t_pub_reliable") else None
+        scan_journal.record_sent(ctx.get("radar_ids") or (), item.item_id, t_sent)
         log_event(
             logger,
             logging.INFO,

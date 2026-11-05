@@ -27,6 +27,9 @@ class AdminStates(StatesGroup):
     waiting_for_stars_prices = State()
     waiting_for_extend_time = State()
     waiting_for_extend_reason = State()
+    waiting_for_lot = State()
+    waiting_for_broadcast = State()
+    waiting_for_note = State()
 
 
 @router.callback_query(F.data == "admin_probe")
@@ -68,6 +71,7 @@ async def cb_admin_approve(call: CallbackQuery, bot: Bot):
     username_str = f"@{user['username']}" if user.get("username") else f"ID {target_user_id}"
 
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} одобрил доступ пользователю ID:{target_user_id} ({username_str})")
+    await database.log_admin_action(call.from_user.id, target_user_id, "approve")
 
     # Уведомляем пользователя
     try:
@@ -107,6 +111,7 @@ async def cb_admin_reject(call: CallbackQuery, bot: Bot):
     target_user_id = int(call.data.split(":")[1])
     await database.set_user_allowed(target_user_id, 0)
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} отклонил доступ пользователю ID:{target_user_id}")
+    await database.log_admin_action(call.from_user.id, target_user_id, "reject")
 
     await call.message.edit_text(
         f"❌ <b>Заявка пользователя {target_user_id} отклонена.</b>",
@@ -173,6 +178,7 @@ async def cb_admin_confirm_sub(call: CallbackQuery, bot: Bot):
 
     plan_title = f"«{config.plan_title(plan)}»"
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} выдал подписку {plan_title} на {days} дн. пользователю ID:{target_user_id}")
+    await database.log_admin_action(call.from_user.id, target_user_id, "grant", f"{plan_title}, {days} дн.")
 
     await call.message.edit_text(
         f"✅ <b>Подписка {plan_title} успешно выдана!</b>\n\n"
@@ -252,7 +258,8 @@ async def render_user_card_data(target_id: int, page: int = 0):
         + (" (не проверяются: нет доступа)" if active_radars and not has_access else "") + "\n"
         f"• Чёрный список: <b>{blocked_count}</b> продавцов\n"
         f"• Триал использован: <b>{'Да' if trial_used else 'Нет'}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
+        + await _activity_lines(target_id, user)
+        + "━━━━━━━━━━━━━━━━━━━━\n"
         "Управление пользователем:"
     )
 
@@ -266,11 +273,16 @@ async def render_user_card_data(target_id: int, page: int = 0):
         InlineKeyboardButton(text="« Список пользователей", callback_data=f"admin_page:{page}"),
     ]
     delete_row = [InlineKeyboardButton(text="🗑 Удалить радары", callback_data=f"admin_rdel:new:{target_id}:{page}")] if user_radars else []
+    note_row = [
+        InlineKeyboardButton(text="📝 Заметка", callback_data=f"admin_note:{target_id}:{page}"),
+        InlineKeyboardButton(text="🧾 Действия админов", callback_data=f"admin_ulog:{target_id}:{page}"),
+    ]
     if config.is_admin(target_id):
         # Admins have no subscription: only radars and the radar limit are managed here.
         text = text.replace(f"• Статус: {status_line}\n", "• Статус: 👑 <b>Администратор</b>\n")
         return text, InlineKeyboardMarkup(inline_keyboard=[row for row in (
             [InlineKeyboardButton(text=f"📁 Радары ({len(user_radars)})", callback_data=f"admin_user_radars:{target_id}:{page}")],
+            note_row,
             delete_row,
             limit_row,
             back_row,
@@ -282,6 +294,7 @@ async def render_user_card_data(target_id: int, page: int = 0):
         [InlineKeyboardButton(text=f"📁 Радары ({len(user_radars)})", callback_data=f"admin_user_radars:{target_id}:{page}"),
          InlineKeyboardButton(text="⭐ Платежи / возврат", callback_data=f"admin_payments:{target_id}")],
         limit_row,
+        note_row,
     ]
     if delete_row:
         buttons.insert(3, delete_row)
@@ -293,6 +306,137 @@ async def render_user_card_data(target_id: int, page: int = 0):
     ])
     buttons.append(back_row)
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _ago(value) -> str:
+    """'2 ч назад' from an epoch or a SQLite UTC timestamp."""
+    import time
+    from datetime import datetime, timezone
+
+    if value in (None, ""):
+        return "—"
+    try:
+        epoch = float(value)
+    except (TypeError, ValueError):
+        try:
+            epoch = datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            return "—"
+    return f"{_dur(time.time() - epoch)} назад"
+
+
+async def _activity_lines(target_id: int, user: dict) -> str:
+    activity = await database.get_user_activity(target_id)
+    lines = [
+        f"• Заходил: <b>{_ago(user.get('last_seen_at'))}</b>",
+        f"• Лотов получил: <b>{activity['lots_day']}</b> за сутки, <b>{activity['lots_week']}</b> за неделю, "
+        f"всего {activity['lots_total']} · последний {_ago(activity['last_sent'])}",
+        f"• Оплат: <b>{activity['paid_count']}</b> на <b>{activity['paid_total']} ⭐</b>"
+        + (f" · последняя {_ago(activity['last_paid'])}" if activity["paid_count"] else ""),
+    ]
+    if activity["blocked_bot"]:
+        lines.append("• ⛔️ <b>Заблокировал бота</b>: радары на паузе, сообщения не доходят")
+    if user.get("admin_note"):
+        lines.append(f"• 📝 Заметка: <i>{html.escape(user['admin_note'])}</i>")
+    return "\n".join(lines) + "\n"
+
+
+@router.callback_query(F.data.startswith("admin_note:"))
+async def cb_admin_note(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        _, target_raw, page_raw = call.data.split(":")
+        target_id, page = int(target_raw), int(page_raw)
+    except ValueError:
+        await call.answer("Некорректная кнопка", show_alert=True)
+        return
+    user = await database.get_user(target_id) or {}
+    await state.set_state(AdminStates.waiting_for_note)
+    await state.update_data(note_user=target_id, note_page=page)
+    current = f"\n\nСейчас: <i>{html.escape(user['admin_note'])}</i>" if user.get("admin_note") else ""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Стереть заметку", callback_data=f"admin_note_clear:{target_id}:{page}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{target_id}:{page}")],
+    ])
+    await ui.show(call, f"📝 <b>Заметка о пользователе</b> <code>{target_id}</code>\n\n"
+                        f"Пришлите текст. Её видят только админы.{current}", kb)
+
+
+@router.callback_query(F.data.startswith("admin_note_clear:"))
+async def cb_admin_note_clear(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    _, target_raw, page_raw = call.data.split(":")
+    await state.clear()
+    await database.set_admin_note(int(target_raw), "")
+    await database.log_admin_action(call.from_user.id, int(target_raw), "note", "заметка стёрта")
+    text, kb = await render_user_card_data(int(target_raw), int(page_raw))
+    await ui.show(call, text, kb)
+
+
+@router.message(AdminStates.waiting_for_note)
+async def msg_admin_note(message: Message, state: FSMContext):
+    if not config.is_admin(message.from_user.id):
+        return
+    from handlers.searches import route_menu_text
+
+    if await route_menu_text(message, state):
+        return
+    data = await state.get_data()
+    await state.clear()
+    target_id, page = int(data.get("note_user") or 0), int(data.get("note_page") or 0)
+    note = (message.text or "").strip()[:500]
+    await database.set_admin_note(target_id, note)
+    await database.log_admin_action(message.from_user.id, target_id, "note", note[:100])
+    text, kb = await render_user_card_data(target_id, page)
+    if text:
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+ADMIN_ACTION_LABELS = {
+    "grant": "выдал подписку", "vip": "выдал VIP", "trial": "выдал триал", "revoke": "отозвал доступ",
+    "limit": "изменил лимит радаров", "radars_delete": "удалил радары", "purge": "удалил пользователя",
+    "refund": "вернул платёж", "note": "заметка", "broadcast": "рассылка", "extend_all": "продлил всем",
+    "net_mode": "режим сети", "prices": "цены Stars", "approve": "одобрил доступ", "reject": "отклонил доступ",
+}
+
+
+def _admin_action_lines(rows: list[dict], with_user: bool) -> list[str]:
+    lines = []
+    for row in rows:
+        target = f" → <code>{row['user_id']}</code>" if with_user and row.get("user_id") else ""
+        detail = f": {html.escape(row['detail'])}" if row.get("detail") else ""
+        label = ADMIN_ACTION_LABELS.get(row["action"], row["action"])
+        lines.append(f"<code>{_msk_sql(row['at'])}</code> админ {row['admin_id']}{target} — {label}{detail}")
+    return lines or ["Пока пусто."]
+
+
+@router.callback_query(F.data.startswith("admin_ulog:"))
+async def cb_admin_user_log(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    _, target_raw, page_raw = call.data.split(":")
+    rows = await database.get_admin_actions(int(target_raw), limit=25)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="« Карточка пользователя", callback_data=f"admin_user:{target_raw}:{page_raw}")],
+    ])
+    text = f"🧾 <b>Действия админов</b> · <code>{target_raw}</code>\n\n" + "\n".join(_admin_action_lines(rows, False))
+    await ui.show(call, text + "\n\n<blockquote>Время МСК.</blockquote>", kb)
+
+
+@router.callback_query(F.data == "admin_alog")
+async def cb_admin_log_all(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    rows = await database.get_admin_actions(None, limit=30)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="admin_refresh")]])
+    text = "🧾 <b>Журнал админов</b> (последние 30)\n\n" + "\n".join(_admin_action_lines(rows, True))
+    await ui.show(call, text + "\n\n<blockquote>Время МСК.</blockquote>", kb)
 
 
 @router.callback_query(F.data.startswith("admin_radar_limit:"))
@@ -311,6 +455,7 @@ async def cb_admin_radar_limit(call: CallbackQuery):
     extra = await database.change_user_extra_radars(target_id, delta)
     max_radars = await database.get_user_max_radars(target_id)
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} изменил лимит радаров ID:{target_id} на {delta:+d} (бонус {extra}, лимит {max_radars})")
+    await database.log_admin_action(call.from_user.id, target_id, "limit", f"{delta:+d}, лимит {max_radars}")
     await call.answer(f"Лимит радаров: {max_radars} (бонус +{extra})")
     if target_raw == "self":
         return
@@ -420,6 +565,7 @@ async def cb_admin_confirm_vip(call: CallbackQuery, bot: Bot):
     plan_title = f"«{config.plan_title(plan)}»"
 
     logger.info("👑 [АДМИН] Администратор ID:%s выдал бессрочный VIP (%s) пользователю ID:%s", call.from_user.id, plan_title, target_id)
+    await database.log_admin_action(call.from_user.id, target_id, "vip", plan_title)
 
     try:
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -483,6 +629,7 @@ async def cb_admin_confirm_trial(call: CallbackQuery, bot: Bot):
     until = database.format_subscription_date(user.get("subscription_until"))
 
     logger.info("👑 [АДМИН] Администратор ID:%s активировал триал %sч для пользователя ID:%s", call.from_user.id, config.TRIAL_HOURS, target_id)
+    await database.log_admin_action(call.from_user.id, target_id, "trial", f"{config.TRIAL_HOURS} ч")
 
     try:
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -533,16 +680,469 @@ async def cb_admin_user_radars(call: CallbackQuery):
             title = html.escape(r.get("title") or "Без названия")
             url = html.escape(r.get("url") or "")
             text_lines.append(
-                f"{idx}. {status_emoji} <b>{title}</b>\n"
+                f"{idx}. {status_emoji} <b>{title}</b> · #{r['id']}\n"
                 f"   ├ Выборка: <i>{scope}</i>\n"
                 f"   └ <a href=\"{url}\">Ссылка на Авито</a>"
             )
 
+    scan_buttons = [
+        InlineKeyboardButton(text=f"📊 Сканы {idx}. {(r.get('title') or 'Радар')[:22]}",
+                             callback_data=f"admin_scans:{r['id']}:{target_id}:{page}")
+        for idx, r in enumerate(radars[:20], start=1)
+    ]
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        *[[button] for button in scan_buttons],
+        [InlineKeyboardButton(text="📜 История радаров", callback_data=f"admin_rhist:{target_id}:{page}:0")],
         [InlineKeyboardButton(text="« Назад в карточку пользователя", callback_data=f"admin_user:{target_id}:{page}")]
     ])
-    await call.message.edit_text("\n".join(text_lines), reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    text = "\n".join(text_lines)
+    if len(text) > 3800:
+        text = text[:3800].rsplit("\n", 1)[0] + "\n…"
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
     await call.answer()
+
+
+RADAR_HISTORY_PAGE = 15
+
+
+def _msk(epoch: float, fmt: str = "%H:%M:%S") -> str:
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(epoch + 3 * 3600, timezone.utc).strftime(fmt)
+
+
+def _msk_sql(value) -> str:
+    """'2026-11-05 12:00:00' (UTC, SQLite) → '05.11 15:00' MSK."""
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return str(value or "?")[:16]
+    return _msk(dt.timestamp(), "%d.%m %H:%M")
+
+
+def _dur(seconds) -> str:
+    if seconds is None:
+        return "—"
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds} с"
+    if seconds < 3600:
+        return f"{seconds // 60} м {seconds % 60:02d} с"
+    return f"{seconds // 3600} ч {seconds % 3600 // 60:02d} м"
+
+
+@router.callback_query(F.data.startswith("admin_rhist:"))
+async def cb_admin_radar_history(call: CallbackQuery):
+    """admin_rhist:<user_id>:<card_page>:<page> — all radar changes, deleted radars included."""
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        _, target_raw, card_raw, page_raw = call.data.split(":")
+        target_id, card_page, page = int(target_raw), int(card_raw), max(0, int(page_raw))
+    except ValueError:
+        await call.answer("Некорректная кнопка", show_alert=True)
+        return
+    rows = await database.get_radar_history(target_id)
+    pages = max(1, -(-len(rows) // RADAR_HISTORY_PAGE))
+    page = min(page, pages - 1)
+    live_ids = {r["id"] for r in await database.get_user_searches(target_id)}
+    created = sum(1 for r in rows if r["action"] == "create")
+    deleted = sum(1 for r in rows if r["action"] == "delete")
+    lines = [
+        f"{ui.e('time')} <b>История радаров</b> · ID <code>{target_id}</code>",
+        f"Создано: <b>{created}</b> · удалено: <b>{deleted}</b> · сейчас: <b>{len(live_ids)}</b>"
+        + (f" · стр. {page + 1}/{pages}" if pages > 1 else ""),
+        "",
+    ]
+    if not rows:
+        lines.append("Пока пусто.")
+    for row in rows[page * RADAR_HISTORY_PAGE:(page + 1) * RADAR_HISTORY_PAGE]:
+        action = database.RADAR_HISTORY_LABELS.get(row["action"], row["action"])
+        title = html.escape((row.get("title") or "Радар")[:40])
+        mark = "" if row["search_id"] in live_ids else " ✖"
+        line = f"<code>{_msk_sql(row['at'])}</code> #{row['search_id']}{mark} <b>{title}</b> — {action}"
+        if row.get("detail"):
+            line += f" ({html.escape(row['detail'])})"
+        if row["action"] in ("create", "url", "delete") and row.get("url"):
+            line += f' · <a href="{html.escape(row["url"])}">ссылка</a>'
+        lines.append(line)
+    lines.append("\n<blockquote>✖ — радара уже нет. Время МСК.</blockquote>")
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="«", callback_data=f"admin_rhist:{target_id}:{card_page}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="»", callback_data=f"admin_rhist:{target_id}:{card_page}:{page + 1}"))
+    kb = InlineKeyboardMarkup(inline_keyboard=[row for row in (
+        nav,
+        [InlineKeyboardButton(text="« Радары", callback_data=f"admin_user_radars:{target_id}:{card_page}")],
+    ) if row])
+    await ui.show(call, "\n".join(lines), kb)
+
+
+def render_scan_journal(radar: dict, now: float = None) -> str:
+    """Last scans and new lots of one radar: how often it is really checked, and who held each lot."""
+    import time
+    import scan_journal
+
+    now = now or time.time()
+    rid = int(radar["id"])
+    plan_interval = None
+    try:
+        tariff, _, _ = database.classify_user_tariff(radar)
+        plan_interval = config.plan_interval(tariff)
+    except Exception:
+        pass
+    hour = scan_journal.summary(rid, 3600, now)
+    ten = scan_journal.summary(rid, 600, now)
+    scans = scan_journal.scans(rid)
+    lots = scan_journal.lots(rid)
+
+    lines = [
+        f"{ui.e('radar')} <b>Сканы радара #{rid}</b>",
+        f"«{html.escape((radar.get('title') or 'Радар')[:50])}» · {'🟢 работает' if radar.get('is_active', 1) else '⏸ на паузе'}",
+        "",
+    ]
+    if not scans:
+        lines.append("Сканов в памяти нет: бот перезапускался или радар не проверяется.")
+    else:
+        lines += [
+            f"<b>Частота</b> (тариф: раз в {plan_interval or '?'} с)",
+            f"10 мин: сканов {ten['scans']}, удачных {ten['ok']} · интервал медиана {_dur(ten['gap_median'])}, макс {_dur(ten['gap_max'])}",
+            f"1 час: сканов {hour['scans']}, удачных {hour['ok']} · интервал медиана {_dur(hour['gap_median'])}, макс {_dur(hour['gap_max'])}",
+            f"Последний удачный: {_dur(hour['since_last_ok'])} назад · запрос {int(hour['ms_median'] or 0)} мс",
+        ]
+        if hour["kinds"]:
+            fails = ", ".join(f"{FAILURE_LABELS.get(k, k)} ×{n}" for k, n in sorted(hour["kinds"].items(), key=lambda kv: -kv[1]))
+            lines.append(f"Сбои за час: {html.escape(fails)}")
+        lines += ["", "<b>Последние сканы</b> (МСК · интервал · результат)"]
+        recent = scans[-15:]
+        previous_at = scans[-16]["at"] if len(scans) > 15 else None
+        out = []
+        for entry in recent:
+            gap = f"+{_dur(entry['at'] - previous_at)}" if previous_at else ""
+            previous_at = entry["at"]
+            if entry["ok"]:
+                new = entry["new"].get(rid, 0)
+                res = f"✓ {entry['items']} лот." + (f" <b>+{new} нов.</b>" if new else "") + (" =" if entry["fast"] else "")
+                res += f" · {entry['ms']} мс · {html.escape(entry['ch'] or '?')}"
+            else:
+                res = f"✗ {html.escape(FAILURE_LABELS.get(entry['kind'], entry['kind']))} · {entry['ms']} мс"
+            if entry["due_lag"] >= 3:
+                res += f" · опоздал {_dur(entry['due_lag'])}"
+            out.append(f"<code>{_msk(entry['at'])}</code> {gap} {res}")
+        lines += list(reversed(out))
+
+    lines += ["", "<b>Новые лоты</b> (возраст = Авито прятал + бот не смотрел)"]
+    if not lots:
+        lines.append("Новых лотов в памяти нет.")
+    for lot in reversed(lots[-10:]):
+        split = scan_journal.lot_split(lot)
+        title = html.escape(lot["title"][:30] or lot["item"])
+        head = f'<code>{_msk(lot["seen"])}</code> <a href="{html.escape(lot["url"])}">{title}</a>'
+        if split["age"] is None:
+            lines.append(f"{head}: нет времени публикации")
+            continue
+        verdict = (
+            "Авито" if (split["avito"] or 0) > max(60.0, 2 * (split["bot"] or 0))
+            else "бот" if (split["bot"] or 0) > max(60.0, 2 * (split["avito"] or 0))
+            else "норма" if split["age"] < 60 else "оба"
+        )
+        tail = f" · отправлен через {_dur(split['send'])}" if split["send"] is not None else ""
+        lines.append(
+            f"{head}\n   опубл. {_msk(lot['pub'])}, возраст <b>{_dur(split['age'])}</b>: "
+            f"Авито {_dur(split['avito'])} + бот {_dur(split['bot'])} → <b>{verdict}</b>{tail}"
+            + ("" if lot["reliable"] else " · время неточное")
+            + (" · продвиж." if lot["promo"] else "")
+            + (f" · поз. {lot['pos'] + 1}" if lot.get("pos") is not None else "")
+        )
+    lines.append(
+        "\n<blockquote>«Авито» — лота не было в выдаче на прошлом удачном скане, хотя он уже был опубликован: "
+        "Авито показал его в поиске с задержкой (модерация, индексация, поднятие). "
+        "«Бот» — между сканами прошло слишком долго. «=» — выдача не изменилась. Журнал в памяти, сбрасывается при перезапуске.</blockquote>"
+    )
+    text = "\n".join(lines)
+    while ui.visible_len(text) > 4000 and len(lines) > 10:
+        lines.pop(-2)
+        text = "\n".join(lines)
+    return text
+
+
+@router.callback_query(F.data.startswith("admin_scans:"))
+async def cb_admin_scans(call: CallbackQuery):
+    """admin_scans:<radar_id>:<user_id>:<card_page>"""
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        _, rid_raw, target_raw, card_raw = call.data.split(":")
+        rid, target_id, card_page = int(rid_raw), int(target_raw), int(card_raw)
+    except ValueError:
+        await call.answer("Некорректная кнопка", show_alert=True)
+        return
+    radar = await database.get_search(rid)
+    if not radar:
+        await call.answer("Радар удалён", show_alert=True)
+        return
+    owner = await database.get_user(int(radar["user_id"])) or {}
+    radar = {**radar, **{k: owner.get(k) for k in ("tariff_plan", "is_allowed", "trial_used", "subscription_until")}}
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=call.data)],
+        [InlineKeyboardButton(text="« Радары", callback_data=f"admin_user_radars:{target_id}:{card_page}")],
+    ])
+    await ui.show(call, render_scan_journal(radar), kb, disable_web_page_preview=True)
+
+
+def parse_item_id(text: str) -> str | None:
+    """Avito lot number from a link (…/iphone_13_1234567890?…) or the bare number."""
+    import re
+    from urllib.parse import urlsplit
+
+    raw = (text or "").strip()
+    if raw.isdigit() and len(raw) >= 5:
+        return raw
+    path = urlsplit(raw if "://" in raw else f"https://{raw}").path
+    found = re.findall(r"(\d{6,})", path)
+    return found[-1] if found else None
+
+
+async def explain_lot(item_id: str) -> str:
+    """Everything the bot knows about one lot: what each radar decided, where it sits now, what waits to be sent."""
+    import time
+    import scan_journal
+    from parser import AvitoParser
+    from source_cache import SOURCE_SNAPSHOTS
+
+    now = time.time()
+    lines = [f"{ui.e('scope')} <b>Лот {html.escape(item_id)}</b>"]
+    radar_titles: dict[int, str] = {}
+
+    async def radar_name(rid: int) -> str:
+        if rid not in radar_titles:
+            radar = await database.get_search(rid)
+            radar_titles[rid] = (
+                f"#{rid} «{html.escape((radar.get('title') or 'Радар')[:30])}» (польз. {radar.get('user_id')})"
+                if radar else f"#{rid} (удалён)"
+            )
+        return radar_titles[rid]
+
+    decided = scan_journal.decisions(item_id)
+    title = next((d["title"] for d in decided if d["title"]), "")
+    published = next((d["pub"] for d in decided if d["pub"]), None)
+
+    # Where the lot sits in the latest page of each link, if the bot still holds that page.
+    placed = []
+    try:
+        url_radars: dict[str, list[dict]] = {}
+        for radar in await database.get_all_active_searches():
+            keys = {radar["url"]}
+            try:
+                keys.add(AvitoParser.normalize_url(radar["url"]))
+            except Exception:
+                pass
+            for key in keys:
+                url_radars.setdefault(key, []).append(radar)
+        for key, (snapshot, _) in list(SOURCE_SNAPSHOTS._data.items()):
+            for position, item in enumerate(snapshot.items, 1):
+                if str(item.item_id) == item_id:
+                    title = title or item.title
+                    published = published or item.timestamp
+                    names = ", ".join(f"#{r['id']}" for r in url_radars.get(key, [])) or "радар не найден"
+                    placed.append(f"{names}: место {position} из {len(snapshot.items)}, скан {_msk(snapshot.captured_at)}")
+    except Exception:
+        logger.debug("Не удалось просмотреть кэш выдачи", exc_info=True)
+
+    if title:
+        lines.append(f"«{html.escape(title[:60])}»")
+    if published:
+        try:
+            lines.append(f"Опубликован: {_msk(float(published), '%d.%m %H:%M:%S')} МСК")
+        except (TypeError, ValueError):
+            pass
+    lines.append("")
+
+    if decided:
+        lines.append("<b>Что решил бот, когда лот был новым</b>")
+        for entry in decided:
+            verdict = scan_journal.VERDICTS.get(entry["verdict"], entry["verdict"])
+            detail = f" «{html.escape(entry['detail'])}»" if entry["detail"] else ""
+            line = f"{await radar_name(entry['rid'])}: {_msk(entry['at'])} — {verdict}{detail}"
+            if entry["verdict"] == "queued":
+                line += f", отправлен через {_dur(entry['sent'] - entry['at'])}" if entry["sent"] else ", отправки ещё не было"
+            if entry["pub"]:
+                try:
+                    line += f" · возраст при находке {_dur(entry['at'] - float(entry['pub']))}"
+                except (TypeError, ValueError):
+                    pass
+            lines.append(line)
+        lines.append("")
+
+    traces = await database.find_lot_traces(item_id)
+    if traces["deliveries"]:
+        lines.append("<b>Доставка</b>")
+        for row in traces["deliveries"]:
+            who = await radar_name(int(row["search_id"])) if row.get("search_id") else f"польз. {row['user_id']}"
+            status = row["status"]
+            if status == "sent" and row.get("sent_at"):
+                state = f"отправлен {_msk(row['sent_at'])}, через {_dur(row['sent_at'] - row['queued_at'])} после находки"
+            elif status in ("expired", "failed"):
+                when = row.get("expired_at") or row.get("failed_at")
+                state = (f"не отправлен ({'устарел' if status == 'expired' else 'ошибка'}"
+                         f"{': ' + html.escape(str(row['last_error'])[:60]) if row.get('last_error') else ''})"
+                         + (f" в {_msk(when)}" if when else ""))
+            else:
+                state = f"ждёт отправки с {_msk(row['queued_at'])}, попыток {row['attempt_count']}"
+            lines.append(f"{who}: {state}")
+        lines.append("")
+    if placed:
+        lines.append("<b>В последней выдаче</b>")
+        lines += placed
+        lines.append("")
+    if traces["seen"] and not decided:
+        lines.append("<b>Помечен как просмотренный</b>")
+        for row in traces["seen"][:8]:
+            lines.append(f"{await radar_name(int(row['search_id']))} с {_msk_sql(row['created_at'])}")
+        lines.append(
+            "<blockquote>Бот видел лот раньше, чем хранит журнал (до перезапуска) или при первом скане радара: "
+            "лоты, которые уже были в выдаче при создании радара, не присылаются.</blockquote>"
+        )
+
+    if not decided and not traces["seen"] and not traces["deliveries"] and not placed:
+        lines.append(
+            "Бот этот лот не видел: его нет ни в журнале, ни в базе, ни в последних выдачах радаров.\n\n"
+            "<blockquote>Значит, он не подходит под ссылку радара (город, категория, цена или фильтры в самой ссылке) "
+            "или Авито ещё не показал его в поиске. Откройте ссылку радара в браузере и поищите лот там.</blockquote>"
+        )
+    elif decided:
+        lines.append("<blockquote>Журнал решений в памяти, сбрасывается при перезапуске бота. Время МСК.</blockquote>")
+    return "\n".join(lines).rstrip()
+
+
+@router.message(Command("lot"))
+async def cmd_lot(message: Message, state: FSMContext):
+    """/lot <ссылка или номер> — почему лот пришёл или не пришёл."""
+    if not config.is_admin(message.from_user.id):
+        return
+    arg = (message.text or "").partition(" ")[2].strip()
+    if not arg:
+        await state.set_state(AdminStates.waiting_for_lot)
+        await message.answer("Пришлите ссылку на объявление Авито или его номер.")
+        return
+    await _answer_lot(message, arg)
+
+
+@router.callback_query(F.data == "admin_lot_prompt")
+async def cb_admin_lot_prompt(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_for_lot)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Логи", callback_data="admin_logs_menu")]])
+    await ui.show(call, f"{ui.e('scope')} <b>Почему не пришёл лот</b>\n\nПришлите ссылку на объявление Авито или его номер.", kb)
+
+
+@router.message(AdminStates.waiting_for_lot)
+async def msg_admin_lot(message: Message, state: FSMContext):
+    if not config.is_admin(message.from_user.id):
+        return
+    from handlers.searches import route_menu_text
+
+    if await route_menu_text(message, state):
+        return
+    await state.clear()
+    await _answer_lot(message, message.text or "")
+
+
+async def _answer_lot(message: Message, text: str) -> None:
+    item_id = parse_item_id(text)
+    if item_id is None:
+        await message.answer("Не нашёл номер объявления. Пришлите ссылку вида avito.ru/…_1234567890 или сам номер.")
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Ещё раз", callback_data=f"admin_lot:{item_id}")],
+    ])
+    await message.answer(await explain_lot(item_id), reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+
+
+@router.callback_query(F.data.startswith("admin_lot:"))
+async def cb_admin_lot(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    item_id = call.data.split(":", 1)[1]
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Ещё раз", callback_data=call.data)]])
+    await ui.show(call, await explain_lot(item_id), kb, disable_web_page_preview=True)
+
+
+SCANS_PICK_PAGE = 12
+
+
+@router.callback_query(F.data.startswith("admin_scans_pick:"))
+async def cb_admin_scans_pick(call: CallbackQuery):
+    """All running radars, newest first: one tap opens the scan journal."""
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        page = max(0, int(call.data.split(":")[1]))
+    except (ValueError, IndexError):
+        page = 0
+    radars = sorted(await database.get_all_active_searches(), key=lambda r: -int(r["id"]))
+    pages = max(1, -(-len(radars) // SCANS_PICK_PAGE))
+    page = min(page, pages - 1)
+    rows = [
+        [InlineKeyboardButton(
+            text=f"📊 #{r['id']} {(r.get('title') or 'Радар')[:24]} · {r.get('username') or r['user_id']}"[:60],
+            callback_data=f"admin_scans:{r['id']}:{r['user_id']}:0",
+        )]
+        for r in radars[page * SCANS_PICK_PAGE:(page + 1) * SCANS_PICK_PAGE]
+    ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="«", callback_data=f"admin_scans_pick:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="»", callback_data=f"admin_scans_pick:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="« Логи", callback_data="admin_logs_menu")])
+    text = (
+        f"{ui.e('radar')} <b>Сканы радаров</b>\n\n"
+        f"Работающих радаров: <b>{len(radars)}</b>" + (f" · стр. {page + 1}/{pages}" if pages > 1 else "")
+        + "\nВыберите радар. Или командой: <code>/scans 12</code>."
+    )
+    await ui.show(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.message(Command("scans"))
+async def cmd_scans(message: Message):
+    """/scans <радар> — журнал сканов; без номера — кнопки радаров администратора."""
+    if not config.is_admin(message.from_user.id):
+        return
+    arg = (message.text or "").partition(" ")[2].strip().lstrip("#")
+    if arg.isdigit():
+        radar = await database.get_search(int(arg))
+        if not radar:
+            await message.answer("Радар не найден.")
+            return
+        owner = await database.get_user(int(radar["user_id"])) or {}
+        radar = {**radar, **{k: owner.get(k) for k in ("tariff_plan", "is_allowed", "trial_used", "subscription_until")}}
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin_scans:{radar['id']}:{radar['user_id']}:0")],
+        ])
+        await ui.show(message, render_scan_journal(radar), kb, disable_web_page_preview=True)
+        return
+    radars = await database.get_user_searches(message.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📊 #{r['id']} {(r.get('title') or 'Радар')[:28]}",
+                              callback_data=f"admin_scans:{r['id']}:{message.from_user.id}:0")]
+        for r in radars[:20]
+    ])
+    await message.answer(
+        "Журнал сканов: <code>/scans 12</code> — номер радара (есть в карточке пользователя → Радары)."
+        + ("\n\nВаши радары:" if radars else ""),
+        reply_markup=kb if radars else None,
+        parse_mode="HTML",
+    )
 
 
 async def _selected_radars(state: FSMContext, radars: list[dict]) -> set[int]:
@@ -638,6 +1238,7 @@ async def cb_admin_radars_delete(call: CallbackQuery, state: FSMContext):
     for radar_id in selected:
         deleted += int(await database.delete_search(radar_id, target_id))
     logger.info("👑 [АДМИН] Администратор ID:%s удалил радары пользователя ID:%s: %s из %s", call.from_user.id, target_id, deleted, len(selected))
+    await database.log_admin_action(call.from_user.id, target_id, "radars_delete", f"{deleted} шт.")
     await call.answer(f"Удалено радаров: {deleted}")
     text, kb = await render_user_card_data(target_id, int(card_page))
     if text:
@@ -671,17 +1272,28 @@ async def cb_admin_revoke_prompt(call: CallbackQuery):
 # ── Панель администратора (/admin, /users, кнопка в меню) ─────────────
 
 USERS_PER_PAGE = 8
+USER_FILTERS = {
+    "all": "Все",
+    "ever": "Была подписка",
+    "now": "Активные",
+    "paid": "Платили",
+    "lost": "Ушедшие",
+}
 
 NET_MODE_TITLES = {
+    "smart": "🧠 Умный",
     "direct": "🖥 Только сервер",
     "proxy": "🛰 Только прокси",
     "both": "🔀 Сервер + прокси",
     "auto": "🤖 Авто",
 }
 NET_MODE_HINTS = {
+    "smart": "Пока сервер справляется, сканирует он один. Прокси ждут в запасе: не тратят запросы на проверки "
+             "и берут скан, только если сервер ошибся. Выросла нагрузка или Авито блокирует сервер — "
+             "прокси сами включаются в работу, переключать ничего не нужно.",
     "direct": "Сканирует только IP сервера. Бесплатно, но один IP — ниже скорость и выше риск блокировки.",
     "proxy": "Сканируют только прокси, IP сервера Авито не видит.",
-    "both": "Сервер и прокси работают вместе и делят нагрузку — больше проверок в секунду.",
+    "both": "Сервер и прокси всегда работают вместе и делят нагрузку, даже когда её мало.",
     "auto": "Прокси, если подключён, иначе IP сервера (режим по умолчанию).",
 }
 CHANNEL_STATE_ICONS = {"healthy": "🟢", "degraded": "🟡", "half_open": "🟡", "quarantined": "🔴", "draining": "⚪"}
@@ -774,6 +1386,8 @@ async def cmd_admin_home(event):
          ui.btn("Премиум-эмодзи", "palette", callback_data="admin_emoji")],
         [ui.btn("Цены в Stars", "star", callback_data="admin_prices"),
          ui.btn("Продлить всем", "time", callback_data="admin_extend_all")],
+        [ui.btn("Деньги", "coin", callback_data="admin_money"),
+         ui.btn("Журнал админов", "write", callback_data="admin_alog")],
         [ui.btn("Обновить", "refresh", callback_data="admin_refresh")],
     )
     await _show(event, text, kb)
@@ -945,6 +1559,7 @@ async def cb_admin_extend_go(call: CallbackQuery, state: FSMContext, bot: Bot):
     await call.answer("Продлеваю…")
     granted = await database.extend_active_subscriptions(seconds)
     logger.info("Админ %s продлил всем %s с: пользователей %s", call.from_user.id, seconds, len(granted))
+    await database.log_admin_action(call.from_user.id, None, "extend_all", f"{seconds} с, пользователей {len(granted)}")
     await _show(call, f"{ui.e('wait')} Время добавлено: <b>{len(granted)}</b>. Рассылаю сообщения…", ui.kb())
 
     from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
@@ -1048,6 +1663,7 @@ async def msg_admin_stars_prices(message: Message, state: FSMContext):
     await database.set_bot_setting("stars_prices", json.dumps(prices))
     await state.clear()
     logger.info("Цены Stars изменены: admin=%s prices=%s", message.from_user.id, prices)
+    await database.log_admin_action(message.from_user.id, None, "prices", str(prices))
     await _show(message, *_stars_prices_screen())
 
 
@@ -1056,24 +1672,29 @@ async def msg_admin_stars_prices(message: Message, state: FSMContext):
 async def cmd_admin_panel(event, page: int = 0):
     """Список пользователей: одна строка и одна кнопка на человека, все действия — в карточке."""
     message, user_id = _admin_event(event)
+    user_filter = "all"
     if isinstance(event, CallbackQuery):
         if event.data.startswith("admin_page:"):
+            parts = event.data.split(":")
             try:
-                page = int(event.data.split(":")[1])
+                page = int(parts[1])
             except (ValueError, IndexError):
                 page = 0
+            if len(parts) > 2 and parts[2] in USER_FILTERS:
+                user_filter = parts[2]
         await event.answer()
     if not config.is_admin(user_id):
         return
 
-    all_users = await database.get_all_users()
+    all_users, ever_ids, paid_ids, allowed = await _filtered_users(user_filter)
     total_pages = max(1, (len(all_users) + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
     page = min(max(0, page), total_pages - 1)
     start_idx = page * USERS_PER_PAGE
     page_users = all_users[start_idx:start_idx + USERS_PER_PAGE]
+    suffix = "" if user_filter == "all" else f":{user_filter}"
 
     page_info = f" · стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
-    lines = [f"👥 <b>Пользователи</b> ({len(all_users)}){page_info}", ""]
+    lines = [f"👥 <b>Пользователи</b> · {USER_FILTERS[user_filter]} ({len(all_users)}){page_info}", ""]
     buttons = []
     for idx, u in enumerate(page_users, start=start_idx + 1):
         u_id = u["user_id"]
@@ -1081,34 +1702,223 @@ async def cmd_admin_panel(event, page: int = 0):
         tag = f"@{u['username']}" if u.get("username") else str(u_id)
         if config.is_admin(u_id):
             icon, status = "👑", "админ"
-        elif await database.is_user_allowed(u_id):
+        elif allowed.get(u_id):
             trial = not u.get("is_allowed") and u.get("trial_used")
             icon = "🎁" if trial else "🟢"
             status = "триал" if trial else config.plan_title(u.get("tariff_plan"))
             until = _short_until(u.get("subscription_until"))
             status = f"{status} {until}".strip()
+        elif u_id in paid_ids:
+            icon, status = "🔴", "нет доступа · платил"
+        elif u_id in ever_ids:
+            icon, status = "🔴", "нет доступа · был триал"
         else:
-            icon, status = "🔴", "нет доступа"
+            icon, status = "⚪️", "не пробовал"
         lines.append(f"{idx}. {icon} <b>{html.escape(fname)}</b> {html.escape(tag)} — {status}")
         label = f"{icon} {fname[:18]} · {tag[:16]}"
         callback = "admin_noop" if config.is_admin(u_id) else f"admin_user:{u_id}:{page}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=callback)])
 
     if not page_users:
-        lines.append("Пока никого нет.")
+        lines.append("Никого нет.")
     lines.append("\nНажмите на пользователя: подписка, радары, платежи, блок и удаление — в карточке.")
 
     if total_pages > 1:
         buttons.append([
-            InlineKeyboardButton(text="◀️", callback_data=f"admin_page:{page - 1}" if page > 0 else "admin_noop"),
+            InlineKeyboardButton(text="◀️", callback_data=f"admin_page:{page - 1}{suffix}" if page > 0 else "admin_noop"),
             InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="admin_noop"),
-            InlineKeyboardButton(text="▶️", callback_data=f"admin_page:{page + 1}" if page < total_pages - 1 else "admin_noop"),
+            InlineKeyboardButton(text="▶️", callback_data=f"admin_page:{page + 1}{suffix}" if page < total_pages - 1 else "admin_noop"),
         ])
+    filter_buttons = [
+        InlineKeyboardButton(text=("• " if key == user_filter else "") + title, callback_data=f"admin_page:0:{key}")
+        for key, title in USER_FILTERS.items()
+    ]
+    buttons.append(filter_buttons[:3])
+    buttons.append(filter_buttons[3:])
+    buttons.append([InlineKeyboardButton(text=f"📣 Рассылка: {USER_FILTERS[user_filter]}", callback_data=f"admin_bc:{user_filter}")])
     buttons.append([
         InlineKeyboardButton(text="🔍 Найти", callback_data="admin_search_user_prompt"),
         InlineKeyboardButton(text="⬅️ Меню", callback_data="admin_refresh"),
     ])
     await _show(event, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+async def _filtered_users(user_filter: str):
+    """(users of the filter, ever-subscribed ids, paying ids, {user_id: has access now}). Admins only in «Все»."""
+    all_users = await database.get_all_users()
+    ever_ids = await database.get_ever_subscribed_user_ids()
+    paid_ids = await database.get_paid_user_ids()
+    allowed = {u["user_id"]: await database.is_user_allowed(u["user_id"]) for u in all_users}
+    keep = {
+        "ever": lambda uid: uid in ever_ids,
+        "paid": lambda uid: uid in paid_ids,
+        "now": lambda uid: allowed.get(uid),
+        "lost": lambda uid: uid in ever_ids and not allowed.get(uid),
+    }.get(user_filter)
+    if keep is not None:
+        all_users = [u for u in all_users if keep(u["user_id"]) and not config.is_admin(u["user_id"])]
+    return all_users, ever_ids, paid_ids, allowed
+
+
+# ── Рассылка по фильтру пользователей ──────────────────────────────────
+
+BROADCAST_PAUSE = 0.05  # 20 messages a second, under Telegram's 30/s for bots
+BROADCAST_TASKS: set = set()
+
+
+@router.callback_query(F.data.startswith("admin_bc:"))
+async def cb_admin_broadcast(call: CallbackQuery, state: FSMContext):
+    """admin_bc:<filter> — ask for the text of a broadcast to this user group."""
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    user_filter = call.data.split(":", 1)[1]
+    if user_filter not in USER_FILTERS:
+        await call.answer("Неизвестный фильтр", show_alert=True)
+        return
+    users = [u for u in (await _filtered_users(user_filter))[0] if not config.is_admin(u["user_id"])]
+    await state.set_state(AdminStates.waiting_for_broadcast)
+    await state.update_data(bc_filter=user_filter)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_page:0:{user_filter}")]])
+    await ui.show(
+        call,
+        f"📣 <b>Рассылка</b> · {USER_FILTERS[user_filter]} ({len(users)} чел.)\n\n"
+        "Пришлите текст сообщения. Форматирование (жирный, ссылки) сохранится.\n"
+        "<blockquote>Перед отправкой покажу, как оно выглядит, и спрошу подтверждение. Админам рассылка не уходит.</blockquote>",
+        kb,
+    )
+
+
+@router.message(AdminStates.waiting_for_broadcast)
+async def msg_admin_broadcast(message: Message, state: FSMContext):
+    if not config.is_admin(message.from_user.id):
+        return
+    from handlers.searches import route_menu_text
+
+    if await route_menu_text(message, state):
+        return
+    text = (message.html_text or "").strip()
+    if not text:
+        await message.answer("Нужен текст. Пришлите сообщение словами.")
+        return
+    data = await state.get_data()
+    user_filter = data.get("bc_filter") or "all"
+    users = [u for u in (await _filtered_users(user_filter))[0] if not config.is_admin(u["user_id"])]
+    await state.update_data(bc_text=text[:4000])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Отправить {len(users)} чел.", callback_data="admin_bc_go")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_page:0:{user_filter}")],
+    ])
+    await message.answer(text[:4000], parse_mode="HTML", disable_web_page_preview=True)
+    await message.answer(
+        f"☝️ Так увидят сообщение <b>{len(users)}</b> чел. ({USER_FILTERS[user_filter]}). Отправить?",
+        reply_markup=kb, parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "admin_bc_go")
+async def cb_admin_broadcast_go(call: CallbackQuery, state: FSMContext, bot: Bot):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    data = await state.get_data()
+    await state.clear()
+    text, user_filter = data.get("bc_text"), data.get("bc_filter") or "all"
+    if not text:
+        await call.answer("Текст рассылки потерян, начните заново", show_alert=True)
+        return
+    users = [u["user_id"] for u in (await _filtered_users(user_filter))[0] if not config.is_admin(u["user_id"])]
+    await call.answer("Рассылка началась")
+    await ui.show(call, f"📣 Рассылка {len(users)} чел. идёт. Пришлю итог, когда закончу.", None)
+    await database.log_admin_action(call.from_user.id, None, "broadcast", f"{USER_FILTERS[user_filter]}, {len(users)} чел.: {text[:80]}")
+    task = asyncio.create_task(_run_broadcast(bot, call.from_user.id, users, text))
+    BROADCAST_TASKS.add(task)
+    task.add_done_callback(BROADCAST_TASKS.discard)
+
+
+async def _run_broadcast(bot: Bot, admin_id: int, user_ids: list[int], text: str) -> dict:
+    """Sends one by one at BROADCAST_PAUSE; waits out flood limits; reports the totals to the admin."""
+    from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+
+    sent = blocked = failed = 0
+    for user_id in user_ids:
+        for _ in range(3):
+            try:
+                await bot.send_message(user_id, text, parse_mode="HTML", disable_web_page_preview=True)
+                sent += 1
+                break
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(float(exc.retry_after) + 1)
+            except TelegramForbiddenError:
+                blocked += 1
+                break
+            except Exception as exc:
+                failed += 1
+                logger.warning("Рассылка: не отправлено %s: %s", user_id, type(exc).__name__)
+                break
+        await asyncio.sleep(BROADCAST_PAUSE)
+    result = {"sent": sent, "blocked": blocked, "failed": failed}
+    logger.info("Рассылка от админа %s: %s", admin_id, result)
+    try:
+        await bot.send_message(
+            admin_id,
+            f"📣 <b>Рассылка закончена</b>\n\nДоставлено: <b>{sent}</b>\nЗаблокировали бота: {blocked}\nОшибки: {failed}",
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.warning("Не удалось отправить итог рассылки", exc_info=True)
+    return result
+
+
+# ── Деньги ───────────────────────────────────────────────────────────
+
+def _share(part: int, total: int) -> str:
+    return f"{100 * part / total:.0f}%" if total else "—"
+
+
+@router.message(Command("money"))
+@router.callback_query(F.data == "admin_money")
+async def cb_admin_money(event):
+    message, user_id = _admin_event(event)
+    if not config.is_admin(user_id):
+        return
+    stats = await database.get_money_stats()
+    revenue, funnel = stats["revenue"], stats["funnel"]
+
+    def period(key: str, title: str) -> str:
+        orders, stars, payers = revenue[key]
+        return f"{title}: <b>{stars} ⭐</b> · оплат {orders} · платили {payers} чел."
+
+    plans = ", ".join(f"«{config.plan_title(p)}» {n} шт. на {s} ⭐" for p, n, s in stats["by_plan"]) or "нет"
+    lines = [
+        f"{ui.e('coin')} <b>Деньги</b>",
+        "",
+        period("day", "Сутки"),
+        period("week", "Неделя"),
+        period("month", "30 дней"),
+        period("all", "Всё время"),
+        f"По тарифам за 30 дней: {plans}",
+        "",
+        "<b>Воронка за 30 дней</b>",
+        f"Новых: <b>{funnel['new']}</b> → попробовали (триал или выдача): <b>{funnel['tried']}</b> "
+        f"({_share(funnel['tried'], funnel['new'])}) → оплатили: <b>{funnel['paid']}</b> ({_share(funnel['paid'], funnel['new'])})",
+        "",
+        "<b>Сейчас</b>",
+        f"С подпиской: <b>{stats['active_paid']}</b> · на триале: <b>{stats['active_trial']}</b>",
+        f"Платили хоть раз: <b>{stats['payers']}</b>, из них продлевали: <b>{stats['renewed']}</b> ({_share(stats['renewed'], stats['payers'])})",
+        f"Доступ закончился за 30 дней: <b>{stats['lapsed']}</b>, из них платившие: <b>{stats['lapsed_paid']}</b>",
+        "",
+        "<blockquote>Сумма — оплаты Stars без возвращённых. «С подпиской» включает выданные админом.</blockquote>",
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📣 Написать ушедшим", callback_data="admin_bc:lost")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_money"),
+         InlineKeyboardButton(text="⬅️ Меню", callback_data="admin_refresh")],
+    ])
+    if isinstance(event, CallbackQuery):
+        await ui.show(event, "\n".join(lines), kb)
+    else:
+        await message.answer("\n".join(lines), reply_markup=kb, parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("admin_revoke:"))
@@ -1126,6 +1936,7 @@ async def cb_admin_revoke(call: CallbackQuery, bot: Bot):
         return
     await database.set_user_allowed(target_user_id, 0)
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} отозвал доступ у пользователя ID:{target_user_id}")
+    await database.log_admin_action(call.from_user.id, target_user_id, "revoke")
     await call.answer("Доступ отозван")
 
     try:
@@ -1158,6 +1969,7 @@ async def cb_admin_purge_user(call: CallbackQuery):
 
     res = await database.purge_user_by_pattern(target_user_id)
     logger.info(f"👑 [АДМИН] Администратор ID:{call.from_user.id} стер пользователя ID:{target_user_id}: {res['message']}")
+    await database.log_admin_action(call.from_user.id, target_user_id, "purge")
     await call.answer(res["message"][:200], show_alert=True)
     await cmd_admin_panel(call, page=page)
 
@@ -1266,6 +2078,8 @@ async def cmd_admin_logs_menu(event):
         "<b>Отчёт для отладки</b> — главное за час одним файлом: причины сбоев, каналы, ошибки. "
         "Его достаточно прислать разработчику.\n"
         "<b>Готовность к продаже</b> — вердикт за сутки: скорость, надёжность, прокси, ссылки.\n"
+        "<b>Сканы радаров</b> — как часто проверяется каждый радар и кто задержал лот: Авито или бот.\n"
+        "<b>Почему не пришёл лот</b> — пришлите ссылку на объявление: видел ли его бот и что решил.\n"
         "<b>Подробно на 10 мин</b> — в events.jsonl пишутся все шаги сканов.\n\n"
         "• bot.log — что делал бот, по строке на событие\n"
         "• errors.log — только то, что требует внимания\n"
@@ -1279,6 +2093,8 @@ async def cmd_admin_logs_menu(event):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [ui.btn("Отчёт для отладки", "stats", callback_data="admin_log_get:report", style="primary")],
         [ui.btn("Готовность к продаже", "ok", callback_data="admin_log_get:ready", style="success")],
+        [ui.btn("Сканы радаров", "radar", callback_data="admin_scans_pick:0")],
+        [ui.btn("Почему не пришёл лот", "scope", callback_data="admin_lot_prompt")],
         [ui.btn("Выключить подробный режим" if debug_left > 0 else "Подробно на 10 мин", "scope",
                 callback_data="admin_log_debug")],
         [ui.btn("Все логи (ZIP)", "box", callback_data="admin_log_get:all_zip")],
@@ -1707,7 +2523,7 @@ async def _set_direct_legacy(enabled: bool) -> dict:
     pool = get_proxy_pool()
     config.ALLOW_DIRECT_AVITO = bool(enabled)
     await database.set_bot_setting("allow_direct_avito", "1" if enabled else "0")
-    mode = ("both" if pool.has_configured_proxy() else "direct") if enabled else "proxy"
+    mode = ("smart" if pool.has_configured_proxy() else "direct") if enabled else "proxy"
     await database.set_bot_setting("net_mode", mode)
     return await pool.set_net_mode_async(mode)
 
@@ -1777,7 +2593,7 @@ async def cmd_admin_reload_proxies(message: Message):
 
 # ── Сеть и прокси: режимы, проверка каналов, подключение прокси без перезапуска ──
 
-NET_MODE_BUTTONS = (("direct", "🖥 Сервер"), ("proxy", "🛰 Прокси"), ("both", "🔀 Оба"))
+NET_MODE_BUTTONS = (("smart", "🧠 Умный"), ("both", "🔀 Оба"), ("direct", "🖥 Сервер"), ("proxy", "🛰 Прокси"))
 
 PROXY_FORMAT_HELP = (
     "Формат: <code>http://логин:пароль@IP:порт</code>\n"
@@ -1851,6 +2667,7 @@ async def _render_net(note: str = "") -> tuple[str, InlineKeyboardMarkup]:
         "",
         f"Режим: <b>{NET_MODE_TITLES.get(mode, mode)}</b>",
         f"<i>{NET_MODE_HINTS.get(mode, '')}</i>",
+        *_smart_lines(pool),
         "",
         f"<b>Каналы сканирования</b> · работают {len(working)} из {len(snaps)}, "
         f"суммарно <code>{sum(float(s.get('effective_rate') or 0) for s in working):.2f}</code> req/s:",
@@ -1858,7 +2675,7 @@ async def _render_net(note: str = "") -> tuple[str, InlineKeyboardMarkup]:
     lines += [_channel_label(snap) for snap in snaps[:NET_CHANNELS_SHOWN]] or ["⏸ нет активных каналов — сканирование стоит"]
     if len(snaps) > NET_CHANNELS_SHOWN:
         lines.append(f"… и ещё {len(snaps) - NET_CHANNELS_SHOWN} — полный список в «🗂 Мои прокси»")
-    if mode in ("proxy", "both") and not pool.has_configured_proxy():
+    if mode in ("proxy", "both", "smart") and not pool.has_configured_proxy():
         lines += ["", "⚠️ Прокси не подключены — нажмите «➕ Добавить прокси»."]
     if pool.pool_file_overrides_single_proxy():
         lines += ["", "📄 Прокси берутся из файла PROXY_POOL_FILE на сервере, добавленные в боте не используются."]
@@ -1868,11 +2685,13 @@ async def _render_net(note: str = "") -> tuple[str, InlineKeyboardMarkup]:
     add_row = [InlineKeyboardButton(text="➕ Добавить прокси", callback_data="admin_net_add")]
     if config.PROXY_URLS:
         add_row.append(InlineKeyboardButton(text=f"🗂 Мои прокси ({len(config.PROXY_URLS)})", callback_data="admin_net_list:0"))
+    mode_buttons = [
+        InlineKeyboardButton(text=("✅ " if key == mode else "") + title, callback_data=f"admin_net_mode:{key}")
+        for key, title in NET_MODE_BUTTONS
+    ]
     buttons = [
-        [
-            InlineKeyboardButton(text=("✅ " if key == mode else "") + title, callback_data=f"admin_net_mode:{key}")
-            for key, title in NET_MODE_BUTTONS
-        ],
+        mode_buttons[:2],
+        mode_buttons[2:],
         [InlineKeyboardButton(text="🧪 Проверить каналы", callback_data="admin_net_probe")],
         add_row,
         [
@@ -1881,6 +2700,28 @@ async def _render_net(note: str = "") -> tuple[str, InlineKeyboardMarkup]:
         ],
     ]
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _smart_lines(pool) -> list[str]:
+    """What smart mode does right now and why, so nobody has to guess from the channel list."""
+    if config.NET_MODE != "smart" or not hasattr(pool, "smart_status"):
+        return []
+    status = pool.smart_status()
+    load = f"нагрузка <code>{status['demand_rps']:.2f}</code> из <code>{status['limit_rps']:.2f}</code> запр/с"
+    blocks = (
+        f"блокировок у сервера {status['server_blocks']:.0%}" if status["server_answers"]
+        else "у сервера пока нет ответов"
+    )
+    if not status["has_proxies"]:
+        return ["", f"Сейчас: сканирует сервер, прокси нет · {load}"]
+    if status["server_first"]:
+        return ["", f"Сейчас: <b>сканирует сервер</b>, прокси в запасе · {load} · {blocks}"]
+    left = int(status["hold_left"] // 60) + 1
+    return [
+        "",
+        f"Сейчас: <b>прокси в работе</b> — {html.escape(status['reason'])}",
+        f"Вернусь к одному серверу, если всё спокойно ещё ~{left} мин · {blocks}",
+    ]
 
 
 async def _set_net_mode(mode: str) -> None:
@@ -1982,8 +2823,8 @@ async def _add_proxies(message: Message, raw: str) -> None:
         report.append(f"\n<b>Добавлено: {len(accepted)}</b>, всего прокси: {len(config.PROXY_URLS)}. Применено сразу.")
         if config.NET_MODE in ("direct", "auto"):
             # Keep the server IP scanning too: a fresh proxy must add capacity, not replace it.
-            await _set_net_mode("both")
-            report.append("Режим переключён на «🔀 Оба»: сервер и прокси делят нагрузку.")
+            await _set_net_mode("smart")
+            report.append("Режим переключён на «🧠 Умный»: сервер сканирует, прокси в запасе и включаются сами, когда нужны.")
         logger.info("Admin %s added %s proxies", message.from_user.id, len(accepted))
     text, kb = await _render_net("\n".join(report))
     await status.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -2085,8 +2926,12 @@ async def _render_proxy_card(proxy_id: str, page: int) -> tuple[str, InlineKeybo
     if client is None:
         lines.append("Сейчас не в работе: режим сети без этого канала.")
     else:
-        lines.append(f"Роль: {client.routing_role()}")
+        pool = get_proxy_pool()
+        server_first = config.NET_MODE == "smart" and pool.smart_status()["server_first"]
+        lines.append(f"Роль: {client.routing_role(server_first=server_first)}")
         lines.append(f"Последние {config.PROXY_HEALTH_WINDOW} запросов: {client.recent_health():.0%} успешных")
+        if server_first and not client.is_direct and len(client._outcomes) >= 3:
+            lines.append(f"За последние {len(client._outcomes)} ответов: {client.long_health():.0%} успешных")
 
     summary = next((s for s in METRICS.get_proxy_summaries() if s["proxy_id"] == proxy_id), None)
     if summary is not None:
@@ -2126,10 +2971,11 @@ async def cb_admin_net_mode(call: CallbackQuery):
     if mode not in config.NET_MODES:
         await call.answer("Неизвестный режим", show_alert=True)
         return
-    if mode in ("proxy", "both") and not get_proxy_pool().has_configured_proxy():
+    if mode in ("proxy", "both", "smart") and not get_proxy_pool().has_configured_proxy():
         await call.answer("Сначала добавьте прокси: кнопка «➕ Добавить прокси».", show_alert=True)
         return
     await _set_net_mode(mode)
+    await database.log_admin_action(call.from_user.id, None, "net_mode", NET_MODE_TITLES.get(mode, mode))
     await call.answer(f"Режим: {NET_MODE_TITLES[mode]}")
     text, kb = await _render_net()
     await _show(call, text, kb)

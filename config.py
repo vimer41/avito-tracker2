@@ -94,8 +94,9 @@ SCAN_PROXY_ATTEMPTS = positive_int_setting("SCAN_PROXY_ATTEMPTS", "3")
 PROXY_POOL_FILE = (os.getenv("PROXY_POOL_FILE") or "").strip()
 ALLOW_DIRECT_AVITO = os.getenv("ALLOW_DIRECT_AVITO", "1" if TESTING else "0").strip() == "1"
 # Network channels for scanning: auto (proxies if any, else server IP when ALLOW_DIRECT_AVITO),
-# direct (server IP only), proxy (proxies only), both (proxies and the server IP share the load).
-NET_MODES = ("auto", "direct", "proxy", "both")
+# direct (server IP only), proxy (proxies only), both (proxies and the server IP share the load),
+# smart (the server IP alone while it copes, proxies in reserve; see SMART_* below).
+NET_MODES = ("auto", "direct", "proxy", "both", "smart")
 NET_MODE = (os.getenv("NET_MODE", "auto").strip().lower() or "auto")
 if NET_MODE not in NET_MODES:
     raise ValueError(f"NET_MODE должен быть одним из: {', '.join(NET_MODES)}")
@@ -133,6 +134,14 @@ PROXY_HOT_PENALTY = positive_float_setting("PROXY_HOT_PENALTY", "0.5")
 # after a success, so that a proxy back from an outage is proven again within a minute.
 PROXY_PROBE_INTERVAL = positive_float_setting("PROXY_PROBE_INTERVAL", "60")
 PROXY_PROBE_RETRY = positive_float_setting("PROXY_PROBE_RETRY", "5")
+# Smart mode: the server IP scans alone while the planned load stays under SMART_DIRECT_MAX_RPS and its share
+# of blocks under SMART_DIRECT_BLOCK_RATIO; proxies are not probed and only take the retry after a server failure.
+# Past either limit the proxies join the load as in «both» for at least SMART_HOLD_SECONDS.
+SMART_DIRECT_MAX_RPS = positive_float_setting("SMART_DIRECT_MAX_RPS", "0.5")
+SMART_DIRECT_BLOCK_RATIO = positive_float_setting("SMART_DIRECT_BLOCK_RATIO", "0.2")
+SMART_HOLD_SECONDS = positive_float_setting("SMART_HOLD_SECONDS", "600")
+# A reserve proxy is chosen by its record over this many last answers, however old they are.
+PROXY_QUALITY_WINDOW = positive_int_setting("PROXY_QUALITY_WINDOW", "50")
 CHALLENGE_WORKERS = positive_int_setting("CHALLENGE_WORKERS", "1")
 COOKIE_SAVE_INTERVAL = non_negative_float_setting("COOKIE_SAVE_INTERVAL", "30")
 

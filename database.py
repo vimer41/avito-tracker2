@@ -612,7 +612,20 @@ async def init_db():
             "night_to": "INTEGER NOT NULL DEFAULT 8",
             "reminded_key": "TEXT NOT NULL DEFAULT ''",
             "mirror_chat_id": "INTEGER",
+            "last_seen_at": "TIMESTAMP",
+            "admin_note": "TEXT NOT NULL DEFAULT ''",
         })
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS admin_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                user_id INTEGER,
+                action TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS admin_actions_user ON admin_actions(user_id, id)")
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS stars_orders (
@@ -728,6 +741,27 @@ async def init_db():
             "reply_template": "TEXT DEFAULT ''",
             "pause_reason": "TEXT DEFAULT ''",
         })
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS radar_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                search_id INTEGER NOT NULL,
+                at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                action TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                url TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS radar_history_user ON radar_history(user_id, id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS radar_history_search ON radar_history(search_id)")
+        # Radars made before the history existed get their creation row once.
+        await db.execute("""
+            INSERT INTO radar_history (user_id, search_id, at, action, title, url, detail)
+            SELECT s.user_id, s.id, COALESCE(s.created_at, datetime('now')), 'create', s.title, s.url, 'до журнала'
+            FROM searches s
+            WHERE NOT EXISTS (SELECT 1 FROM radar_history h WHERE h.search_id = s.id)
+        """)
         await db.execute("UPDATE searches SET is_active = 1 WHERE is_active IS NULL;")
         await db.execute("UPDATE searches SET stop_words = '[]' WHERE stop_words IS NULL;")
         await db.execute("UPDATE searches SET initialized_at = COALESCE(created_at, datetime('now')) WHERE initialized_at = ''")
@@ -925,8 +959,20 @@ async def init_db():
         config.PROXY_URLS = proxy_urls
         async with db.execute("SELECT value FROM bot_settings WHERE key = 'net_mode'") as cur:
             m_row = await cur.fetchone()
-            if m_row is not None and str(m_row[0]) in config.NET_MODES:
-                config.NET_MODE = str(m_row[0])
+        async with db.execute("SELECT value FROM bot_settings WHERE key = 'net_mode_smart_offered'") as cur:
+            offered = await cur.fetchone() is not None
+        if not offered:
+            # Once: «both» becomes «smart» (the server alone while it copes). A later choice of «both» stays.
+            if m_row is not None and str(m_row[0]) == "both":
+                m_row = ("smart",)
+                await db.execute("UPDATE bot_settings SET value = 'smart', updated_at = CURRENT_TIMESTAMP WHERE key = 'net_mode'")
+                logger.info("Режим сети «Оба» переведён на «Умный»: сервер сканирует один, пока справляется")
+            await db.execute(
+                "INSERT OR IGNORE INTO bot_settings (key, value, updated_at) VALUES ('net_mode_smart_offered', '1', CURRENT_TIMESTAMP)"
+            )
+            await db.commit()
+        if m_row is not None and str(m_row[0]) in config.NET_MODES:
+            config.NET_MODE = str(m_row[0])
         async with db.execute("SELECT value FROM bot_settings WHERE key = 'stars_prices'") as cur:
             p_row = await cur.fetchone()
         if p_row is not None:
@@ -1032,12 +1078,16 @@ async def sync_radar_limit_in_transaction(db, user_id: int) -> None:
             "UPDATE searches SET is_active = 0, pause_reason = ? WHERE id = ?",
             [(PAUSE_LIMIT, radar_id) for radar_id in active[limit:]],
         )
+        for radar_id in active[limit:]:
+            await log_radar_history(db, user_id, radar_id, "limit_pause", detail=f"лимит {limit}")
     returning = waiting[: max(0, limit - len(active))]
     if returning:
         await db.executemany(
             "UPDATE searches SET is_active = 1, pause_reason = '' WHERE id = ?",
             [(radar_id,) for radar_id in returning],
         )
+        for radar_id in returning:
+            await log_radar_history(db, user_id, radar_id, "limit_resume", detail=f"лимит {limit}")
 
 
 async def sync_radar_limit(user_id: int) -> None:
@@ -1067,11 +1117,17 @@ async def count_limit_paused(user_id: int) -> int:
 async def resume_blocked_searches(user_id: int) -> int:
     """The user is back after blocking the bot: their radars run again, within the tariff."""
     async with writer_connection() as db:
+        async with db.execute(
+            "SELECT id FROM searches WHERE user_id = ? AND pause_reason = ?", (user_id, PAUSE_BLOCKED)
+        ) as cur:
+            back = [int(row[0]) for row in await cur.fetchall()]
         cursor = await db.execute(
             "UPDATE searches SET is_active = 1, pause_reason = '' WHERE user_id = ? AND pause_reason = ?",
             (user_id, PAUSE_BLOCKED),
         )
         resumed = max(0, int(cursor.rowcount or 0))
+        for radar_id in back:
+            await log_radar_history(db, user_id, radar_id, "blocked_resume")
         if resumed:
             await sync_radar_limit_in_transaction(db, user_id)
         await db.commit()
@@ -1271,6 +1327,7 @@ async def add_search(user_id: int, title: str, url: str, search_in_title_only: i
             (user_id, title, url, json.dumps([], ensure_ascii=False), search_in_title_only, max_age_minutes)
         )
         search_id = cursor.lastrowid
+        await log_radar_history(db, user_id, search_id, "create", title, url)
         if initial_items is not None:
             await db.executemany(
                 "INSERT OR IGNORE INTO seen_items (search_id, item_id, last_price) VALUES (?, ?, ?)",
@@ -1330,6 +1387,11 @@ async def update_search_title_scope(search_id: int, user_id: int, search_in_titl
             "UPDATE searches SET search_in_title_only = ?, url = ? WHERE id = ? AND user_id = ?",
             (search_in_title_only, new_url, search_id, user_id)
         )
+        if cursor.rowcount > 0:
+            await log_radar_history(
+                db, user_id, search_id, "scope", url=new_url,
+                detail="только в заголовках" if search_in_title_only else "заголовок и текст",
+            )
         await db.commit()
         return cursor.rowcount > 0
 
@@ -1340,8 +1402,230 @@ async def rename_search(search_id: int, user_id: int, title: str) -> bool:
             "UPDATE searches SET title = ? WHERE id = ? AND user_id = ?",
             (title.strip()[:100], search_id, user_id),
         )
+        if cursor.rowcount > 0:
+            await log_radar_history(db, user_id, search_id, "rename", title.strip()[:100])
         await db.commit()
         return cursor.rowcount > 0
+
+
+RADAR_HISTORY_LABELS = {
+    "create": "создан",
+    "delete": "удалён",
+    "url": "новая ссылка",
+    "rename": "переименован",
+    "scope": "область поиска",
+    "pause": "пауза",
+    "resume": "запущен",
+    "limit_pause": "пауза: лимит тарифа",
+    "limit_resume": "снова в работе: место в тарифе",
+    "blocked_pause": "пауза: бот заблокирован",
+    "blocked_resume": "снова в работе: бот разблокирован",
+}
+
+
+async def log_radar_history(db, user_id: int, search_id: int, action: str, title: Optional[str] = None,
+                            url: Optional[str] = None, detail: str = "") -> None:
+    """One row per radar change, inside the caller's transaction. Missing title/url are taken from the radar."""
+    if title is None or url is None:
+        async with db.execute("SELECT title, url FROM searches WHERE id = ?", (search_id,)) as cursor:
+            row = await cursor.fetchone()
+        if row is not None:
+            title = row[0] if title is None else title
+            url = row[1] if url is None else url
+    await db.execute(
+        "INSERT INTO radar_history (user_id, search_id, action, title, url, detail) VALUES (?, ?, ?, ?, ?, ?)",
+        (int(user_id), int(search_id), action, str(title or "")[:100], str(url or "")[:500], str(detail or "")[:200]),
+    )
+
+
+async def get_radar_history(user_id: int, limit: int = 300) -> List[Dict[str, Any]]:
+    """Newest first."""
+    async with reader_connection() as db:
+        async with db.execute(
+            "SELECT * FROM radar_history WHERE user_id = ? ORDER BY id DESC LIMIT ?", (int(user_id), int(limit))
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+
+async def get_ever_subscribed_user_ids() -> set[int]:
+    """Anyone who ever had access: a trial, a paid order or an admin grant."""
+    async with reader_connection() as db:
+        async with db.execute("""
+            SELECT user_id FROM users
+            WHERE COALESCE(trial_used, 0) = 1 OR COALESCE(is_allowed, 0) = 1 OR subscription_until IS NOT NULL
+            UNION
+            SELECT user_id FROM stars_orders WHERE status IN ('paid', 'refunding')
+        """) as cursor:
+            return {int(row[0]) for row in await cursor.fetchall()}
+
+
+async def find_lot_traces(item_id: str) -> dict[str, list[dict]]:
+    """Where a lot left marks: radars that remember it as seen (with when) and notifications still waiting."""
+    async with reader_connection() as db:
+        async with db.execute("""
+            SELECT si.search_id, si.created_at, s.title, s.user_id, s.is_active
+            FROM seen_items si LEFT JOIN searches s ON s.id = si.search_id
+            WHERE si.item_id = ? ORDER BY si.created_at
+        """, (str(item_id),)) as cursor:
+            seen = [dict(row) for row in await cursor.fetchall()]
+        async with db.execute("""
+            SELECT e.user_id, e.status, e.attempt_count, e.queued_at, e.sent_at, e.expired_at, e.failed_at,
+                   e.last_error, r.search_id
+            FROM notification_events e
+            LEFT JOIN notification_dedupe_radars r ON r.user_id = e.user_id AND r.item_id = e.item_id
+            WHERE e.item_id = ? ORDER BY e.queued_at
+        """, (str(item_id),)) as cursor:
+            deliveries = [dict(row) for row in await cursor.fetchall()]
+    return {"seen": seen, "deliveries": deliveries}
+
+
+PAID_STATUSES = "('paid', 'refunding')"
+
+
+async def log_admin_action(admin_id: int, user_id: Optional[int], action: str, detail: str = "") -> None:
+    try:
+        async with writer_connection() as db:
+            await db.execute(
+                "INSERT INTO admin_actions (admin_id, user_id, action, detail) VALUES (?, ?, ?, ?)",
+                (int(admin_id), int(user_id) if user_id is not None else None, action[:60], str(detail or "")[:300]),
+            )
+            await db.commit()
+    except Exception:
+        logger.warning("Не удалось записать действие администратора", exc_info=True)
+
+
+async def get_admin_actions(user_id: Optional[int] = None, limit: int = 30) -> List[Dict[str, Any]]:
+    """Newest first; user_id=None gives the whole journal."""
+    query = "SELECT * FROM admin_actions" + (" WHERE user_id = ?" if user_id is not None else "") + " ORDER BY id DESC LIMIT ?"
+    params = ((int(user_id),) if user_id is not None else ()) + (int(limit),)
+    async with reader_connection() as db:
+        async with db.execute(query, params) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+
+async def set_admin_note(user_id: int, note: str) -> None:
+    async with writer_connection() as db:
+        await db.execute("UPDATE users SET admin_note = ? WHERE user_id = ?", (str(note or "")[:500], int(user_id)))
+        await db.commit()
+
+
+_TOUCHED: dict[int, float] = {}
+TOUCH_INTERVAL = 300.0
+
+
+async def touch_user(user_id: int) -> None:
+    """Last time the user did anything in the bot; written at most once per TOUCH_INTERVAL."""
+    now = time.monotonic()
+    if now - _TOUCHED.get(int(user_id), -TOUCH_INTERVAL) < TOUCH_INTERVAL:
+        return
+    _TOUCHED[int(user_id)] = now
+    try:
+        async with writer_connection() as db:
+            await db.execute("UPDATE users SET last_seen_at = datetime('now') WHERE user_id = ?", (int(user_id),))
+            await db.commit()
+    except Exception:
+        logger.debug("Не удалось обновить last_seen_at", exc_info=True)
+
+
+async def get_user_activity(user_id: int) -> Dict[str, Any]:
+    """For the admin card: lots delivered, payments, whether the user blocked the bot."""
+    now = time.time()
+    async with reader_connection() as db:
+        async with db.execute(
+            "SELECT COUNT(*), MAX(sent_at), SUM(CASE WHEN sent_at > ? THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN sent_at > ? THEN 1 ELSE 0 END) FROM notification_events WHERE user_id = ? AND status = 'sent'",
+            (now - 86400, now - 7 * 86400, int(user_id)),
+        ) as cursor:
+            total, last_sent, day, week = await cursor.fetchone()
+        async with db.execute(
+            f"SELECT COUNT(*), COALESCE(SUM(total_amount), 0), MAX(paid_at) FROM stars_orders "
+            f"WHERE user_id = ? AND status IN {PAID_STATUSES}",
+            (int(user_id),),
+        ) as cursor:
+            paid_count, paid_total, last_paid = await cursor.fetchone()
+        async with db.execute(
+            "SELECT COUNT(*) FROM searches WHERE user_id = ? AND pause_reason = ?", (int(user_id), PAUSE_BLOCKED)
+        ) as cursor:
+            blocked = (await cursor.fetchone())[0] > 0
+    return {
+        "lots_total": int(total or 0), "lots_day": int(day or 0), "lots_week": int(week or 0), "last_sent": last_sent,
+        "paid_count": int(paid_count or 0), "paid_total": int(paid_total or 0), "last_paid": last_paid,
+        "blocked_bot": bool(blocked),
+    }
+
+
+async def get_money_stats() -> Dict[str, Any]:
+    """Revenue by period, the trial → payment funnel of the last 30 days, renewals and churn."""
+    async with reader_connection() as db:
+        revenue = {}
+        for key, since in (("day", "-1 day"), ("week", "-7 days"), ("month", "-30 days"), ("all", "-100 years")):
+            async with db.execute(
+                f"SELECT COUNT(*), COALESCE(SUM(total_amount), 0), COUNT(DISTINCT user_id) FROM stars_orders "
+                f"WHERE status IN {PAID_STATUSES} AND paid_at > datetime('now', ?)",
+                (since,),
+            ) as cursor:
+                revenue[key] = tuple(int(v or 0) for v in await cursor.fetchone())
+        async with db.execute(
+            f"SELECT tariff_plan, COUNT(*), COALESCE(SUM(total_amount), 0) FROM stars_orders "
+            f"WHERE status IN {PAID_STATUSES} AND paid_at > datetime('now', '-30 days') GROUP BY tariff_plan"
+        ) as cursor:
+            by_plan = [(row[0], int(row[1]), int(row[2])) for row in await cursor.fetchall()]
+        async with db.execute(f"""
+            SELECT COUNT(*),
+                   SUM(CASE WHEN COALESCE(u.trial_used, 0) = 1 OR u.subscription_until IS NOT NULL THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN EXISTS (SELECT 1 FROM stars_orders o WHERE o.user_id = u.user_id
+                                         AND o.status IN {PAID_STATUSES}) THEN 1 ELSE 0 END)
+            FROM users u WHERE u.created_at > datetime('now', '-30 days')
+        """) as cursor:
+            new_users, tried, paid = (int(v or 0) for v in await cursor.fetchone())
+        async with db.execute(f"""
+            SELECT COUNT(*), SUM(CASE WHEN n >= 2 THEN 1 ELSE 0 END)
+            FROM (SELECT user_id, COUNT(*) AS n FROM stars_orders WHERE status IN {PAID_STATUSES} GROUP BY user_id)
+        """) as cursor:
+            payers, renewed = (int(v or 0) for v in await cursor.fetchone())
+        async with db.execute("""
+            SELECT SUM(CASE WHEN is_allowed = 1 THEN 1 ELSE 0 END), SUM(CASE WHEN is_allowed = 0 THEN 1 ELSE 0 END)
+            FROM users WHERE subscription_until > datetime('now')
+        """) as cursor:
+            active_paid, active_trial = (int(v or 0) for v in await cursor.fetchone())
+        async with db.execute(f"""
+            SELECT COUNT(*), SUM(CASE WHEN EXISTS (SELECT 1 FROM stars_orders o WHERE o.user_id = u.user_id
+                                                   AND o.status IN {PAID_STATUSES}) THEN 1 ELSE 0 END)
+            FROM users u WHERE u.subscription_until <= datetime('now') AND u.subscription_until > datetime('now', '-30 days')
+        """) as cursor:
+            lapsed, lapsed_paid = (int(v or 0) for v in await cursor.fetchone())
+    return {
+        "revenue": revenue, "by_plan": by_plan,
+        "funnel": {"new": new_users, "tried": tried, "paid": paid},
+        "payers": payers, "renewed": renewed,
+        "active_paid": active_paid, "active_trial": active_trial,
+        "lapsed": lapsed, "lapsed_paid": lapsed_paid,
+    }
+
+
+async def count_paid_orders(user_id: int) -> int:
+    async with reader_connection() as db:
+        async with db.execute(
+            f"SELECT COUNT(*) FROM stars_orders WHERE user_id = ? AND status IN {PAID_STATUSES}", (int(user_id),)
+        ) as cursor:
+            return int((await cursor.fetchone())[0])
+
+
+async def count_radar_lots(search_id: int, hours: int = 24) -> int:
+    """Lots this radar delivered in the last hours."""
+    async with reader_connection() as db:
+        async with db.execute("""
+            SELECT COUNT(*) FROM notification_dedupe_radars r
+            JOIN notification_events e ON e.user_id = r.user_id AND e.item_id = r.item_id
+            WHERE r.search_id = ? AND e.status = 'sent' AND e.sent_at > ?
+        """, (int(search_id), time.time() - hours * 3600)) as cursor:
+            return int((await cursor.fetchone())[0])
+
+
+async def get_paid_user_ids() -> set[int]:
+    async with reader_connection() as db:
+        async with db.execute("SELECT DISTINCT user_id FROM stars_orders WHERE status IN ('paid', 'refunding')") as cursor:
+            return {int(row[0]) for row in await cursor.fetchall()}
 
 
 async def replace_search_url(search_id: int, user_id: int, url: str, search_in_title_only: int,
@@ -1357,6 +1641,7 @@ async def replace_search_url(search_id: int, user_id: int, url: str, search_in_t
         if cursor.rowcount == 0:
             await db.commit()
             return False
+        await log_radar_history(db, user_id, search_id, "url")
         await db.execute("DELETE FROM seen_items WHERE search_id = ?", (search_id,))
         await db.execute("DELETE FROM notification_outbox WHERE search_id = ?", (search_id,))
         if initial_items is not None:
@@ -1521,6 +1806,7 @@ async def toggle_search_active(search_id: int, user_id: int) -> Optional[bool]:
             "UPDATE searches SET is_active = ?, pause_reason = '' WHERE id = ? AND user_id = ?",
             (new_status, search_id, user_id)
         )
+        await log_radar_history(db, user_id, search_id, "resume" if new_status else "pause")
         await db.commit()
         return bool(new_status)
 
@@ -1571,8 +1857,11 @@ async def delete_search(search_id: int, user_id: int) -> bool:
     now_epoch = time.time()
     async with writer_connection() as db:
         await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT title, url FROM searches WHERE id = ? AND user_id = ?", (search_id, user_id)) as cur:
+            before = await cur.fetchone()
         cursor = await db.execute("DELETE FROM searches WHERE id = ? AND user_id = ?", (search_id, user_id))
         if cursor.rowcount > 0:
+            await log_radar_history(db, user_id, search_id, "delete", before[0] if before else "", before[1] if before else "")
             await db.execute("DELETE FROM seen_items WHERE search_id = ?", (search_id,))
             await db.execute("DELETE FROM notification_outbox WHERE search_id = ?", (search_id,))
 
@@ -3312,6 +3601,10 @@ async def apply_admin_subscription_action(token: str, admin_id: int) -> Dict[str
 
 async def deactivate_user_searches(user_id: int):
     async with writer_connection() as db:
+        async with db.execute("SELECT id FROM searches WHERE user_id = ? AND is_active = 1", (user_id,)) as cursor:
+            stopped = [int(row[0]) for row in await cursor.fetchall()]
+        for radar_id in stopped:
+            await log_radar_history(db, user_id, radar_id, "blocked_pause")
         await db.execute(
             "UPDATE searches SET is_active = 0, pause_reason = ? WHERE user_id = ? AND is_active = 1",
             (PAUSE_BLOCKED, user_id),
@@ -3609,6 +3902,7 @@ async def purge_user_by_pattern(pattern: str) -> Dict[str, Any]:
             await db.execute("DELETE FROM notification_events WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM notification_outbox WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM searches WHERE user_id = ?", (uid,))
+            await db.execute("DELETE FROM radar_history WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM blocked_sellers WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM support_outbox WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM admin_subscription_actions WHERE user_id = ? AND applied_at IS NULL", (uid,))

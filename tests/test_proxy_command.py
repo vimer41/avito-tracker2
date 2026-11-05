@@ -89,8 +89,8 @@ class TestProxyCommand(ProxyEnvMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(probe_mock.await_args.args[0], PROXY_URL)
         message.delete.assert_awaited_once()
         self.assertEqual(await database.get_proxy_urls(), [PROXY_URL])
-        # Adding a proxy must add capacity, not switch the server IP off.
-        self.assertEqual(config.NET_MODE, "both")
+        # Adding a proxy must add capacity, not switch the server IP off: smart keeps it scanning first.
+        self.assertEqual(config.NET_MODE, "smart")
         self.assertEqual(self.channels(), ["direct", PROXY_URL])
         report = status.edit_text.await_args.args[0]
         self.assertIn("Добавлено: 1", report)
@@ -221,7 +221,7 @@ class TestNetworkScreen(ProxyEnvMixin, DispatcherFixture, unittest.IsolatedAsync
         history.assert_called_once_with("10.1.2.3:8080")
         text = self.methods("EditMessageText")[-1].text
         self.assertIn("10.1.2.3:8080", text)
-        self.assertIn("Роль: основной", text)
+        self.assertIn("Роль: в запасе", text, "smart mode keeps a proxy in reserve while the server copes")
         self.assertIn("75% успешных", text)
         self.assertIn("За 60 минут", text)
         self.assertIn("Запросов 100, успешных 84%", text)
@@ -243,7 +243,33 @@ class TestNetworkScreen(ProxyEnvMixin, DispatcherFixture, unittest.IsolatedAsync
     async def test_saved_mode_is_restored_on_startup(self):
         await database.set_bot_setting("net_mode", "both")
         await database.init_db()
-        self.assertEqual(config.NET_MODE, "both")
+        self.assertEqual(config.NET_MODE, "both", "a choice made after the one-time switch stays")
+
+    async def test_old_both_mode_becomes_smart_once(self):
+        await database.set_bot_setting("net_mode", "both")
+        async with database.writer_connection() as db:
+            await db.execute("DELETE FROM bot_settings WHERE key = 'net_mode_smart_offered'")
+            await db.commit()
+        await database.init_db()
+        self.assertEqual(config.NET_MODE, "smart")
+        self.assertEqual(await database.get_bot_setting("net_mode"), "smart")
+
+    async def test_smart_screen_says_who_scans_now(self):
+        await self.dispatch_callback("admin_net_add", config.ADMIN_ID)
+        with patch.object(proxy_check, "exit_ips_for", new=exit_ips({PROXY_URL: "10.1.2.3"})), \
+                patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=probe(True, True))):
+            await self.dispatch_message(text=PROXY_RAW, user_id=config.ADMIN_ID)
+        self.assertEqual(config.NET_MODE, "smart")
+        await self.dispatch_callback("admin_net", config.ADMIN_ID)
+        text = self.methods("EditMessageText")[-1].text
+        self.assertIn("Режим: <b>🧠 Умный</b>", text)
+        self.assertIn("Сейчас: <b>сканирует сервер</b>, прокси в запасе", text)
+
+        proxy_pool.get_proxy_pool().note_demand(config.SMART_DIRECT_MAX_RPS * 2)
+        await self.dispatch_callback("admin_net", config.ADMIN_ID)
+        text = self.methods("EditMessageText")[-1].text
+        self.assertIn("Сейчас: <b>прокси в работе</b> — нагрузка", text)
+        proxy_pool.get_proxy_pool().note_demand(0.0)
 
     async def test_non_admin_cannot_switch_modes(self):
         await self.dispatch_callback("admin_net_mode:direct", 123456)

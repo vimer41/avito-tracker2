@@ -152,6 +152,65 @@ class TestAdminRadars(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
             await self.dispatch_callback(data, USER_ID)
         self.assertEqual(len(await database.get_user_searches(USER_ID)), 1)
 
+    async def test_radar_history_keeps_deleted_radars(self):
+        first, second = await self.add_user_radars(2)
+        await database.rename_search(first, USER_ID, "PSP")
+        await database.toggle_search_active(first, USER_ID)
+        await database.delete_search(second, USER_ID)
+        actions = [(row["search_id"], row["action"]) for row in await database.get_radar_history(USER_ID)]
+        self.assertEqual(actions[0], (second, "delete"))
+        self.assertIn((first, "rename"), actions)
+        self.assertIn((first, "pause"), actions)
+        self.assertIn((second, "create"), actions)
+
+        await self.dispatch_callback(f"admin_rhist:{USER_ID}:0:0", config.ADMIN_ID)
+        text = self.last_text()
+        self.assertIn("История радаров", text)
+        self.assertIn("удалено: <b>1</b>", text)
+        self.assertIn(f"#{second} ✖", text)
+
+        await self.dispatch_callback(f"admin_rhist:{USER_ID}:0:0", USER_ID)
+        self.assertNotIn(str(second) + " ✖", "".join(
+            m.text for m in self.session.calls if type(m).__name__ == "SendMessage" and m.chat_id == USER_ID))
+
+    async def test_user_filter_ever_subscribed(self):
+        never = 55502
+        await database.get_or_create_user(never, "never", "Never")
+        await self.dispatch_callback("admin_page:0:ever", config.ADMIN_ID)
+        text = self.last_text()
+        self.assertIn("Была подписка", text)
+        self.assertIn("@user", text)
+        self.assertNotIn("@never", text)
+        await self.dispatch_callback("admin_page:0", config.ADMIN_ID)
+        self.assertIn("@never", self.last_text())
+
+    async def test_scan_journal_splits_lot_age(self):
+        import time
+        import scan_journal
+
+        radar_id = (await self.add_user_radars(1))[0]
+        now = time.time()
+        scan_journal.forget(radar_id)
+        scan_journal.record_scan([radar_id], ok=True, at=now - 20, ms=300, channel="direct", items=50)
+        scan_journal.record_scan([radar_id], ok=False, at=now - 12, ms=900, kind="forbidden")
+        scan_journal.record_scan([radar_id], ok=True, at=now - 5, ms=310, channel="direct", items=50)
+        scan_journal.record_lot(radar_id, item_id="1", title="PSP Vita", url="https://www.avito.ru/1",
+                                published=now - 245, seen_at=now - 5, scan_at=now - 5, previous_scan_at=now - 20,
+                                reliable=True)
+        scan_journal.record_sent([radar_id], "1", now - 4)
+
+        split = scan_journal.lot_split(scan_journal.lots(radar_id)[0])
+        self.assertAlmostEqual(split["bot"], 15, delta=0.5)
+        self.assertAlmostEqual(split["avito"], 225, delta=0.5)
+        self.assertEqual(scan_journal.summary(radar_id, now=now)["fail"], 1)
+
+        await self.dispatch_callback(f"admin_scans:{radar_id}:{USER_ID}:0", config.ADMIN_ID)
+        text = self.last_text()
+        self.assertIn("+1 нов.", text)
+        self.assertIn("→ <b>Авито</b>", text)
+        self.assertIn("PSP Vita", text)
+        scan_journal.forget(radar_id)
+
 
 if __name__ == "__main__":
     unittest.main()

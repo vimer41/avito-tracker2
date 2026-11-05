@@ -337,7 +337,17 @@ class TestReport(LogFixture):
                    "ms_p50": 500, "fail": {}, "state": "healthy", "rate": 1.5}
         self.write_day(lambda stamp: self.healthy_minute(stamp, ch={f"10.0.0.{i}:3000": dict(channel) for i in range(5)}))
         self.flush()
-        self.assertIn("✅ Запас хороших прокси: хватает 100% минут", log_report.build_readiness(24))
+        self.assertIn("✅ Запас хороших каналов: хватает 100% минут", log_report.build_readiness(24))
+
+    def test_server_alone_covers_a_small_load_in_smart_mode(self):
+        server = {"http": 8, "ok": 8, "403": 0, "429": 0, "5xx": 0, "terr": 0, "coll": 8, "coll_ok": 8,
+                  "ms_p50": 400, "fail": {}, "state": "healthy", "rate": 1.5}
+        idle_proxy = {"http": 0, "ok": 0, "403": 0, "429": 0, "5xx": 0, "terr": 0, "coll": 0, "coll_ok": 0,
+                      "fail": {}, "state": "healthy", "rate": 1.5}
+        self.write_day(lambda stamp: self.healthy_minute(
+            stamp, rps_need=0.3, ch={"direct": dict(server), "10.0.0.1:3000": dict(idle_proxy)}))
+        self.flush()
+        self.assertIn("✅ Запас хороших каналов: хватает 100% минут", log_report.build_readiness(24))
 
     def test_blind_zone_names_its_radar(self):
         def row(stamp):
@@ -404,9 +414,10 @@ class TestReport(LogFixture):
             {"id": "a1f3", "ev": "scan.fail", "f": {"rids": [7]}},
             {"id": "a1f3", "ev": "fanout.found", "f": {"radar": 7, "chat": 5}},
             {"id": "b2c4", "ev": "send.ok", "f": {"chat": 5}},
+            {"id": "c3d5", "ev": "lot.new", "f": {"rid": 7, "age": 200, "gap": 18}},
         ]
         self.assertEqual(len(log_report.select(rows, trace="a1f3")), 2)
-        self.assertEqual(len(log_report.select(rows, radar=7)), 2)
+        self.assertEqual(len(log_report.select(rows, radar=7)), 3)
         self.assertEqual(len(log_report.select(rows, chat=5)), 2)
         self.assertEqual(len(log_report.select(rows, text="FANOUT")), 1)
 

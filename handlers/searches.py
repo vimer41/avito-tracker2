@@ -439,7 +439,28 @@ def _scope_button(search_id: int, title_only: bool):
     return ui.btn(label, "scope", callback_data=f"toggle_title_scope:{search_id}")
 
 
-def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
+def _check_line(s: dict, lots_day: Optional[int]) -> str:
+    """When the radar was last checked and how much it sent: the user sees that it is alive."""
+    import time
+    import scan_journal
+
+    if not s["is_active"]:
+        return ""
+    ok_times = [entry["at"] for entry in scan_journal.scans(s["id"]) if entry["ok"]]
+    if ok_times:
+        ago = max(0, int(time.time() - ok_times[-1]))
+        when = f"{ago} с назад" if ago < 120 else f"{ago // 60} мин назад"
+        if ago > 600:
+            when += " — Авито сейчас плохо отдаёт выдачу, бот продолжает пробовать"
+    else:
+        when = "скоро, бот только что запустился"
+    line = f"<b>Проверен:</b> {when}\n"
+    if lots_day is not None:
+        line += f"<b>Прислано за сутки:</b> {lots_day}\n"
+    return line
+
+
+def build_radar_card(s: dict, lots_day: Optional[int] = None) -> Tuple[str, InlineKeyboardMarkup]:
     search_id = s["id"]
     is_active = bool(s["is_active"])
     stops_count = len(s["stop_words"])
@@ -451,7 +472,8 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
     card_text = (
         f"{ui.e('radar')} <b>{html.escape(s['title'])}</b>\n\n"
         f"<b>Статус:</b> {status}\n"
-        f"<b>Ищет:</b> {_scope_label(title_only)}\n"
+        + _check_line(s, lots_day)
+        + f"<b>Ищет:</b> {_scope_label(title_only)}\n"
         f"<b>Стоп-слова:</b> {stops_count or 'нет'}\n"
         f"<b>Фильтры:</b> {html.escape(radar_filters.summary(s))}\n"
         f"<a href=\"{html.escape(s['url'], quote=True)}\">Открыть выдачу на Авито</a>"
@@ -475,7 +497,11 @@ def build_radar_card(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
 
 
 async def _show_card(event, s: dict) -> None:
-    card_text, markup = build_radar_card(s)
+    try:
+        lots_day = await database.count_radar_lots(int(s["id"]), hours=24)
+    except Exception:
+        lots_day = None
+    card_text, markup = build_radar_card(s, lots_day)
     await ui.show(event, card_text, markup, disable_web_page_preview=True)
 
 

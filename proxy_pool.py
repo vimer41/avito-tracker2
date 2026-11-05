@@ -22,6 +22,7 @@ from logger_setup import log_event
 from runtime_metrics import METRICS, mask_proxy_url, sanitize_proxy_credentials, short_channel
 
 log = logging.getLogger("proxy_pool")
+SMART_BLOCK_ALERT_INTERVAL = 3600.0
 
 ALLOWED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 
@@ -190,6 +191,8 @@ class ProxyClient:
 
         # Sliding 10m window of (monotonic_ts, status_code, is_transport_error)
         self._history_10m: deque[tuple[float, int | None, bool]] = deque()
+        # Last answers however old: a reserve proxy may stay idle for hours, its record must not vanish.
+        self._outcomes: deque[bool] = deque(maxlen=max(1, int(config.PROXY_QUALITY_WINDOW)))
 
         # Persistent AsyncSession (created lazily)
         self._async_session: curl_requests.AsyncSession | None = None
@@ -362,8 +365,31 @@ class ProxyClient:
         ok = sum(1 for _, status, transport in recent if not transport and status is not None and 200 <= status < 400)
         return ok / len(recent)
 
-    def routing_role(self) -> str:
+    def long_health(self) -> float:
+        """Share of successful answers among the last PROXY_QUALITY_WINDOW, however old; neutral until 3 answers."""
+        outcomes = list(self._outcomes)
+        if len(outcomes) < 3:
+            return float(config.PROXY_GOOD_HEALTH)
+        return sum(outcomes) / len(outcomes)
+
+    def recent_block_share(self, now: float) -> tuple[int, float]:
+        """(answers, share of 403/429/439) among the last PROXY_RATE_WINDOW answers of the last 10 minutes."""
+        cutoff = now - float(config.PROXY_BLOCK_WINDOW_SECONDS)
+        window = max(1, int(config.PROXY_RATE_WINDOW))
+        statuses = [
+            status for at, status, transport in list(self._history_10m)
+            if at >= cutoff and not transport and status is not None
+        ][-window:]
+        if not statuses:
+            return 0, 0.0
+        return len(statuses), sum(1 for status in statuses if status in (403, 429, 439)) / len(statuses)
+
+    def routing_role(self, server_first: bool = False) -> str:
         """The channel's place in routing, for the admin card."""
+        if server_first:
+            if self.is_direct:
+                return "основной: пока справляется, сканирует один"
+            return "в запасе: берёт скан, только если сервер ошибся, без лишних проверок"
         if self.is_direct:
             return "запасной, берёт нагрузку, когда хорошие прокси заняты"
         if len(self._history_10m) < 3:
@@ -372,8 +398,17 @@ class ProxyClient:
             return "основной, работает в первую очередь"
         return "слабый, работает как запасной и проверяется раз в минуту"
 
-    def routing_score(self, now: float) -> float:
-        """Higher goes first: unproven channel due for a probe, proven proxy, server or weak proxy, overloaded proxy."""
+    def routing_score(self, now: float, server_first: bool = False) -> float:
+        """Higher goes first: unproven channel due for a probe, proven proxy, server or weak proxy, overloaded proxy.
+        With server_first (smart mode while the server copes) the server leads and proxies are a reserve
+        ordered by their long record: no probes, so an idle proxy costs no scan a timeout."""
+        if server_first:
+            with self._pacing_lock:
+                in_flight, limit = self.in_flight, self.max_in_flight
+            if self.is_direct:
+                # One more scan may queue behind the current request; the next one goes to a good reserve proxy.
+                return 3.0 if in_flight <= limit else 0.9
+            return min(0.99, self.long_health()) - (float(config.PROXY_HOT_PENALTY) if in_flight >= limit else 0.0)
         health = self.recent_health()
         good = health >= float(config.PROXY_GOOD_HEALTH)
         idle = now - self.last_acquired_at
@@ -400,6 +435,7 @@ class ProxyClient:
         now = self._monotonic()
         self._prune_10m_history(now)
         self._history_10m.append((now, status_code, is_transport_error))
+        self._outcomes.append(not is_transport_error and status_code is not None and 200 <= status_code < 400)
 
         METRICS.record_http_request(
             self.proxy_id,
@@ -617,6 +653,13 @@ class ProxyPool:
         self._draining_clients: list[ProxyClient] = []
         self._rr_cursor: int = 0
         self._lock = threading.Lock()
+        # Smart mode state: planned load from the monitoring loop, until when proxies stay in work, and why.
+        self._demand_rps: float = 0.0
+        self._smart_mixed_until: float = -math.inf
+        self._smart_reason: str = ""
+        self._smart_server_first: bool | None = None
+        self._alerts: list[str] = []
+        self._block_alerted_at: float = -math.inf
 
         self.load_configuration(
             proxy_pool_file=proxy_pool_file,
@@ -649,7 +692,7 @@ class ProxyPool:
                 if normalized not in proxies:
                     proxies.append(normalized)
 
-        if mode == "both":
+        if mode in ("both", "smart"):
             return proxies + [None]
         if mode == "proxy":
             if not proxies:
@@ -789,6 +832,84 @@ class ProxyPool:
         now = self._monotonic()
         return sum(1 for c in self.clients if c.is_available_for_scan(now))
 
+    def note_demand(self, requests_per_second: float) -> None:
+        """Planned load of all links in req/s, from the monitoring loop; smart mode compares it with the server's share."""
+        try:
+            value = float(requests_per_second)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(value) and value >= 0:
+            self._demand_rps = value
+
+    def _evaluate_smart(self, now: float, clients: list[ProxyClient]) -> bool:
+        """
+        Smart mode: True while the server scans alone. Proxies join the load when the planned load passes
+        SMART_DIRECT_MAX_RPS or the server gets more than SMART_DIRECT_BLOCK_RATIO blocks, and stay in work
+        until neither has happened for SMART_HOLD_SECONDS.
+        """
+        if config.NET_MODE != "smart":
+            return False
+        direct = next((c for c in clients if c.is_direct), None)
+        if direct is None:
+            return False
+        reason = ""
+        limit = float(config.SMART_DIRECT_MAX_RPS)
+        answers, blocks = direct.recent_block_share(now)
+        if self._demand_rps > limit:
+            reason = f"нагрузка {self._demand_rps:.2f} запр/с, сервер один тянет до {limit:.2f}"
+        elif answers >= 10 and blocks > float(config.SMART_DIRECT_BLOCK_RATIO):
+            reason = f"Авито блокирует сервер: {blocks:.0%} ответов"
+        if reason and any(not c.is_direct for c in clients):
+            self._smart_mixed_until = max(self._smart_mixed_until, now + float(config.SMART_HOLD_SECONDS))
+            self._smart_reason = reason
+        server_first = now >= self._smart_mixed_until
+        if server_first != self._smart_server_first:
+            self._smart_server_first = server_first
+            log_event(
+                log,
+                logging.INFO,
+                "net.smart",
+                "Умный режим: сервер справляется, прокси в запасе" if server_first
+                else f"Умный режим: прокси включены в работу · {self._smart_reason}",
+                server_first=server_first,
+                reason="" if server_first else self._smart_reason,
+                rps=round(self._demand_rps, 3),
+                blocks=round(blocks, 3),
+            )
+            if not server_first and self._smart_reason.startswith("Авито блокирует") \
+                    and now - self._block_alerted_at >= SMART_BLOCK_ALERT_INTERVAL:
+                self._block_alerted_at = now
+                self._alerts.append(
+                    f"⚠️ {self._smart_reason}.\nУмный режим включил прокси в работу: сканы не остановятся. "
+                    "Если повторяется часто, IP сервера стоит сменить."
+                )
+        return server_first
+
+    def pop_alerts(self) -> list[str]:
+        """Messages for admins collected while routing; the monitoring loop sends them."""
+        alerts, self._alerts = self._alerts, []
+        return alerts
+
+    def smart_status(self) -> dict[str, Any]:
+        """What smart mode is doing now, for the network screen."""
+        now = self._monotonic()
+        with self._lock:
+            clients = list(self._clients.values())
+            server_first = self._evaluate_smart(now, clients)
+        direct = next((c for c in clients if c.is_direct), None)
+        answers, blocks = direct.recent_block_share(now) if direct is not None else (0, 0.0)
+        return {
+            "active": config.NET_MODE == "smart",
+            "server_first": server_first,
+            "reason": self._smart_reason,
+            "demand_rps": self._demand_rps,
+            "limit_rps": float(config.SMART_DIRECT_MAX_RPS),
+            "server_answers": answers,
+            "server_blocks": blocks,
+            "hold_left": max(0.0, self._smart_mixed_until - now),
+            "has_proxies": any(not c.is_direct for c in clients),
+        }
+
     def acquire_client(self, *, exclude_ids: set[str] | None = None) -> ProxyLease | None:
         """
         Выбирает здоровый или half-open прокси-клиент: сначала по измеренному качеству
@@ -803,6 +924,7 @@ class ProxyPool:
                 return None
 
             n = len(all_clients)
+            server_first = self._evaluate_smart(now, all_clients)
             candidates: list[tuple[float, float, int, ProxyClient]] = []
             for offset in range(n):
                 idx = (self._rr_cursor + offset) % n
@@ -815,7 +937,7 @@ class ProxyPool:
                     # A busy fast channel usually frees up sooner than a throttled idle one becomes ready.
                     queued = max(0, client.in_flight - client.max_in_flight + 1)
                     starts_at = max(now, client._next_request_at) + queued * float(config.PROXY_BUSY_PENALTY)
-                candidates.append((-client.routing_score(now), starts_at, offset, client))
+                candidates.append((-client.routing_score(now, server_first=server_first), starts_at, offset, client))
 
             if not candidates:
                 return None

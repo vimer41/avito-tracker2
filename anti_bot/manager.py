@@ -417,7 +417,7 @@ def solve_pow_challenge(
     except PowSearchError:
         raise
     except Exception as e:
-        logger.error(f"Исключение при решении PoW: {e}")
+        logger.warning(f"Не удалось решить PoW: {str(e)[:200]}")
         return False
 
 
@@ -584,7 +584,7 @@ def solve_geetest_if_available(
     except PowSearchError:
         raise
     except Exception as e:
-        logger.error(f"Исключение при решении GeeTest: {e}")
+        logger.warning(f"Не удалось решить GeeTest: {str(e)[:200]}")
         return False
     finally:
         if owns_geetest_session:

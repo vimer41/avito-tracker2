@@ -47,6 +47,11 @@ class ActionLoggingMiddleware(BaseMiddleware):
         user = data.get("event_from_user")
         if not user:
             return await handler(event, data)
+        try:
+            import database
+            await database.touch_user(user.id)
+        except Exception:
+            pass
 
         state = data.get("state")
         current_state = None

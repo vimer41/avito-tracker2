@@ -288,13 +288,53 @@ def setup_logging():
     # Подавляем шумные технические логи aiogram
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
     logging.getLogger("aiogram.dispatcher").setLevel(logging.WARNING)
+    if not any(isinstance(f, _PollingNoise) for f in logging.getLogger("aiogram.dispatcher").filters):
+        logging.getLogger("aiogram.dispatcher").addFilter(_PollingNoise())
     user_logger.setLevel(logging.INFO)
     metrics_logger.setLevel(logging.INFO)
 
     # A segfault in a native library leaves no Python traceback without this.
     if _crash_file is None:
+        _trim_crash_log()
         _crash_file = open(CRASH_LOG, "a", encoding="utf-8")
         faulthandler.enable(file=_crash_file)
+
+
+class _PollingNoise(logging.Filter):
+    """A Telegram polling timeout that aiogram retries by itself is routine: INFO, not an error to read."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = str(record.msg)
+        if message.startswith("Failed to fetch updates") or message.startswith("Sleep for"):
+            record.levelno, record.levelname = logging.INFO, "INFO"
+        return True
+
+
+CRASH_LOG_MAX_BYTES = 2 * 1024 * 1024
+CRASH_LOG_KEEP_BYTES = 256 * 1024
+STALL_MARK_RE = re.compile(r"^=== зависание .* · epoch (\d+) ===$")
+
+
+def _trim_crash_log() -> None:
+    try:
+        if CRASH_LOG.is_file() and CRASH_LOG.stat().st_size > CRASH_LOG_MAX_BYTES:
+            data = CRASH_LOG.read_bytes()[-CRASH_LOG_KEEP_BYTES:]
+            CRASH_LOG.write_bytes(data[data.find(b"\n") + 1:])
+    except OSError:
+        pass
+
+
+def mark_stall_dump(lag_seconds: float) -> None:
+    """The stack dump faulthandler just wrote has no time: this line after it dates it for the report."""
+    if _crash_file is None:
+        return
+    now = time.time()
+    stamp = time.strftime("%m-%d %H:%M:%S", time.gmtime(now + MSK_OFFSET_SECONDS))
+    try:
+        _crash_file.write(f"=== зависание {stamp} МСК · {lag_seconds:.1f} с · epoch {int(now)} ===\n")
+        _crash_file.flush()
+    except (OSError, ValueError):
+        pass
 
 
 def write_metrics_row(row: dict) -> None:

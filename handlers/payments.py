@@ -166,6 +166,26 @@ async def successful_payment(message: Message, bot: Bot):
         ),
     )
     logger.info("Stars payment fulfilled: order=%s user=%s plan=%s amount=%s", order["id"], order["user_id"], order["tariff_plan"], order["total_amount"])
+    try:
+        await notify_admins(bot, await payment_notice(message, order), order["user_id"])
+    except Exception:
+        logger.warning("Payment notice for admins failed", exc_info=True)
+
+
+async def payment_notice(message: Message, order: dict) -> str:
+    """One message per payment: who, what, how much, first purchase or a renewal."""
+    user = message.from_user
+    name = html.escape(user.full_name or "Без имени")
+    tag = f" @{html.escape(user.username)}" if user.username else ""
+    paid = await database.count_paid_orders(order["user_id"])
+    kind = "первая оплата" if paid <= 1 else f"продление, {paid}-я оплата"
+    return (
+        f"💰 <b>Оплата {order['total_amount']} ⭐</b>\n\n"
+        f"{name}{tag} · <code>{order['user_id']}</code>\n"
+        f"Тариф «{html.escape(config.plan_title(order['tariff_plan']))}» на {order['days']} дн., "
+        f"до {database.format_subscription_date(order['subscription_after'])}\n"
+        f"{kind.capitalize()} · заказ <code>{order['id']}</code>"
+    )
 
 
 @router.message(Command("paysupport"))
@@ -270,6 +290,7 @@ async def refund_payment(call: CallbackQuery, bot: Bot):
         await call.message.answer("Ответ Telegram не получен. Подписка пока не изменена; повторите сверку через 5 минут.")
         return
     result = await billing.complete_refund(order["telegram_payment_charge_id"])
+    await database.log_admin_action(call.from_user.id, order["user_id"], "refund", f"заказ #{order['id']}, {order['total_amount']} ⭐")
     await call.message.answer(f"✅ Возврат {order['total_amount']} ⭐ подтверждён."
                               + (" ⚠️ После платежа подписка менялась: сверить срок вручную в карточке пользователя." if result["refund_needs_review"] else " Продление по этому платежу отменено."))
     try:

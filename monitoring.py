@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 import config
 import database
 import logger_setup
+import scan_journal
 import ui
 from collector import collect_source, settled_item_ids
 from logger_setup import get_trace, log_event, new_trace, set_trace, write_metrics_row
@@ -34,6 +35,8 @@ SLOW_SCAN_MS = 15000
 LOOP_PROBE_SECONDS = 0.25
 LOOP_STALL_SECONDS = 1.0
 STALL_DUMP_SECONDS = 4.0
+LONG_STALL_ALERT_SECONDS = 30.0
+LONG_STALL_ALERT_INTERVAL = 1800.0
 STALL_DUMP_REARM_SECONDS = 1.0
 SOURCE_STATS_SECONDS = 600
 WORKER_CRASH_PAUSE = 1.0
@@ -137,9 +140,10 @@ def log_scan_success(task, collection, channel: str, elapsed_ms: float, http_req
     )
 
 
-async def watch_event_loop() -> None:
+async def watch_event_loop(on_long_stall=None) -> None:
     """Measures how late the loop wakes up. A stall here means something blocked every coroutine."""
     armed_at = 0.0
+    alerted_at = -LONG_STALL_ALERT_INTERVAL
     try:
         while True:
             started = time.monotonic()
@@ -152,6 +156,16 @@ async def watch_event_loop() -> None:
             METRICS.record_loop_lag(lag, stall=stalled)
             if stalled:
                 log_event(logger, logging.WARNING, "loop.stall", f"Event loop завис на {lag:.1f} с", s=round(lag, 2))
+            if lag >= STALL_DUMP_SECONDS:
+                logger_setup.mark_stall_dump(lag)
+                armed_at = 0.0  # the dump fired once: arm it again for the next stall
+            if lag >= LONG_STALL_ALERT_SECONDS and on_long_stall is not None \
+                    and time.monotonic() - alerted_at >= LONG_STALL_ALERT_INTERVAL:
+                alerted_at = time.monotonic()
+                try:
+                    await on_long_stall(lag)
+                except Exception:
+                    logger.warning("Не удалось сообщить о зависании", exc_info=True)
     finally:
         logger_setup.disarm_stall_dump()
 
@@ -262,6 +276,16 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             f"⚠️ Ошибка в коде: «{label}»\n{type(exc).__name__}: {str(exc)[:200]}\n{where}\n\n"
             "Мониторинг не остановлен: остальные ссылки работают, эта повторится позже. "
             "Подробности — в logs/errors.log."
+        )
+
+    async def alert_long_stall(lag: float):
+        system = METRICS.system_now()
+        details = ", ".join(f"{label} {system[key]}" for key, label in (
+            ("load1", "нагрузка"), ("swap_mb", "swap МБ"), ("mem_avail_mb", "свободно памяти МБ")) if key in system)
+        await notify_admins_text(
+            f"⚠️ Бот завис на {lag:.0f} с: все сканы и отправки стояли.\n"
+            + (f"Сервер сейчас: {details}.\n" if details else "")
+            + "Причина — в отчёте для отладки, раздел «Зависания» (Админка → Логи)."
         )
 
     dead_link_warned_at: dict[int, float] = {}
@@ -543,6 +567,22 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             masked_url=scan_client.masked_url if scan_client is not None else "direct",
             failure_kind=None if ok else (last_failure.kind if last_failure else ("unknown" if attempts else "no_channel")),
         )
+        try:
+            scan_journal.record_scan(
+                [radar.get("id") for radar in task.radars],
+                ok=ok,
+                at=collection.captured_at if ok else time.time(),
+                ms=elapsed_ms,
+                channel=collection.channel if ok else ", ".join(attempts)[:80],
+                items=len(collection.items) if ok else 0,
+                pages=pages_fetched,
+                fast=fast_skipped,
+                kind="" if ok else (last_failure.kind if last_failure else ("unknown" if attempts else "no_channel")),
+                detail="" if ok or not last_failure else last_failure.detail,
+                due_lag=due_lag_seconds,
+            )
+        except Exception:
+            logger.debug("Журнал сканов не записан", exc_info=True)
 
         if not ok:
             log_scan_failure(task, last_failure, attempts, elapsed_ms, max(1, total_http_reqs))
@@ -742,6 +782,13 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 full_coverage_age_seconds=planner_snap["full_coverage_age_seconds"],
             )
             cap = metrics_snap["capacity"]
+            note_demand = getattr(pool, "note_demand", None)
+            if callable(note_demand):
+                note_demand(cap.get("required_rps") or plan.requested_rps)
+            pop_alerts = getattr(pool, "pop_alerts", None)
+            if callable(pop_alerts):
+                for text in pop_alerts():
+                    await notify_admins_text(text)
 
             MONITORING_STATS.clear()
             MONITORING_STATS.update(
@@ -825,7 +872,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
 
     tasks = [
         asyncio.create_task(dispatch(), name="scan-dispatcher"),
-        asyncio.create_task(watch_event_loop(), name="loop-watchdog"),
+        asyncio.create_task(watch_event_loop(alert_long_stall), name="loop-watchdog"),
     ]
     tasks.extend(
         asyncio.create_task(fanout_worker(index), name=f"fanout-worker-{index}")

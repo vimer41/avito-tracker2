@@ -227,6 +227,77 @@ class TestChannelRouting(unittest.TestCase):
         lease.release()
 
 
+class TestSmartRouting(TestChannelRouting):
+    """Smart mode: the server scans alone while it copes; proxies wait in reserve without probes."""
+
+    def setUp(self):
+        super().setUp()
+        smart = patch.object(config, "NET_MODE", "smart")
+        smart.start()
+        self.addCleanup(smart.stop)
+
+    # The «both» routing tests do not apply to a server-first pool.
+    test_new_channels_count_as_good_but_server_stays_reserve = None
+    test_proven_proxies_rotate_and_weak_ones_wait = None
+    test_load_above_preferred_rate_spills_to_the_better_reserve = None
+    test_timeouts_drop_a_proxy_and_a_probe_brings_it_back = None
+
+    def test_server_scans_alone_and_idle_proxies_are_not_probed(self):
+        self.settle_channels()
+        self.answer(self.direct, *[200] * 20)  # the server is fine
+        picked = [self.pick(config.PROXY_PROBE_INTERVAL + 1) for _ in range(5)]
+        self.assertEqual(set(picked), {self.direct}, "no proxy gets a probe while the server copes")
+
+    def test_after_a_server_failure_the_best_reserve_proxy_takes_the_retry(self):
+        self.answer(self.direct, *[200] * 10)
+        self.answer(self.good, *[200] * 20)
+        self.answer(self.other, *[200, None] * 10)
+        self.answer(self.weak, *[403] * 20)
+        self.weak._state, self.weak.quarantined_until = "healthy", 0.0
+        first = self.pool.acquire_client()
+        self.assertIs(first.client, self.direct)
+        retry = self.pool.acquire_client(exclude_ids={self.direct.proxy_id})
+        self.assertIs(retry.client, self.good)
+        first.release()
+        retry.release()
+
+    def test_busy_server_lets_one_scan_wait_then_spills_to_a_good_proxy(self):
+        self.answer(self.direct, *[200] * 10)
+        self.answer(self.good, *[200] * 20)
+        leases = [self.pool.acquire_client() for _ in range(3)]
+        self.assertEqual([lease.client for lease in leases[:2]], [self.direct, self.direct])
+        self.assertIs(leases[2].client, self.good)
+        for lease in leases:
+            lease.release()
+
+    def test_high_load_brings_proxies_in_and_they_stay_for_the_hold(self):
+        self.settle_channels()
+        self.answer(self.direct, *[200] * 20)  # the server is fine: only the load decides here
+        self.assertTrue(self.pool.smart_status()["server_first"])
+        self.pool.note_demand(config.SMART_DIRECT_MAX_RPS * 2)
+        self.assertIn(self.pick(1.0), {self.good, self.other}, "proven proxies lead as in «both»")
+        self.pool.note_demand(0.05)
+        self.assertNotEqual(self.pick(1.0), self.direct, "proxies stay in work for the hold")
+        self.clock.now += config.SMART_HOLD_SECONDS
+        self.assertIs(self.pick(1.0), self.direct)
+        self.assertTrue(self.pool.smart_status()["server_first"])
+
+    def test_blocked_server_brings_proxies_in(self):
+        self.settle_channels()
+        self.answer(self.direct, *[403, 200] * 10)
+        status = self.pool.smart_status()
+        self.assertFalse(status["server_first"])
+        self.assertIn("блокирует сервер: 50%", status["reason"])
+        self.assertIn(self.pick(1.0), {self.good, self.other})
+
+    def test_other_modes_never_put_the_server_first(self):
+        self.answer(self.direct, *[200] * 10)
+        self.direct.last_acquired_at = self.clock.now  # no probe of the server is due
+        with patch.object(config, "NET_MODE", "both"):
+            self.assertFalse(self.pool.smart_status()["server_first"])
+            self.assertNotEqual(self.pick(0.0), self.direct)
+
+
 class TestBatchedRadarEligibility(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()

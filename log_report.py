@@ -318,10 +318,88 @@ def _compact(row: dict) -> str:
     return f"{row.get('ts')} {row.get('l')} {row.get('c')} {row.get('id', '····')} {row.get('ev', '')} {text} {tail}".rstrip()
 
 
-def _crash_tail() -> list[str]:
+STALL_MARK = re.compile(r"^=== зависание (.*) · ([\d.]+) с · epoch (\d+) ===$")
+CRASH_DUMPS_SHOWN = 4
+CRASH_STACK_LINES = 14
+
+
+def _main_thread(chunk: list[str]) -> list[str]:
+    """The event loop thread is the one running asyncio; the other threads are idle pools."""
+    blocks, current = [], []
+    for line in chunk:
+        if line.startswith(("Thread 0x", "Current thread 0x")) and current:
+            blocks.append(current)
+            current = []
+        current.append(line)
+    if current:
+        blocks.append(current)
+    main = next((b for b in reversed(blocks) if any("asyncio" in line or "bot.py" in line for line in b)), blocks[-1] if blocks else [])
+    frames = [line for line in main if line.strip()]
+    return frames[:CRASH_STACK_LINES]
+
+
+def _crash_tail(since: float = 0.0) -> list[str]:
+    """Dated stall dumps of the period, main thread only. Dumps without a date predate the marks and are skipped,
+    except a native crash (Fatal Python error) written during the period."""
     if not CRASH_LOG.is_file() or CRASH_LOG.stat().st_size == 0:
         return []
-    return CRASH_LOG.read_text(encoding="utf-8", errors="replace")[-6000:].splitlines()
+    lines = CRASH_LOG.read_text(encoding="utf-8", errors="replace")[-200000:].splitlines()
+    dumps, chunk = [], []
+    for line in lines:
+        mark = STALL_MARK.match(line.strip())
+        if mark:
+            if int(mark.group(3)) >= since:
+                dumps.append([f"{mark.group(1)} · пауза {mark.group(2)} с", *("  " + l for l in _main_thread(chunk))])
+            chunk = []
+        else:
+            chunk.append(line)
+    if any("Fatal Python error" in line for line in chunk) and CRASH_LOG.stat().st_mtime >= since:
+        dumps.append(["Падение (Fatal Python error) в конце файла:", *("  " + l for l in chunk[-CRASH_STACK_LINES:])])
+    result = [line for dump in dumps[-CRASH_DUMPS_SHOWN:] for line in dump]
+    if len(dumps) > CRASH_DUMPS_SHOWN:
+        result.insert(0, f"Показаны последние {CRASH_DUMPS_SHOWN} из {len(dumps)} дампов.")
+    return result
+
+
+def _stall_rows(metrics: list[dict]) -> list[dict]:
+    return [row for row in metrics if (row.get("loop_max_ms") or 0) >= LONG_STALL_MS]
+
+
+def stall_cause(rows: list[dict]) -> str:
+    """The likely reason for long stalls from the server numbers of those minutes."""
+    measured = [row for row in rows if "steal" in row]
+    if not rows:
+        return ""
+    if not measured:
+        return "системных цифр нет: бот старой версии или не на Linux"
+    steal = max(row.get("steal") or 0 for row in measured)
+    iowait = max(row.get("iowait") or 0 for row in measured)
+    swap_in = max(row.get("swap_in") or 0 for row in measured)
+    server = max(row.get("sys_cpu") or 0 for row in measured)
+    own = max(row.get("cpu_pct") or 0 for row in measured)
+    if steal >= 20:
+        return f"хостинг забирает процессор (steal до {steal:g}%): поможет только другой сервер"
+    if iowait >= 20 or swap_in >= 100:
+        return f"сервер ждёт диск и подкачку (iowait до {iowait:g}%, swap-in {swap_in}): не хватает памяти"
+    if server >= 90 and own >= 70:
+        return f"процессор занят самим ботом ({own:g}%): тяжёлая работа в основном потоке, стек — в crash.log"
+    if server >= 90:
+        return f"процессор занят другими программами на сервере (всего {server:g}%, бот {own:g}%)"
+    return "сервер в эти минуты не перегружен: код бота держит поток, стек — в crash.log"
+
+
+def _stall_lines(metrics: list[dict]) -> list[str]:
+    rows = _stall_rows(metrics)
+    if not rows:
+        return []
+    lines = [f"Причина, похоже: {stall_cause(rows)}", "минута · пауза · cpu бота · cpu сервера · iowait · steal · swap-in · свободно МБ"]
+    for row in rows[-12:]:
+        lines.append(
+            f"{row.get('ts')} · {(row.get('loop_max_ms') or 0) / 1000:.1f} с · {row.get('cpu_pct', '—')}% · "
+            f"{row.get('sys_cpu', '—')}% · {row.get('iowait', '—')}% · {row.get('steal', '—')}% · "
+            f"{row.get('swap_in', '—')} · {row.get('mem_avail_mb', '—')}"
+        )
+    return lines
 
 
 def _section(title: str, lines: list[str]) -> list[str]:
@@ -346,7 +424,10 @@ def build_report(minutes: int = 60, live_state: Optional[dict] = None) -> str:
     lines += _section("Антибот", _challenges(metrics))
     lines += _section("Воронка лотов", [_funnel(metrics)])
     lines += _section("Ошибки и предупреждения", _error_groups(events))
-    crash = _crash_tail()
+    stalls = _stall_lines(metrics)
+    if stalls:
+        lines += _section("Зависания", stalls)
+    crash = _crash_tail(since)
     if crash:
         lines += _section("crash.log", crash)
     lines += _section(
@@ -378,7 +459,8 @@ def _bot_waits(lots: list[dict]) -> list[float]:
 
 
 def _safe_capacity_share(metrics: list[dict]) -> float:
-    """Share of minutes when proven proxies alone cover the load at the safe per-IP rate, with a 20 % reserve."""
+    """Share of minutes when proven channels cover the load at the safe per-IP rate, with a 20 % reserve.
+    The server IP counts as one channel: in smart mode it carries the load alone and idle proxies prove nothing."""
     covered = total = 0
     for start in range(0, len(metrics), CAPACITY_WINDOW_MIN):
         window = metrics[start:start + CAPACITY_WINDOW_MIN]
@@ -386,8 +468,8 @@ def _safe_capacity_share(metrics: list[dict]) -> float:
         if not needs:
             continue
         good = sum(
-            1 for name, stats in _channels(window).items()
-            if name != "direct" and stats.get("http", 0) >= 3 and stats.get("ok", 0) / stats["http"] >= GOOD_CHANNEL_OK
+            1 for stats in _channels(window).values()
+            if stats.get("http", 0) >= 3 and stats.get("ok", 0) / stats["http"] >= GOOD_CHANNEL_OK
         )
         total += len(needs)
         covered += len(needs) if good * SAFE_RPS_PER_IP >= max(needs) * 1.2 else 0
@@ -406,7 +488,7 @@ def readiness_checks(metrics: list[dict], events: list[dict], hours: int) -> lis
     def add(mark: str, name: str, value: str, norm: str) -> None:
         checks.append(f"{mark} {name}: {value} (норма: {norm})")
 
-    seen = len(metrics) / (hours * 60)
+    seen = min(1.0, len(metrics) / (hours * 60))
     crashes = sum("УПАЛ" in line for line in _restarts(events))
     mark = "⏳" if seen < 0.8 else "❌" if crashes else _grade(seen, 0.99, 0.95)
     add(mark, "Работа без перерывов", f"{seen:.1%} времени, падений {crashes}", "99 % и 0 падений")
@@ -432,11 +514,13 @@ def readiness_checks(metrics: list[dict], events: list[dict], hours: int) -> lis
     mark = _grade(lost / (sent + lost), 0.005, 0.02) if sent + lost else "⏳"
     add("⚠️" if mark == "✅" and flood else mark, "Доставка", f"отправлено {sent}, потеряно {lost}, flood-wait {flood}", "потери до 0,5 %, без flood-wait")
 
-    long_stalls = sum(1 for row in metrics if (row.get("loop_max_ms") or 0) >= LONG_STALL_MS)
-    add(_grade(long_stalls, 0, 2), "Зависания бота", f"{long_stalls} минут с паузой от {LONG_STALL_MS // 1000} с", "0")
+    stall_rows = _stall_rows(metrics)
+    long_stalls = len(stall_rows)
+    cause = f" · похоже: {stall_cause(stall_rows)}" if stall_rows else ""
+    add(_grade(long_stalls, 0, 2), "Зависания бота", f"{long_stalls} минут с паузой от {LONG_STALL_MS // 1000} с{cause}", "0")
 
     capacity = _safe_capacity_share(metrics)
-    add(_grade(capacity, 0.95, 0.8) if metrics else "⏳", "Запас хороших прокси", f"хватает {capacity:.0%} минут",
+    add(_grade(capacity, 0.95, 0.8) if metrics else "⏳", "Запас хороших каналов", f"хватает {capacity:.0%} минут",
         f"95 % минут при {SAFE_RPS_PER_IP} запр/с на IP и запасе 20 %")
     return checks
 
@@ -592,7 +676,10 @@ def build_readiness(hours: int = 24, live_state: Optional[dict] = None) -> str:
     if live_state:
         lines += _section("Состояние сейчас", [json.dumps(live_state, ensure_ascii=False, default=str)])
     lines += _section("Ошибки и предупреждения", _error_groups(events))
-    crash = _crash_tail()
+    stalls = _stall_lines(metrics)
+    if stalls:
+        lines += _section("Зависания", stalls)
+    crash = _crash_tail(now - hours * 3600)
     if crash:
         lines += _section("crash.log", crash)
     return "\n".join(lines)
@@ -603,7 +690,7 @@ def select(rows: list[dict], trace: str = "", radar: int = 0, chat: int = 0, tex
         fields = row.get("f") or {}
         if trace and row.get("id") != trace:
             return False
-        if radar and radar != fields.get("radar") and radar not in (fields.get("rids") or ()):
+        if radar and radar not in (fields.get("radar"), fields.get("rid")) and radar not in (fields.get("rids") or ()):
             return False
         if chat and chat != fields.get("chat"):
             return False

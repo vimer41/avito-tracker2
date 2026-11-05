@@ -877,7 +877,40 @@ class RuntimeMetricsRegistry:
             stats["load1"] = round(os.getloadavg()[0], 2)
         except (OSError, AttributeError, ValueError):
             pass  # not Linux
+        stats.update(self._system_deltas())
         return stats
+
+    def _system_deltas(self) -> dict[str, Any]:
+        """Whole-server CPU split since the previous call: busy, waiting for the disk, taken by the host (steal),
+        and pages swapped in/out. Tells a slow server from slow code when the loop stalls. Linux only."""
+        current = _read_cpu_and_swap()
+        if current is None:
+            return {}
+        previous, self._sys_mark = getattr(self, "_sys_mark", None), current
+        out = _read_memory()
+        if previous is None:
+            return out
+        cpu_now, cpu_before = current["cpu"], previous["cpu"]
+        total = max(1, sum(cpu_now) - sum(cpu_before))
+        delta = [now - before for now, before in zip(cpu_now, cpu_before)]
+        # /proc/stat: user nice system idle iowait irq softirq steal
+        out.update(
+            sys_cpu=round(100.0 * (delta[0] + delta[1] + delta[2] + delta[5] + delta[6]) / total, 1),
+            iowait=round(100.0 * delta[4] / total, 1),
+            steal=round(100.0 * delta[7] / total, 1) if len(delta) > 7 else 0.0,
+            swap_in=max(0, current["pswpin"] - previous["pswpin"]),
+            swap_out=max(0, current["pswpout"] - previous["pswpout"]),
+        )
+        return out
+
+    def system_now(self) -> dict[str, Any]:
+        """Instant server state for an alert: load, swap in use, available memory."""
+        out = _read_memory()
+        try:
+            out["load1"] = round(os.getloadavg()[0], 2)
+        except (OSError, AttributeError):
+            pass
+        return out
 
     def pop_minute_rows(self) -> list[dict[str, Any]]:
         """Finished minutes not yet returned, oldest first. Each is one row of logs/metrics.jsonl."""
@@ -1480,6 +1513,36 @@ def short_channel(proxy_id: str, masked_url: str | None = None) -> str:
     return sanitize_proxy_credentials(masked_url or proxy_id).split("@", 1)[-1].split("://", 1)[-1] or proxy_id
 
 
+def _read_cpu_and_swap() -> dict[str, Any] | None:
+    try:
+        with open("/proc/stat", encoding="ascii") as stat:
+            cpu = [int(value) for value in stat.readline().split()[1:9]]
+        swap = {"pswpin": 0, "pswpout": 0}
+        with open("/proc/vmstat", encoding="ascii") as vmstat:
+            for line in vmstat:
+                key, _, value = line.partition(" ")
+                if key in swap:
+                    swap[key] = int(value)
+    except (OSError, ValueError):
+        return None
+    return {"cpu": cpu, **swap}
+
+
+def _read_memory() -> dict[str, Any]:
+    try:
+        fields = {}
+        with open("/proc/meminfo", encoding="ascii") as meminfo:
+            for line in meminfo:
+                key, _, value = line.partition(":")
+                fields[key] = int(value.split()[0])
+        return {
+            "mem_avail_mb": round(fields["MemAvailable"] / 1024),
+            "swap_mb": round((fields["SwapTotal"] - fields["SwapFree"]) / 1024),
+        }
+    except (OSError, ValueError, KeyError, IndexError):
+        return {}
+
+
 def format_minute_line(row: dict[str, Any]) -> str:
     """The minute's vitals in one line of bot.log."""
     scans = row["scans"]
@@ -1507,6 +1570,10 @@ def format_minute_line(row: dict[str, Any]) -> str:
         parts.append(f"{row['rss_mb']:g} МБ")
     if "cpu_pct" in row:
         parts.append(f"cpu {row['cpu_pct']:g}%")
+    if row.get("steal") or row.get("iowait"):
+        parts.append(f"steal {row.get('steal', 0):g}% iowait {row.get('iowait', 0):g}%")
+    if row.get("swap_in"):
+        parts.append(f"swap-in {row['swap_in']}")
     return " · ".join(parts)
 
 
