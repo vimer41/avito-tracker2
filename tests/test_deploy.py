@@ -30,7 +30,7 @@ class TestDeployScript(unittest.TestCase):
     def run_deploy(self, *, fail_tests=False, fail_service=False, stale=False,
                    posix_shell=False, test_timeout=False, python_fallback=False,
                    unsupported_python=False, full_tests=None, preflight_failure="", stars_enabled=None,
-                   stop_before_preflight=None):
+                   stop_before_preflight=None, platega=None):
         with tempfile.TemporaryDirectory(prefix="avito-deploy-test-") as temporary:
             directory = Path(temporary)
             project = directory / "project"
@@ -103,11 +103,16 @@ fi
 if [[ -n "$PREFLIGHT_FAILURE" && "$*" == *"$PREFLIGHT_FAILURE"* ]]; then exit 19; fi
 if [[ "$*" == *run_offline_tests.py* ]]; then
   echo "test-runtime testing=$AVITO_RADAR_TESTING no_pyc=$PYTHONDONTWRITEBYTECODE openblas=$OPENBLAS_NUM_THREADS omp=$OMP_NUM_THREADS mkl=$MKL_NUM_THREADS" >> "$MOCK_ROOT/events"
+  echo "test-sees-platega=${DEPLOY_PLATEGA_SECRET:-}${PLATEGA_SECRET:-}" >> "$MOCK_ROOT/events"
   exit "$TEST_EXIT_CODE"
 fi
 if [[ "$*" == *configure_stars.py* ]]; then
   echo "BOT_TOKEN=fixture-secret" > "$DEPLOY_TARGET_DIR/.env"
   echo "STARS_PAYMENTS_ENABLED=$DEPLOY_STARS_PAYMENTS_ENABLED" >> "$DEPLOY_TARGET_DIR/.env"
+fi
+if [[ "$*" == *configure_platega.py* ]]; then
+  echo "PLATEGA_MERCHANT_ID=$PLATEGA_MERCHANT_ID" >> "$DEPLOY_TARGET_DIR/.env"
+  echo "platega-secret-received=${PLATEGA_SECRET:+yes}" >> "$MOCK_ROOT/events"
 fi
 if [[ "$*" == *cleanup_releases.py* ]]; then
   echo "retention-executed" >> "$MOCK_ROOT/events"
@@ -137,6 +142,10 @@ if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT
             env.pop("DEPLOY_STARS_PAYMENTS_ENABLED", None)
             if stars_enabled is not None:
                 env["DEPLOY_STARS_PAYMENTS_ENABLED"] = stars_enabled
+            for name in ("DEPLOY_PLATEGA_MERCHANT_ID", "DEPLOY_PLATEGA_SECRET", "PLATEGA_MERCHANT_ID", "PLATEGA_SECRET"):
+                env.pop(name, None)
+            if platega is not None:
+                env["DEPLOY_PLATEGA_MERCHANT_ID"], env["DEPLOY_PLATEGA_SECRET"] = platega
             if posix_shell:
                 wrapper = directory / "wrapper.sh"
                 wrapper.write_text("bash -s <<'AVITO_DEPLOY_SCRIPT'\n" + (ROOT / "tools/deploy.sh").read_text(encoding="utf-8") + "\nAVITO_DEPLOY_SCRIPT\n", encoding="utf-8", newline="\n")
@@ -297,6 +306,41 @@ if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT
         self.assertEqual(head, OLD_SHA)
         self.assertNotIn("systemctl stop", events)
 
+    def test_platega_keys_reach_only_the_runtime_env(self):
+        result, head, events, _, _ = self.run_deploy(full_tests="1", platega=("merchant-uuid-1234", "secretvalue12345"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(head, TEST_SHA)
+        self.assertLess(events.index("backup-created"), events.index("configure_platega.py"))
+        self.assertLess(events.index("configure_platega.py"), events.index("systemctl start"))
+        self.assertIn("platega-secret-received=yes", events)
+        self.assertIn("test-sees-platega=\n", events, "tests and pip never inherit the keys")
+        self.assertIn("PLATEGA_MERCHANT_ID=merchant-uuid-1234", events.split("runtime-env:")[1])
+        self.assertNotIn("secretvalue12345", result.stdout + result.stderr + events)
+
+    def test_one_platega_secret_alone_changes_nothing(self):
+        result, head, events, _, _ = self.run_deploy(full_tests="0", platega=("merchant-uuid-1234", ""))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("configure_platega.py", events)
+        self.assertIn("Only one Platega secret is set", result.stdout)
+        self.assertIn("runtime-env:BOT_TOKEN=fixture-secret\nSTARS_PAYMENTS_ENABLED=0\n", events)
+
+    def test_invalid_platega_secret_never_stops_running_bot(self):
+        result, head, events, _, _ = self.run_deploy(full_tests="0", platega=("merchant id", "secret'value123"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(head, OLD_SHA)
+        self.assertNotIn("build-env", events)
+        self.assertNotIn("systemctl stop", events)
+        self.assertIn("Invalid Platega secret format", result.stdout)
+        self.assertNotIn("secret'value123", result.stdout + result.stderr)
+
+    def test_failed_activation_restores_the_env_without_new_keys(self):
+        result, head, events, _, _ = self.run_deploy(full_tests="0", fail_service=True,
+                                                     platega=("merchant-uuid-1234", "secretvalue12345"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(head, OLD_SHA)
+        self.assertIn("configure_platega.py", events)
+        self.assertEqual(events.split("runtime-env:")[1], "BOT_TOKEN=fixture-secret\nSTARS_PAYMENTS_ENABLED=0\n")
+
     def test_stop_before_preflight_stops_service_early_and_deploys_successfully(self):
         result, head, events, old_environment, release_count = self.run_deploy(full_tests="0", stop_before_preflight="1")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -325,6 +369,31 @@ if [[ "$*" == "-B -" ]]; then cat >/dev/null; echo backup-created >> "$MOCK_ROOT
         self.assertEqual(head, OLD_SHA)
         self.assertIn("DEPLOY_STOP_BEFORE_PREFLIGHT must be 0 or 1", result.stdout)
         self.assertNotIn("systemctl stop", events)
+
+
+class TestConfigurePlatega(unittest.TestCase):
+    MERCHANT = "32d0abf7-fb7e-48f2-87b4-306c426a84a4"
+
+    def test_keys_replace_old_lines_and_keep_everything_else(self):
+        from tools.configure_platega import configure
+        with tempfile.TemporaryDirectory() as temporary:
+            env_file = Path(temporary) / ".env"
+            env_file.write_text("BOT_TOKEN=x\nexport PLATEGA_SECRET=old-value-1\nPROXY_URL=y\n", encoding="utf-8")
+            values = {"PLATEGA_MERCHANT_ID": self.MERCHANT, "PLATEGA_SECRET": "a1" * 50}
+            self.assertTrue(configure(env_file, values))
+            self.assertEqual(env_file.read_text(encoding="utf-8"),
+                             f"BOT_TOKEN=x\nPROXY_URL=y\nPLATEGA_MERCHANT_ID={self.MERCHANT}\nPLATEGA_SECRET={'a1' * 50}\n")
+            self.assertFalse(configure(env_file, values), "the same keys do not rewrite the file")
+
+    def test_unsafe_values_are_rejected_and_the_file_is_untouched(self):
+        from tools.configure_platega import configure
+        with tempfile.TemporaryDirectory() as temporary:
+            env_file = Path(temporary) / ".env"
+            env_file.write_text("BOT_TOKEN=x\n", encoding="utf-8")
+            for bad in ("", "short", "with space 123", "quote'value12", "dollar$value12", "hash#value1234", "line\nbreak123"):
+                with self.assertRaises(ValueError):
+                    configure(env_file, {"PLATEGA_MERCHANT_ID": self.MERCHANT, "PLATEGA_SECRET": bad})
+            self.assertEqual(env_file.read_text(encoding="utf-8"), "BOT_TOKEN=x\n")
 
 
 if __name__ == "__main__":

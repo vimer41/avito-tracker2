@@ -12,6 +12,24 @@ DEPLOY_STOP_BEFORE_PREFLIGHT="${DEPLOY_STOP_BEFORE_PREFLIGHT:-0}"
 [[ "$DEPLOY_STOP_BEFORE_PREFLIGHT" == 0 || "$DEPLOY_STOP_BEFORE_PREFLIGHT" == 1 ]] || { echo "DEPLOY_STOP_BEFORE_PREFLIGHT must be 0 or 1"; exit 1; }
 DEPLOY_STARS_PAYMENTS_ENABLED="${DEPLOY_STARS_PAYMENTS_ENABLED:-}"
 [[ -z "$DEPLOY_STARS_PAYMENTS_ENABLED" || "$DEPLOY_STARS_PAYMENTS_ENABLED" == 0 || "$DEPLOY_STARS_PAYMENTS_ENABLED" == 1 ]] || { echo "Invalid Stars enable flag"; exit 1; }
+# Platega keys from GitHub secrets. Kept in non-exported shell variables, so tests, pip and the bot
+# never inherit them; only configure_platega.py receives them. Both or none: one alone changes nothing.
+PLATEGA_ID_VALUE="${DEPLOY_PLATEGA_MERCHANT_ID:-}"
+PLATEGA_SECRET_VALUE="${DEPLOY_PLATEGA_SECRET:-}"
+unset DEPLOY_PLATEGA_MERCHANT_ID DEPLOY_PLATEGA_SECRET
+PLATEGA_KEYS=0
+# Length is checked apart: some regex engines refuse a {8,256} bound (RE_DUP_MAX is 255 there).
+PLATEGA_SAFE_VALUE='^[A-Za-z0-9._~+/=:-]+$'
+if [[ -n "$PLATEGA_ID_VALUE" && -n "$PLATEGA_SECRET_VALUE" ]]; then
+    for platega_value in "$PLATEGA_ID_VALUE" "$PLATEGA_SECRET_VALUE"; do
+        [[ "$platega_value" =~ $PLATEGA_SAFE_VALUE ]] && (( ${#platega_value} >= 8 && ${#platega_value} <= 256 )) \
+            || { echo "Invalid Platega secret format: expected 8-256 characters without spaces, quotes, # or \$"; exit 1; }
+    done
+    unset platega_value
+    PLATEGA_KEYS=1
+elif [[ -n "$PLATEGA_ID_VALUE" || -n "$PLATEGA_SECRET_VALUE" ]]; then
+    echo "Only one Platega secret is set; runtime Platega keys left unchanged"
+fi
 DEPLOY_CLEANUP="${DEPLOY_CLEANUP:-1}"
 [[ "$DEPLOY_CLEANUP" == 0 || "$DEPLOY_CLEANUP" == 1 ]] || { echo "DEPLOY_CLEANUP must be 0 or 1"; exit 1; }
 
@@ -43,7 +61,7 @@ PREVIOUS_ENV=""
 WAS_ACTIVE=0
 STOPPED_EARLY=0
 CHANGED=0
-STARS_CONFIG_CHANGED=0
+ENV_CONFIG_CHANGED=0
 HAD_ENV_FILE=0
 systemctl is-active --quiet avito-bot && WAS_ACTIVE=1
 
@@ -82,7 +100,7 @@ rollback() {
                 mv "$PREVIOUS_ENV" "$TARGET_DIR/venv" || true
             fi
         fi
-        if [[ "$STARS_CONFIG_CHANGED" == 1 ]]; then
+        if [[ "$ENV_CONFIG_CHANGED" == 1 ]]; then
             if [[ "$HAD_ENV_FILE" == 1 ]]; then
                 cp -p "$STAGE_DIR/runtime.env.before" "$TARGET_DIR/.env" || true
             else
@@ -208,7 +226,7 @@ else
 fi
 
 # No user deletion or log scrubbing. Backup is read-only and precedes migrations.
-if [[ -n "$DEPLOY_STARS_PAYMENTS_ENABLED" ]]; then
+if [[ -n "$DEPLOY_STARS_PAYMENTS_ENABLED" || "$PLATEGA_KEYS" == 1 ]]; then
     [[ ! -L "$TARGET_DIR/.env" ]] || { echo "Symlinked runtime .env cannot be changed"; exit 1; }
     if [[ -f "$TARGET_DIR/.env" ]]; then
         cp -p "$TARGET_DIR/.env" "$STAGE_DIR/runtime.env.before"
@@ -249,9 +267,14 @@ fi
 ENV_CHANGED=1
 ln -s "$NEW_ENV" "$TARGET_DIR/venv"
 if [[ -n "$DEPLOY_STARS_PAYMENTS_ENABLED" ]]; then
-    STARS_CONFIG_CHANGED=1
+    ENV_CONFIG_CHANGED=1
     "$NEW_ENV/bin/python" -B "$STAGE_DIR/tools/configure_stars.py" --env-file "$TARGET_DIR/.env" \
         --enabled "$DEPLOY_STARS_PAYMENTS_ENABLED" --standart "${DEPLOY_STARS_PRICE_STANDART:-170}" --pro "${DEPLOY_STARS_PRICE_PRO:-470}"
+fi
+if [[ "$PLATEGA_KEYS" == 1 ]]; then
+    ENV_CONFIG_CHANGED=1
+    PLATEGA_MERCHANT_ID="$PLATEGA_ID_VALUE" PLATEGA_SECRET="$PLATEGA_SECRET_VALUE" \
+        "$NEW_ENV/bin/python" -B "$STAGE_DIR/tools/configure_platega.py" --env-file "$TARGET_DIR/.env"
 fi
 if [[ -z "${MOCK_ROOT:-}" ]]; then
     systemctl enable avito-bot 2>/dev/null || true
