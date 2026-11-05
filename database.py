@@ -3614,7 +3614,8 @@ async def count_sent_lots(user_id: int, since_epoch: float, until_epoch: float) 
     return int(row[0]) if row else 0
 
 
-async def grant_subscription_in_transaction(db, user_id: int, days: int, tariff_plan: Optional[str] = None) -> str:
+async def grant_subscription_in_transaction(db, user_id: int, days: int, tariff_plan: Optional[str] = None,
+                                           seconds: Optional[int] = None) -> str:
     """Shared atomic update; the caller owns the transaction and commit."""
     if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
         raise ValueError("days must be a positive integer")
@@ -3640,12 +3641,12 @@ async def grant_subscription_in_transaction(db, user_id: int, days: int, tariff_
         UPDATE users
         SET subscription_until = datetime(
                 CASE WHEN subscription_until > datetime('now') THEN subscription_until ELSE datetime('now') END,
-                '+' || ? || ' days'),
+                '+' || ? || ?),
             tariff_plan = COALESCE(?, tariff_plan),
             is_allowed = 1, trial_used = 1,
             subscription_revision = subscription_revision + 1
         WHERE user_id = ?
-    """, (days, effective_plan, user_id))
+    """, (int(seconds), " seconds", effective_plan, user_id) if seconds else (days, " days", effective_plan, user_id))
     if cursor.rowcount != 1:
         raise ValueError("Пользователь не найден")
     await sync_radar_limit_in_transaction(db, user_id)

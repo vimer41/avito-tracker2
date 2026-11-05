@@ -376,8 +376,9 @@ async def cmd_subscription_menu(event):
         f"{plan_card('pro')}\n\n"
         "На всех тарифах: стоп-слова, фильтр цены, чёрный список продавцов, ночной режим.\n\n"
         "<blockquote>Чем чаще проверка, тем раньше вы увидите лот и успеете написать первым.</blockquote>\n"
-        f"Оплата разовая на 1 или 3 месяца, без автосписаний. За 3 месяца{period_discount_text(3)}. "
-        "Оплаченные дни добавляются к текущему сроку."
+        + (f"Оплата разовая на 1 или 3 месяца, без автосписаний. За 3 месяца{period_discount_text(3)}. "
+           if 3 in config.SALE_PERIOD_MONTHS else "Оплата разовая на месяц, без автосписаний. ")
+        + "Оплаченные дни добавляются к текущему сроку."
     )
 
     rows = []
@@ -437,7 +438,7 @@ async def cb_select_tariff(call: CallbackQuery):
         await cmd_subscription_menu(call)
         return
     is_test = tariff_key == "test"
-    if is_test or months not in config.PERIOD_MONTHS:
+    if is_test or months not in config.SALE_PERIOD_MONTHS:
         months = 1
     title = config.plan_title(tariff_key)
     stars = config.stars_price(tariff_key, months)
@@ -452,6 +453,8 @@ async def cb_select_tariff(call: CallbackQuery):
     if not is_test and months > 1:
         saved = config.rub_price(tariff_key) * months - config.rub_price(tariff_key, months)
         saving = f" <i>(выгода {saved} ₽)</i>" if saved > 0 else ""
+    if not is_test and config.STARS_PAYMENTS_ENABLED:
+        price_label += f" или {stars} ⭐"
     text = (
         f"{plan_icon(plan)} <b>Тариф «{title}»</b> — {price_label} за {period_label}{saving}\n\n"
         f"• До <b>{radars_word(config.plan_radars(plan))}</b>\n"
@@ -469,17 +472,19 @@ async def cb_select_tariff(call: CallbackQuery):
     )
 
     rows = []
-    if not is_test:
+    if not is_test and len(config.SALE_PERIOD_MONTHS) > 1:
         rows.append([
             ui.btn(("✓ " if m == months else "") + config.period_title(m) + period_discount_text(m),
                    callback_data=f"buy_tariff:{tariff_key}:{m}", style="primary" if m == months else None)
-            for m in config.PERIOD_MONTHS
+            for m in config.SALE_PERIOD_MONTHS
         ])
-        rows.extend(rub_payments.method_buttons(tariff_key, months, config.rub_price(tariff_key, months)))
+    # Payment methods: plain buttons in a 2×2 grid (СБП · Карта / Крипта · Stars).
+    pay_buttons = [] if is_test else rub_payments.method_buttons(tariff_key, months)
     if config.STARS_PAYMENTS_ENABLED:
-        rows.append([ui.btn(f"Telegram Stars — {stars} ⭐", "star",
-                            callback_data=f"stars_buy:{tariff_key}:{months}:{stars}")])
-    else:
+        pay_buttons.append(ui.btn(f"Telegram Stars — {stars} ⭐" if is_test else "Stars", "star",
+                                  callback_data=f"stars_buy:{tariff_key}:{months}:{stars}"))
+    rows.extend(pay_buttons[i:i + 2] for i in range(0, len(pay_buttons), 2))
+    if not config.STARS_PAYMENTS_ENABLED:
         text += "\n\n⏸ Оплата Telegram Stars временно выключена."
     rows.append([
         ui.btn("« Все тарифы", callback_data="open_subscription_menu"),
@@ -498,6 +503,9 @@ async def cb_pay_method(call: CallbackQuery, bot: Bot):
     method = parts[1] if len(parts) > 1 else ""
     if config.PLATEGA_ENABLED and method in rub_payments.METHODS and len(parts) > 2:
         months = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
+        if months not in config.SALE_PERIOD_MONTHS:
+            await call.answer("Такого срока сейчас нет. Откройте тариф заново.", show_alert=True)
+            return
         if not call.message or call.message.chat.type != "private":
             await call.answer("Оплата доступна только в личном чате с ботом.", show_alert=True)
             return

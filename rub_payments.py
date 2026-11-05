@@ -119,6 +119,8 @@ def link_deadline(order: dict) -> float:
 
 
 def order_title(order: dict) -> str:
+    if order["tariff_plan"] == config.RUB_TEST_PLAN:
+        return "Тест оплаты · 1 час «Полного»"
     return f"{config.plan_title(order['tariff_plan'])} · {config.period_title(config.period_months(order['days']))}"
 
 
@@ -126,10 +128,13 @@ def method_title(order: dict) -> str:
     return METHODS.get(order.get("payment_method") or "", ("Platega", ""))[0]
 
 
-def method_buttons(plan: str, months: int, amount: int) -> list[list[InlineKeyboardButton]]:
-    return [[ui.btn(f"{title} — {amount} ₽", icon, callback_data=f"pay_method:{key}:{plan}:{months}",
-                    style="success" if key == "sbp" else None)]
-            for key, (title, icon) in METHODS.items()]
+SHORT_TITLES = {"sbp": "СБП", "card": "Карта", "crypto": "Крипта"}
+
+
+def method_buttons(plan: str, months: int) -> list[InlineKeyboardButton]:
+    """Plain (uncoloured) ruble buttons with short labels; the price is in the screen text."""
+    return [ui.btn(SHORT_TITLES[key], icon, callback_data=f"pay_method:{key}:{plan}:{months}")
+            for key, (_title, icon) in METHODS.items()]
 
 
 def next_check_at(order: dict, now: float | None = None) -> float | None:
@@ -489,7 +494,7 @@ async def _alert(bot: Bot, order: dict, text: str):
 
 async def _on_paid(bot: Bot, order: dict):
     await _edit_invoice(bot, order, f"{ui.e('ok')} <b>Счёт на {rub(order['amount'])} ₽ оплачен</b>", with_pay=None)
-    plan = order["tariff_plan"]
+    plan = config.order_plan(order["tariff_plan"])
     paused = await database.count_limit_paused(order["user_id"])
     notes = f"\nНе вошли в лимит тарифа и стоят на паузе радаров: {paused}." if paused else ""
     try:
@@ -497,7 +502,9 @@ async def _on_paid(bot: Bot, order: dict):
             order["user_id"],
             f"{ui.e('ok')} <b>Оплата {rub(order['amount'])} ₽ прошла</b>\n\n"
             f"Тариф <b>«{config.plan_title(plan)}»</b>, радаров до {await database.get_user_max_radars(order['user_id'])}.\n"
-            f"+{config.plural(order['days'], 'день', 'дня', 'дней')}, "
+            + ("+1 час, " if order["tariff_plan"] == config.RUB_TEST_PLAN
+               else f"+{config.plural(order['days'], 'день', 'дня', 'дней')}, ")
+            + 
             f"действует до {database.format_subscription_date(order['subscription_after'])}.\n"
             f"Заказ <code>R{order['id']}</code>, без автосписания. Вопросы: /paysupport.{notes}",
             reply_markup=ui.kb(
@@ -546,7 +553,7 @@ async def build_evidence(order_id: int, bot_username: str = "") -> tuple[str, by
     if not order:
         return None
     user = await database.get_user(order["user_id"]) or {}
-    plan = order["tariff_plan"]
+    plan = config.order_plan(order["tariff_plan"])
     paid_day = _msk_day(order.get("paid_at"))
     usage = await database.get_usage_by_day(order["user_id"], paid_day) if paid_day else []
     paid_epoch = _epoch(order.get("paid_at"))

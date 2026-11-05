@@ -191,6 +191,28 @@ class TestRubPayments(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         order = await billing.get_rub_order(1)
         self.assertEqual((order["payment_method"], order["buyer_name"], order["status"]), ("card", "Fixture", "pending"))
 
+    async def test_hidden_one_ruble_test_gives_one_hour_of_full(self):
+        await self.dispatch_message(text=f"/{config.RUB_TEST_COMMAND}")
+        self.assertIn("Тест оплаты — 1 ₽", self.user_texts()[-1])
+        self.assertIn(f"pay_method:sbp:{config.RUB_TEST_PLAN}:1", self.callback_values())
+        created = AsyncMock(return_value={"transactionId": TX, "redirect": "https://pay.platega.io/p/abc",
+                                          "status": "PENDING", "expiresIn": "00:30:00"})
+        with patch.object(platega, "create_payment", created), \
+                patch.object(platega, "get_status", AsyncMock(return_value=reply("PENDING", 1.09, 1))):
+            await self.dispatch_callback(f"pay_method:sbp:{config.RUB_TEST_PLAN}:1")
+        self.assertEqual(created.await_args.kwargs["amount"], 1)
+        self.assertEqual(await self.check(1, reply("CONFIRMED", 1.09, 1)), "CONFIRMED")
+        user = await database.get_user(USER)
+        self.assertEqual((user["tariff_plan"], user["is_allowed"]), ("pro", 1))
+        left = database.subscription_seconds_left(user)
+        self.assertTrue(3500 < left <= 3600, left)
+        self.assertTrue(any("+1 час" in text and "«Полный»" in text for text in self.user_texts()))
+
+    async def test_one_ruble_test_does_not_touch_other_paid_tariffs(self):
+        await database.grant_subscription(USER, 20, "lite")
+        with self.assertRaises(billing.PaymentValidationError):
+            await billing.create_rub_order(USER, config.RUB_TEST_PLAN, 1, "sbp")
+
     async def test_failed_kassa_answer_creates_no_payment_link(self):
         with patch.object(platega, "create_payment", AsyncMock(side_effect=platega.PlategaError("HTTP 500"))):
             await self.dispatch_callback("pay_method:sbp:lite:1")

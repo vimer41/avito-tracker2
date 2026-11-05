@@ -82,6 +82,15 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("subscription_period", invoice.model_dump())
         self.assertEqual(await database.get_user(self.user_id), before)
 
+    async def test_three_months_is_hidden_from_sale_for_now(self):
+        await self.dispatch_callback("buy_tariff:pro:3")
+        labels = [b.text for row in self.last_markup().inline_keyboard for b in row]
+        self.assertFalse(any("месяц" in label for label in labels))
+        self.assertIn("stars_buy:pro:1:899", self.callback_values())
+        await self.dispatch_callback("stars_buy:pro:3:2399")
+        self.assertEqual(self.methods("SendInvoice"), [])
+
+    @patch.object(config, "SALE_PERIOD_MONTHS", (1, 3))
     async def test_three_months_is_ten_percent_cheaper_and_gives_90_days(self):
         await self.dispatch_callback("buy_tariff:pro:3")
         text = self.methods("EditMessageText")[-1].text

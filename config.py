@@ -160,7 +160,7 @@ AVITO_MAX_PAGES_PER_SCAN = min(5, positive_int_setting("AVITO_MAX_PAGES_PER_SCAN
 # A trial works like the Полный tariff with TRIAL_RADARS radars for TRIAL_HOURS. "base" is the classification of test orders.
 # A URL watched by several tariffs is scanned at the fastest one.
 PAID_PLANS: tuple[str, ...] = ("lite", "standart", "pro")
-PLAN_TITLES: dict[str, str] = {"lite": "Базовый", "standart": "Средний", "pro": "Полный", "test": "Тест", "base": "Пробный"}
+PLAN_TITLES: dict[str, str] = {"lite": "Базовый", "standart": "Средний", "pro": "Полный", "test": "Тест", "base": "Пробный", "rubtest": "Тест 1 ₽"}
 PLAN_RADARS: dict[str, int] = {"lite": 1, "standart": 2, "pro": 4}
 # Tariffs that also copy every lot into a group chat (the trial counts as Полный).
 GROUP_DELIVERY_PLANS: frozenset[str] = frozenset({"standart", "pro"})
@@ -350,6 +350,12 @@ def apply_stars_prices(lite: int, standart: int, pro: int) -> None:
 
 # A subscription is bought for one of these periods; longer ones are cheaper per month.
 PERIOD_MONTHS: tuple[int, ...] = (1, 3)
+# Periods offered for sale right now. 3 months is hidden for the time being (PERIOD_MONTHS still knows it,
+# so orders already created for 3 months complete normally). Return it with SALE_PERIOD_MONTHS=1,3.
+SALE_PERIOD_MONTHS: tuple[int, ...] = tuple(
+    m for m in (int(x) for x in os.getenv("SALE_PERIOD_MONTHS", "1").replace(" ", "").split(",") if x.isdigit())
+    if m in PERIOD_MONTHS
+) or (1,)
 PERIOD_DISCOUNT_PERCENT: dict[int, int] = {1: 0, 3: positive_int_setting("PERIOD_3M_DISCOUNT", "10")}
 if not all(0 <= PERIOD_DISCOUNT_PERCENT[m] < 100 for m in PERIOD_MONTHS):
     raise ValueError("PERIOD_3M_DISCOUNT must be below 100")
@@ -406,7 +412,22 @@ if max(PRICE_RUB.values()) > PAYMENT_LIMIT_RUB:
     raise ValueError(f"Цена тарифа не должна превышать {PAYMENT_LIMIT_RUB} ₽ за одну оплату")
 
 
+# Hidden checkout test: /arseniytest1ruble sells 1 hour of «Полный» for 1 ₽ through Platega.
+RUB_TEST_PLAN = "rubtest"
+RUB_TEST_PRICE = 1
+RUB_TEST_SECONDS = 3600
+RUB_TEST_GRANTS = "pro"
+RUB_TEST_COMMAND = "arseniytest1ruble"
+
+
+def order_plan(plan: str | None) -> str | None:
+    """The tariff an order actually grants (the ruble test order grants «Полный»)."""
+    return RUB_TEST_GRANTS if plan == RUB_TEST_PLAN else plan
+
+
 def rub_price(plan: str, months: int = 1) -> int:
+    if plan == RUB_TEST_PLAN:
+        return RUB_TEST_PRICE
     return _period_total(PRICE_RUB[plan], months)
 
 
@@ -437,11 +458,12 @@ def plan_interval(plan: str | None) -> int:
 
 
 def plan_switch_seconds(old_plan: str | None, new_plan: str | None, seconds_left: int) -> int:
-    """Paid time keeps its value in Stars when the tariff changes: cheap days must not become expensive ones."""
+    """Paid time keeps its value in rubles when the tariff changes: cheap days must not become expensive ones.
+    Rubles, not Stars: Stars prices are changed by admins and carry Telegram's cut, ruble prices are the base."""
     old, new = (old_plan or "").lower(), (new_plan or "").lower()
     if old == new or old not in PAID_PLANS or new not in PAID_PLANS or seconds_left <= 0:
         return max(0, int(seconds_left))
-    return int(seconds_left * stars_price(old) / stars_price(new))
+    return int(seconds_left * rub_price(old) / rub_price(new))
 
 
 def parse_proxy(raw_proxy: str | None) -> str | None:

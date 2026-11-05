@@ -70,7 +70,7 @@ async def buy_stars(call: CallbackQuery, bot: Bot, state: FSMContext):
             parts.insert(2, "1")
         _, plan, months_raw, displayed_price = parts
         months = int(months_raw)
-        if months not in config.PERIOD_MONTHS:
+        if months not in config.SALE_PERIOD_MONTHS:
             raise billing.PaymentValidationError("Такого срока нет. Откройте тариф заново.")
         if int(displayed_price) != config.stars_price(plan, months):
             raise billing.PaymentValidationError("Цена изменилась. Откройте тариф заново и подтвердите новые условия.")
@@ -141,6 +141,18 @@ async def rub_check(call: CallbackQuery, bot: Bot):
         await call.answer("Касса не ответила, попробуйте через минуту", show_alert=True)
         return
     await call.answer(RUB_CHECK_ANSWERS.get(status, "Статус обновлён"), show_alert=status != "CONFIRMED")
+
+
+@router.message(Command(config.RUB_TEST_COMMAND))
+async def rub_test_checkout(message: Message):
+    """Hidden checkout test: 1 ₽ for 1 hour of «Полный». Not listed anywhere, works only when typed."""
+    if not config.PLATEGA_ENABLED or message.chat.type != "private":
+        return
+    await message.answer(
+        f"{ui.e('card')} <b>Тест оплаты — {config.RUB_TEST_PRICE} ₽</b>\n\n"
+        "1 час тарифа «Полный». Выберите способ:",
+        reply_markup=ui.kb(*(rub_payments.method_buttons(config.RUB_TEST_PLAN, 1)[i:i + 2] for i in (0, 2))),
+    )
 
 
 @router.callback_query(F.data.startswith("admin_rubproof:"))
@@ -301,7 +313,9 @@ async def admin_payments(call: CallbackQuery):
         return
     orders = await billing.list_orders(user_id)
     rub_orders = await billing.list_rub_orders(user_id, 10)
-    lines = [f"⭐ <b>ПЛАТЕЖИ ПОЛЬЗОВАТЕЛЯ {user_id}</b>"]
+    lines = [f"⭐ <b>Платежи пользователя {user_id}</b>",
+             "<i>R12 — заказ №12, оплата рублями (Platega). #12 — заказ №12, оплата Stars. "
+             "Этот номер покупатель видит в сообщении об оплате.</i>", ""]
     buttons = []
     for order in rub_orders:
         lines.append(
@@ -309,8 +323,9 @@ async def admin_payments(call: CallbackQuery):
             f"{rub_payments.method_title(order)} · {rub_payments.STATUS_TITLES.get(order['status'], order['status'])}"
             + (" · ⚠️ сверить подписку вручную" if order["refund_needs_review"] else "")
         )
-        buttons.append([InlineKeyboardButton(text=f"📄 Доказательства R{order['id']}",
-                                             callback_data=f"admin_rubproof:{order['id']}")])
+        if order["paid_at"]:  # evidence is for paid orders only: an unpaid link has nothing to prove
+            buttons.append([InlineKeyboardButton(text=f"📄 Доказательства R{order['id']}",
+                                                 callback_data=f"admin_rubproof:{order['id']}")])
     for order in orders:
         lines.append(f"#{order['id']} · {config.plan_title(order['tariff_plan'])} · {order['total_amount']} ⭐ · {order['status']}"
                      + (" · ⚠️ сверить подписку вручную" if order["refund_needs_review"] else ""))
