@@ -126,6 +126,10 @@ PROXY_RATE_BURST = positive_float_setting("PROXY_RATE_BURST", "3")
 # when its share of blocks among the last PROXY_RATE_WINDOW responses exceeds PROXY_RATE_CUT_RATIO.
 PROXY_RATE_WINDOW = positive_int_setting("PROXY_RATE_WINDOW", "20")
 PROXY_RATE_CUT_RATIO = positive_float_setting("PROXY_RATE_CUT_RATIO", "0.25")
+# One cut multiplies the rate by this (1.5 → 1.05 → 0.74 → 0.52); the next cut needs a fresh half window.
+PROXY_RATE_CUT_FACTOR = positive_float_setting("PROXY_RATE_CUT_FACTOR", "0.7")
+# A throttled proxy with no 403/429 for this long steps up by PROXY_RECOVERY_FACTOR, traffic or not.
+PROXY_RATE_CALM_SECONDS = positive_float_setting("PROXY_RATE_CALM_SECONDS", "300")
 # Channel choice: an extra in-flight request on a busy channel is assumed to cost this many seconds of waiting.
 PROXY_BUSY_PENALTY = positive_float_setting("PROXY_BUSY_PENALTY", "1.0")
 # Channel choice by measured quality: a proxy is proven when at least PROXY_GOOD_HEALTH of its last

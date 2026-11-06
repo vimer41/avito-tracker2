@@ -716,6 +716,8 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             seen_store.prune(groups)
             network = budget.snapshot()
             proxy_snaps = pool.snapshots()
+            # A deleted proxy must not linger in screens or capacity math.
+            METRICS.forget_proxies_except({s["proxy_id"] for s in proxy_snaps if s.get("proxy_id")})
             if proxy_snaps:
                 no_proxy_notified = False
             elif not no_proxy_notified and parser is None and getattr(scheduler.process_url_group, "__name__", "") == "process_url_group":

@@ -663,6 +663,12 @@ class RuntimeMetricsRegistry:
             sl.reset(mid)
         return sl
 
+    def forget_proxies_except(self, keep_ids: set[str]) -> None:
+        """Drop removed proxies, so screens and capacity count only channels that are still in the pool."""
+        for proxy_id in [pid for pid in self._proxy_meta if pid not in keep_ids]:
+            self._proxy_meta.pop(proxy_id, None)
+            self._proxy_rings.pop(proxy_id, None)
+
     def update_proxy_state(
         self,
         proxy_id: str,
@@ -1560,101 +1566,63 @@ class RuntimeMetricsRegistry:
             verdict = ["🟢 <b>Всё работает нормально</b>"]
 
         if cap["available_rate_now"] > 0:
-            if cap["deficit_now"] > 0:
-                net_line = (
-                    f"Нужно <b>{_dec(cap['required_rate_target'], 2)}</b> запр/с, сеть даёт "
-                    f"<b>{_dec(cap['available_rate_now'], 2)}</b> — не хватает"
-                )
-            else:
-                spare = 1.0 - cap["required_rate_target"] / cap["available_rate_now"]
-                net_line = (
-                    f"Нужно <b>{_dec(cap['required_rate_target'], 2)}</b> запр/с, сеть даёт "
-                    f"<b>{_dec(cap['available_rate_now'], 2)}</b> — запас {max(0.0, spare) * 100:.0f}%"
-                )
+            need, have = cap["required_rate_target"], cap["available_rate_now"]
+            spare = f"не хватает {_dec(cap['deficit_now'], 2)}" if cap["deficit_now"] > 0 else f"запас {max(0.0, 1.0 - need / have) * 100:.0f}%"
+            net_line = f"🌐 Сеть: нужно {_dec(need, 2)} из {_dec(have, 2)} запр/с · {spare}"
         else:
-            net_line = "Рабочих каналов нет — сканирование стоит"
+            net_line = "🌐 Рабочих каналов нет — сканирование стоит"
 
-        new_ratio = _pct(pipe["scans_with_new_items"], scans_ok) if scans_ok else "—"
+        interval = pipe["source_interval_seconds"]
         lines = [
-            "📊 <b>Мониторинг</b> · последний час",
-            f"Бот работает {_dur(self._wall_clock() - self._started_at)}",
-            "",
+            f"📊 <b>Мониторинг</b> · час · бот работает {_dur(self._wall_clock() - self._started_at)}",
             *verdict,
             "",
-            "🔎 <b>Сканирование</b>",
-            f"Ссылок в работе: <b>{sched['unique_sources']}</b>"
-            + (f", опаздывают: {sched['overdue_sources']}" if sched["overdue_sources"] else ""),
-            f"Каждая ссылка проверяется: {_hist_text(pipe['source_interval_seconds'])}",
-            f"Сканов: <b>{_num(scans_ok)}</b> успешно, <b>{_num(scans_bad)}</b> с ошибкой"
-            + (f" ({_pct(scans_bad, scans_all)})" if scans_all else ""),
-            f"Нашли новые лоты: {_num(pipe['scans_with_new_items'])} ({new_ratio} сканов)",
-            f"Один скан длится: {_hist_text(pipe['scan_duration_seconds'])}",
-            f"Запросов на скан: {_dec(cap['rolling_mean_http_requests_per_scan'], 1)}"
-            + (" (оценка)" if cap["cold_start_cost_used"] else ""),
-            f"За 10 мин: сканов {_num(scans_ok_10 + scans_bad_10)}, ошибок {_num(scans_bad_10)}, блоков 403/429 {_num(blocks_10)}",
+            f"🔎 Ссылок <b>{sched['unique_sources']}</b>"
+            + (f" · опаздывают {sched['overdue_sources']}" if sched["overdue_sources"] else "")
+            + (f" · проверка ~{_dur(interval['mean'])}" if interval.get("sample_count") else ""),
+            f"Сканов <b>{_num(scans_all)}</b> · ошибок {_pct(scans_bad, scans_all)}"
+            + f" · с новыми лотами {_pct(pipe['scans_with_new_items'], scans_ok)}",
+            f"За 10 мин: сканов {_num(scans_ok_10 + scans_bad_10)} · ошибок {_num(scans_bad_10)} · блоков {_num(blocks_10)}",
         ]
         failures = _merge_failures(proxies)
         if failures:
-            lines.append("Почему падали сканы:")
-            for kind, count in failures[:5]:
-                lines.append(f"  · {FAILURE_LABELS.get(kind, kind)} — {_num(count)}")
+            lines.append("Ошибки: " + ", ".join(f"{FAILURE_LABELS.get(k, k)} {_num(v)}" for k, v in failures[:3]))
+        lines.append(net_line)
 
-        lines += [
-            "",
-            "🌐 <b>Сеть</b>",
-            f"Каналов: {cap['total_proxies']}, рабочих {cap['healthy_proxies']}"
-            + (f", на паузе {cap['quarantined_proxies']}" if cap["quarantined_proxies"] else ""),
-            net_line,
-        ]
-        if cap["deficit_now"] > 0 or cap["quarantined_proxies"]:
-            lines.append(f"<blockquote>{cap['recommendation_ru']}</blockquote>")
+        pub = sla["by_tariff"]
+        pub_total = sum(pub[t]["pub_to_seen_seconds"]["sample_count"] for t in TARIFF_KEYS)
+        pub_mean = (
+            sum((pub[t]["pub_to_seen_seconds"]["mean"] or 0.0) * pub[t]["pub_to_seen_seconds"]["sample_count"] for t in TARIFF_KEYS) / pub_total
+            if pub_total else None
+        )
+        queued = sla["queued_to_sent_seconds"]
+        lines.append(
+            f"📬 Отправлено <b>{_num(bapi['sent_total'])}</b>"
+            + (f" · Авито→бот ~{_dur(pub_mean)}" if pub_mean is not None else "")
+            + (f" · отправка ~{_dur(queued['mean'])}" if queued.get("sample_count") else "")
+            + (f" · в очереди {outbox['pending_depth']}" if outbox["pending_depth"] else "")
+        )
 
-        lines += [
-            "",
-            "📬 <b>Доставка</b>",
-            f"Отправлено уведомлений: <b>{_num(bapi['sent_total'])}</b>",
-        ]
-        pub_hist = _merge_tariff_hist(sla["by_tariff"], "pub_to_seen_seconds")
-        if pub_hist:
-            lines.append(f"От публикации на Авито до бота: {pub_hist}")
-        lines.append(f"Из очереди в Telegram: {_hist_text(sla['queued_to_sent_seconds'])}")
-        tariff_parts = []
-        for t_key in TARIFF_KEYS:
-            h = sla["by_tariff"][t_key]["queued_to_sent_seconds"]
-            if h["sample_count"]:
-                tariff_parts.append(f"{config.plan_title(t_key)} ~{_dur(h['mean'])}")
-        if tariff_parts:
-            lines.append("По тарифам: " + " · ".join(tariff_parts))
-        queue = f"В очереди: {outbox['pending_depth']}"
-        if outbox["pending_depth"]:
-            queue += f", самое старое {_dur(outbox['oldest_pending_age_seconds'])}"
-        lines.append(queue)
-        if bapi["retry_after_count"]:
-            lines.append(f"Telegram просил подождать: {bapi['retry_after_count']} раз")
-        if bapi["catchup_sent_count"] or bapi["catchup_omitted_count"]:
-            lines.append(
-                f"Догон после паузы: отправлено {bapi['catchup_sent_count']}, "
-                f"пропущено {bapi['catchup_omitted_count']}"
-            )
+        # Only channels that really worked this hour; idle reserve proxies are one count.
+        used = [p for p in proxies if p["raw_http_total_60m"] or p["collection_total_60m"]]
+        idle = len(proxies) - len(used)
+        if used or idle:
+            lines += ["", "🔌 <b>Каналы</b> · запросы · успешных · блоков · скорость"]
+            lines += [channel_line(p) for p in sorted(used, key=_channel_sort_key)]
+            if idle:
+                lines.append(f"⚪️ Без запросов за час: {idle}")
 
-        messages = ["\n".join(lines)]
-
-        if proxies:
-            cards = ["🔌 <b>Каналы</b> · последний час"]
-            for p in sorted(proxies, key=_channel_sort_key):
-                cards.append("")
-                cards.extend(channel_card(p))
-            current: list[str] = []
-            current_len = 0
-            for line in cards:
-                if current and current_len + len(line) + 1 > max_len:
-                    messages.append("\n".join(current))
-                    current, current_len = [], 0
-                current.append(line)
-                current_len += len(line) + 1
-            if current:
+        messages: list[str] = []
+        current: list[str] = []
+        current_len = 0
+        for line in lines:
+            if current and current_len + len(line) + 1 > max_len:
                 messages.append("\n".join(current))
-
+                current, current_len = [], 0
+            current.append(line)
+            current_len += len(line) + 1
+        if current:
+            messages.append("\n".join(current))
         return messages
 
     def format_stats_report(self, max_len: int = 3800) -> str:
@@ -1801,6 +1769,23 @@ def _channel_name(p: dict[str, Any]) -> str:
 
 def _channel_sort_key(p: dict[str, Any]) -> tuple[int, str]:
     return (0 if _is_direct_channel(p) else 1, _channel_name(p))
+
+
+def channel_line(p: dict[str, Any]) -> str:
+    """One compact row for the monitoring screen: the details live in the channel card."""
+    raw = p["raw_http_total_60m"]
+    blocks = p["raw_http_403_60m"] + p["raw_http_429_60m"]
+    slowed = p["effective_rate"] < p["configured_rate"] - 1e-6
+    if p["state"] == "quarantined":
+        icon = "🔴"
+    elif slowed or p["state"] == "half_open" or (raw and blocks / raw > 0.10):
+        icon = "🟡"
+    else:
+        icon = "🟢"
+    return (
+        f"{icon} {html_escape(_channel_name(p))} · {_num(raw)} · {_pct(p['raw_http_2xx_3xx_60m'], raw)}"
+        f" · {_pct(blocks, raw)} · {_dec(p['effective_rate'], 2)}" + ("↓" if slowed else "")
+    )
 
 
 def channel_card(p: dict[str, Any]) -> list[str]:

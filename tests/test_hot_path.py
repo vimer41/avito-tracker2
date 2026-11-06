@@ -139,8 +139,28 @@ class TestTokenBucketPacing(unittest.TestCase):
         with patch.object(config, "PROXY_RATE_BURST", 1.0):
             client._tokens = 1.0
             client.effective_rate = 1.0
+            client._last_block_at = clock.now
             self.assertEqual(client._reserve_pacing_delay(), 0.0)
             self.assertAlmostEqual(client._reserve_pacing_delay(), 1.0)
+
+    def test_cut_is_judged_by_fresh_answers_and_calm_restores_rate(self):
+        clock = FakeClock()
+        client = self.make_client(clock, rate=1.5)
+        for _ in range(10):
+            client.record_raw_http_response(403, 0.2)
+        client.record_final_block("forbidden")
+        self.assertAlmostEqual(client.effective_rate, 1.05)
+        # The old 403s are still in the window: one more block right away must not cut again.
+        client.record_raw_http_response(403, 0.2)
+        client.record_final_block("forbidden")
+        self.assertAlmostEqual(client.effective_rate, 1.05)
+        # Timeouts do not count against recovery; after a calm stretch the rate steps up without traffic.
+        client.record_transport_error()
+        clock.now += config.PROXY_RATE_CALM_SECONDS
+        client._reserve_pacing_delay()
+        self.assertAlmostEqual(client.effective_rate, 1.3125)
+        client._reserve_pacing_delay()  # one step per calm period
+        self.assertAlmostEqual(client.effective_rate, 1.3125)
 
 
 class TestChannelRouting(unittest.TestCase):

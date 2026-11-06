@@ -118,6 +118,39 @@ class TestProxyCommand(ProxyEnvMixin, unittest.IsolatedAsyncioTestCase):
         self.assertIn("тот же IP 10.9.9.9", report)
         self.assertIn("уже в списке", report)
 
+    async def test_same_subnet_adds_one_and_asks_about_the_rest(self):
+        neighbour = "http://user:secret@10.1.2.77:8080"
+        third = "http://user:secret@10.1.2.99:8080"
+        message, status = make_message(f"/proxy {PROXY_RAW}\n{neighbour}\n{third}\n{PROXY_B}")
+        ips = {PROXY_URL: "10.1.2.3", neighbour: "10.1.2.77", third: "10.1.2.99", PROXY_B: "10.9.9.9"}
+        with patch.object(proxy_check, "exit_ips_for", new=exit_ips(ips)), \
+                patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=probe(True, True))):
+            await admin.cmd_admin_proxy(message)
+        self.assertEqual(await database.get_proxy_urls(), [PROXY_URL, PROXY_B])
+        report = status.edit_text.await_args.args[0]
+        self.assertIn("10.1.2.0/24", report)
+        self.assertIn("Вы уверены", report)
+        kb = status.edit_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(kb.inline_keyboard[0][0].callback_data, "admin_net_samenet_yes")
+
+        call = Mock(data="admin_net_samenet_yes", from_user=Mock(id=config.ADMIN_ID), answer=AsyncMock())
+        call.message = Mock(answer=AsyncMock())
+        await admin.cb_admin_net_samenet(call)
+        self.assertEqual(await database.get_proxy_urls(), [PROXY_URL, PROXY_B, neighbour, third])
+        await admin.cb_admin_net_samenet(call)  # a second press must not add them twice
+        self.assertEqual(len(await database.get_proxy_urls()), 4)
+
+    async def test_same_subnet_refused_adds_nothing_more(self):
+        neighbour = "http://user:secret@10.1.2.77:8080"
+        message, _ = make_message(f"/proxy {PROXY_RAW}\n{neighbour}")
+        with patch.object(proxy_check, "exit_ips_for", new=exit_ips({PROXY_URL: "10.1.2.3", neighbour: "10.1.2.77"})), \
+                patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=probe(True, True))):
+            await admin.cmd_admin_proxy(message)
+        call = Mock(data="admin_net_samenet_no", from_user=Mock(id=config.ADMIN_ID), answer=AsyncMock())
+        call.message = Mock(answer=AsyncMock())
+        await admin.cb_admin_net_samenet(call)
+        self.assertEqual(await database.get_proxy_urls(), [PROXY_URL])
+
     async def test_proxy_exiting_from_the_server_ip_is_rejected(self):
         message, status = make_message(f"/proxy {PROXY_RAW}")
         with patch.object(proxy_check, "exit_ips_for", new=exit_ips({PROXY_URL: "203.0.113.1"})), \
@@ -317,7 +350,7 @@ class TestChannelSelectionAndLimiter(unittest.TestCase):
 
     def test_heavy_blocking_cuts_rate_but_not_below_floor_and_recovers(self):
         client = proxy_pool.ProxyClient(PROXY_URL)
-        for _ in range(20):
+        for _ in range(60):  # each cut needs a fresh half window of blocks: 1.5 → 1.05 → 0.74 → 0.51 → 0.5
             client.record_raw_http_response(403, 0.5)
             client.record_final_block("forbidden")
         self.assertEqual(client.effective_rate, config.PROXY_MIN_RATE)

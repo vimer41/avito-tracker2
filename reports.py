@@ -351,7 +351,9 @@ async def refresh_live_metrics() -> None:
             leased_depth=ob.get("leased", 0),
             oldest_pending_age_seconds=ob.get("oldest_seconds", 0),
         )
-        METRICS.snapshot(proxy_snapshots=get_proxy_pool().snapshots())
+        snaps = get_proxy_pool().snapshots()
+        METRICS.forget_proxies_except({s["proxy_id"] for s in snaps if s.get("proxy_id")})
+        METRICS.snapshot(proxy_snapshots=snaps)
     except Exception:
         logger.debug("Не удалось обновить живые метрики", exc_info=True)
 

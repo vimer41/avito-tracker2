@@ -3132,27 +3132,95 @@ async def _add_proxies(message: Message, raw: str) -> None:
         unique.append(url)
 
     results = await _probe_many(unique, attempts=3 if len(unique) == 1 else 2) if unique else {}
-    accepted = []
+    # Neighbours in one subnet are usually banned together by Avito: one working proxy per subnet goes in
+    # at once, the rest wait for the admin's «да».
+    nets = {_subnet(exit_ips.get(u)): _proxy_host(u) for u in [None, *existing] if exit_ips.get(u)}
+    accepted, held = [], []
     for url in unique:
         result = results[url]
         ip = exit_ips.get(url)
         ip_note = f" · IP {ip}" if ip else ""
-        if result.successes:
-            accepted.append(url)
-            report.append(f"✅ {html.escape(_proxy_host(url))}{ip_note} — {_probe_summary(result)}")
-        else:
+        if not result.successes:
             report.append(f"🚫 {html.escape(_proxy_host(url))}{ip_note} — {_probe_summary(result)}, не добавлен")
+            continue
+        net = _subnet(ip)
+        if net and net in nets:
+            held.append(url)
+            report.append(
+                f"⏸ {html.escape(_proxy_host(url))}{ip_note} — {_probe_summary(result)}, но подсеть {net} "
+                f"та же, что у {html.escape(nets[net])}: ждёт подтверждения"
+            )
+            continue
+        if net:
+            nets[net] = _proxy_host(url)
+        accepted.append(url)
+        report.append(f"✅ {html.escape(_proxy_host(url))}{ip_note} — {_probe_summary(result)}")
 
     if accepted:
-        await _save_proxy_list([*config.PROXY_URLS, *accepted])
-        report.append(f"\n<b>Добавлено: {len(accepted)}</b>, всего прокси: {len(config.PROXY_URLS)}. Применено сразу.")
-        if config.NET_MODE in ("direct", "auto"):
-            # Keep the server IP scanning too: a fresh proxy must add capacity, not replace it.
-            await _set_net_mode("smart")
-            report.append("Режим переключён на «🧠 Умный»: сервер сканирует, прокси в запасе и включаются сами, когда нужны.")
-        logger.info("Admin %s added %s proxies", message.from_user.id, len(accepted))
+        report.append("\n" + await _commit_proxies(accepted, message.from_user.id))
+    if held:
+        _PENDING_SAME_NET[message.from_user.id] = (time.time(), held)
+        report.append(
+            f"\n⚠️ <b>Из тех же подсетей: {len(held)}.</b> Авито часто банит соседние IP пачкой — если забанят один, "
+            "лягут и эти. Вы уверены, что хотите добавить прокси из одних подсетей?"
+        )
     text, kb = await _render_net("\n".join(report))
+    if held:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✅ Да, добавить ещё {len(held)}", callback_data="admin_net_samenet_yes")],
+            [InlineKeyboardButton(text="✖️ Нет, не добавлять", callback_data="admin_net_samenet_no")],
+            *kb.inline_keyboard,
+        ])
     await status.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+# admin id -> (when, working proxies from an already used subnet) waiting for «Да, добавить».
+_PENDING_SAME_NET: dict[int, tuple[float, list[str]]] = {}
+SAME_NET_TTL = 1800
+
+
+def _subnet(ip: str | None) -> str | None:
+    """'/24' for IPv4, '/64' for IPv6: the block a provider usually sells and Avito bans together."""
+    import ipaddress
+
+    if not ip:
+        return None
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    return str(ipaddress.ip_network(f"{ip}/{24 if addr.version == 4 else 64}", strict=False))
+
+
+async def _commit_proxies(urls: list[str], admin_id: int) -> str:
+    """Save already probed proxies and keep the server scanning; returns the report line."""
+    await _save_proxy_list([*config.PROXY_URLS, *urls])
+    note = f"<b>Добавлено: {len(urls)}</b>, всего прокси: {len(config.PROXY_URLS)}. Применено сразу."
+    if config.NET_MODE in ("direct", "auto"):
+        # Keep the server IP scanning too: a fresh proxy must add capacity, not replace it.
+        await _set_net_mode("smart")
+        note += "\nРежим переключён на «🧠 Умный»: сервер сканирует, прокси в запасе и включаются сами, когда нужны."
+    logger.info("Admin %s added %s proxies", admin_id, len(urls))
+    return note
+
+
+@router.callback_query(F.data.in_({"admin_net_samenet_yes", "admin_net_samenet_no"}))
+async def cb_admin_net_samenet(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    when, urls = _PENDING_SAME_NET.pop(call.from_user.id, (0.0, []))
+    urls = [u for u in urls if u not in config.PROXY_URLS]
+    if call.data.endswith("_no"):
+        await call.answer("Не добавлены")
+        text, kb = await _render_net(f"Прокси из тех же подсетей не добавлены: {len(urls)}.")
+    elif not urls or time.time() - when > SAME_NET_TTL:
+        await call.answer("Список устарел — пришлите прокси заново", show_alert=True)
+        text, kb = await _render_net()
+    else:
+        await call.answer()
+        text, kb = await _render_net(await _commit_proxies(urls, call.from_user.id))
+    await _show(call, text, kb)
 
 
 async def _remove_proxies(proxy_ids: set[str] | None) -> str:
@@ -3357,7 +3425,8 @@ async def cb_admin_net_add(call: CallbackQuery, state: FSMContext):
         call,
         "➕ <b>Добавление прокси</b>\n\n"
         "Пришлите один или сколько угодно прокси — каждый с новой строки. Бот удалит сообщение из чата, "
-        "отсеет прокси с одинаковым IP, проверит каждый на Авито и добавит только рабочие.\n\n" + PROXY_FORMAT_HELP,
+        "отсеет прокси с одинаковым IP, проверит каждый на Авито и добавит только рабочие. "
+        "Из одной подсети сразу добавит один, про остальные спросит.\n\n" + PROXY_FORMAT_HELP,
         InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Отмена", callback_data="admin_net")]]),
     )
 

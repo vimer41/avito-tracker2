@@ -186,6 +186,12 @@ class ProxyClient:
         self.block_streak: int = 0
         self.transport_failure_streak: int = 0
         self.recovery_success_streak: int = 0
+        # Rate limiter memory: answers counted so far, and that count at the last cut, so a cut is judged
+        # only by answers that came at the already lowered rate (the old 403s led to the previous cut).
+        self._answers_total: int = 0
+        self._answers_at_cut: int = 0
+        self._last_block_at: float = -math.inf
+        self._last_rate_step_at: float = -math.inf
         self._half_open_probe_active: bool = False
         self.last_acquired_at: float = -math.inf
 
@@ -348,6 +354,7 @@ class ProxyClient:
         the sustained rate never exceeds effective_rate. Returns how long this request must wait.
         """
         now = self._monotonic()
+        self._calm_recovery(now)
         rate = max(config.PROXY_MIN_RATE, self.effective_rate)
         burst = max(1.0, float(config.PROXY_RATE_BURST))
         with self._pacing_lock:
@@ -384,10 +391,12 @@ class ProxyClient:
         while self._history_10m and self._history_10m[0][0] < cutoff:
             self._history_10m.popleft()
 
-    def _recent_block_ratio(self) -> tuple[int, float]:
-        """(responses, share of 403/429/439) over the last PROXY_RATE_WINDOW HTTP responses."""
+    def _recent_block_ratio(self, limit: int | None = None) -> tuple[int, float]:
+        """(responses, share of 403/429/439) over the last PROXY_RATE_WINDOW HTTP responses (at most `limit`)."""
         window = max(1, int(config.PROXY_RATE_WINDOW))
-        statuses = [status for _, status, transport in list(self._history_10m)[-window:] if not transport and status is not None]
+        statuses = [status for _, status, transport in list(self._history_10m) if not transport and status is not None][-window:]
+        if limit is not None:
+            statuses = statuses[len(statuses) - max(0, limit):] if limit < len(statuses) else statuses
         if not statuses:
             return 0, 0.0
         bad = sum(1 for status in statuses if status in (403, 429, 439))
@@ -487,7 +496,7 @@ class ProxyClient:
         )
 
         if is_transport_error or status_code is None or status_code >= 500:
-            self.recovery_success_streak = 0
+            # A timeout says nothing about Avito's patience, so it does not reset the rate recovery streak.
             self.transport_failure_streak += 1
             if self.transport_failure_streak >= config.PROXY_FAILURE_THRESHOLD:
                 exp = self.transport_failure_streak - config.PROXY_FAILURE_THRESHOLD
@@ -498,6 +507,7 @@ class ProxyClient:
                 self._enter_quarantine(now, backoff, reason=f"transport_or_5xx_streak={self.transport_failure_streak}")
             return
 
+        self._answers_total += 1
         if 200 <= status_code < 400:
             self.transport_failure_streak = 0
             self.recovery_success_streak += 1
@@ -507,21 +517,36 @@ class ProxyClient:
                 and block_ratio <= float(config.PROXY_RATE_CUT_RATIO)
                 and self.effective_rate < self.configured_rate
             ):
-                self.effective_rate = min(
-                    self.configured_rate,
-                    round(self.effective_rate * config.PROXY_RECOVERY_FACTOR, 4),
-                )
-                self.recovery_success_streak = 0
-                log.debug(
-                    f"📈 Прокси {self.proxy_id} ({self.masked_url}) восстановил эффективную скорость до "
-                    f"{self.effective_rate:.2f}/{self.configured_rate:.2f} req/s"
-                )
+                self._step_rate_up(now, "серия успешных ответов")
             self._sync_metrics_state()
             return
 
-        if status_code in (403, 429):
+        if status_code in (403, 429, 439):
             # A single block is Avito's background noise: the window ratio decides, not the streak.
+            # It does break the clean run that recovery waits for.
+            self.recovery_success_streak = 0
+            self._last_block_at = now
             self._sync_metrics_state()
+
+    def _step_rate_up(self, now: float, why: str) -> None:
+        self.effective_rate = min(self.configured_rate, round(self.effective_rate * config.PROXY_RECOVERY_FACTOR, 4))
+        self.recovery_success_streak = 0
+        self._last_rate_step_at = now
+        log.debug(
+            f"📈 Прокси {self.proxy_id} ({self.masked_url}) восстановил эффективную скорость до "
+            f"{self.effective_rate:.2f}/{self.configured_rate:.2f} req/s ({why})"
+        )
+
+    def _calm_recovery(self, now: float) -> None:
+        """A throttled proxy with no block for PROXY_RATE_CALM_SECONDS steps back up even with little traffic:
+        a reserve proxy in smart mode may get a few requests an hour and would otherwise stay at the floor."""
+        calm = float(config.PROXY_RATE_CALM_SECONDS)
+        if (
+            self.effective_rate < self.configured_rate
+            and now - self._last_block_at >= calm
+            and now - self._last_rate_step_at >= calm
+        ):
+            self._step_rate_up(now, "давно без блоков")
 
     def record_final_block(
         self,
@@ -539,12 +564,23 @@ class ProxyClient:
             self._sync_metrics_state()
             return 0.0
         self.block_streak += 1
-        responses, block_ratio = self._recent_block_ratio()
+        self._last_block_at = now
+        # Judge only the answers since the previous cut: the blocks that caused it stay in the window for a while
+        # and used to cut again on the very next 403, 1.5 → 0.75 → 0.5 within seconds.
+        since_cut = self._answers_total - self._answers_at_cut
+        responses, block_ratio = self._recent_block_ratio(limit=since_cut)
         if responses >= max(5, int(config.PROXY_RATE_WINDOW) // 2) and block_ratio > float(config.PROXY_RATE_CUT_RATIO):
             self.recovery_success_streak = 0
+            self._answers_at_cut = self._answers_total
+            self._last_rate_step_at = now
+            before = self.effective_rate
             self.effective_rate = max(
                 config.PROXY_MIN_RATE,
-                round(self.effective_rate * 0.5, 4),
+                round(self.effective_rate * float(config.PROXY_RATE_CUT_FACTOR), 4),
+            )
+            log.info(
+                f"📉 Прокси {self.proxy_id} ({self.masked_url}) замедлен {before:.2f} → {self.effective_rate:.2f} req/s: "
+                f"блоков {block_ratio:.0%} из {responses} ответов"
             )
         duration = min(
             float(config.PROXY_QUARANTINE_MAX),
