@@ -104,9 +104,20 @@ class TestJsonProbe(unittest.IsolatedAsyncioTestCase):
         self.assertIn("- мобильный API /api/11/items: ❌ блок или капча", summary)
         self.assertIn("API со страницы /web/1/js/items/list: ⚠️ отвечает, но лоты другие (0 из 5)", summary)
         self.assertIn("город (locationId): 650400, по лотам (5)", report)
+        self.assertIn("варианты JSON: данные маршрута routes/search, мобильный API /api/11/items", report)
         self.assertIn("1.2.3.4:5500 · страница, как в скане · 200", report)
+        self.assertIn("5 лотов, обычных 5", report)
         self.assertTrue(all("avito.ru" in url for url in session.urls))
         self.assertEqual(client._lane_users, {}, "the probe takes no scan lane")
+
+    def test_the_query_comes_from_the_radar_link_when_avito_moved_it_into_the_path(self):
+        hints = json_probe.page_hints(search_page(), IDS)
+        found = json_probe.candidates("https://www.avito.ru/moskva/telefony/apple-ASgB?s=104", hints, None,
+                                      query_url="https://www.avito.ru/moskva?q=iphone&s=104")
+        self.assertIn("query=iphone", next(c.url for c in found if c.name == "мобильный API /api/11/items"))
+        without_words = json_probe.candidates("https://www.avito.ru/moskva/telefony?s=104", hints, None,
+                                              query_url="https://www.avito.ru/moskva/telefony?s=104")
+        self.assertEqual([c.name for c in without_words if "мобильный" in c.name], ["мобильный API 11 + категория"])
 
     def test_the_city_comes_from_the_lots_not_from_the_rest_of_the_page(self):
         noise = '<script>{"header": [' + ",".join(['{"locationId":637640}'] * 10) + "]}</script>"

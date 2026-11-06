@@ -136,27 +136,43 @@ def _with_param(url: str, key: str, value: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
 
 
-def candidates(search_url: str, hints: dict, user_url: Optional[str]) -> list[Candidate]:
+def candidates(search_url: str, hints: dict, user_url: Optional[str], query_url: Optional[str] = None) -> list[Candidate]:
+    """JSON addresses to try. `search_url` is the page's canonical address; the query words come from the
+    radar's own link (`query_url`): Avito may move «iphone» into a category path and drop `q` (06.11)."""
     parts = urlsplit(search_url)
-    query = dict(parse_qsl(parts.query))
+    query = {**dict(parse_qsl(parts.query)), **dict(parse_qsl(urlsplit(query_url or search_url).query))}
     found: list[Candidate] = []
     if user_url:
         found.append(Candidate("ваш адрес", user_url))
     for route in reversed(hints["routes"][-2:]):  # the catalog is usually the deepest (last) route
         found.append(Candidate(f"данные маршрута {route}", _with_param(search_url, "_data", route)))
     # `<path>.data` (React Router) answered 404 on every channel on 06.11: Avito is not that kind of app.
-    if hints.get("location_id") and query.get("q"):
-        params = {"key": MOBILE_API_KEY, "query": query["q"], "locationId": hints["location_id"], "sort": "date",
+    if hints.get("location_id"):
+        params = {"key": MOBILE_API_KEY, "locationId": hints["location_id"], "sort": "date",
                   "page": 1, "display": "list", "limit": 30}
-        found.append(Candidate("мобильный API /api/11/items", "https://m.avito.ru/api/11/items?" + urlencode(params)))
+        if query.get("q"):
+            params["query"] = query["q"]
+            found.append(Candidate("мобильный API /api/11/items", "https://m.avito.ru/api/11/items?" + urlencode(params)))
         if hints.get("category_id"):
             with_category = dict(params, categoryId=hints["category_id"])
             found.append(Candidate("мобильный API 11 + категория", "https://m.avito.ru/api/11/items?" + urlencode(with_category)))
-        found.append(Candidate("мобильный API /api/9/items", "https://m.avito.ru/api/9/items?" + urlencode(params)))
+        if query.get("q"):
+            found.append(Candidate("мобильный API /api/9/items", "https://m.avito.ru/api/9/items?" + urlencode(params)))
     item_paths = [path for path in hints["api_paths"] if "item" in path or "search" in path]
     if item_paths:
         found.append(Candidate(f"API со страницы {item_paths[0]}", f"https://www.avito.ru{item_paths[0]}?{parts.query}"))
     return found[:CANDIDATES_MAX]
+
+
+def why_no_candidates(hints: dict, query_url: str) -> str:
+    missing = []
+    if not hints.get("location_id"):
+        missing.append("город (locationId) не нашёлся рядом с лотами")
+    if not dict(parse_qsl(urlsplit(query_url).query)).get("q") and not hints.get("category_id"):
+        missing.append("в ссылке нет слова запроса (q), и категория не нашлась")
+    if not hints.get("routes") and not hints.get("api_paths"):
+        missing.append("на странице нет маршрутов данных и путей API")
+    return "; ".join(missing) or "причина не ясна"
 
 
 # ── What an answer holds ──────────────────────────────────────────────────
@@ -393,7 +409,9 @@ async def run_probe(search_url: str, user_url: Optional[str] = None, pool=None) 
                 page.parser.close()
             return [[page.probe] for page in pages], None
         hints = page_hints(reference.html, reference.page_ids)
-        found = candidates(reference.canonical, hints, user_url)
+        found = candidates(reference.canonical, hints, user_url, query_url=search_url)
+        hints["candidates"] = [candidate.name for candidate in found]
+        hints["no_candidates"] = "" if found else why_no_candidates(hints, search_url)
         stems = query_stems(search_url)
         outcomes = await asyncio.gather(*(probe_json(page, reference, found, stems) for page in pages),
                                         return_exceptions=True)
@@ -461,7 +479,7 @@ def _row(p: Probe) -> str:
     return (
         f"{p.channel} · {p.name} · {p.status or '—'}{' блок' if p.blocked else ''} · {value(p.ms, ' мс')} · "
         f"{value(p.ttfb_ms, ' мс')} · {value(p.kb)} · {value(p.body_kb)} · {p.matched}/{p.of} · "
-        f"{'JSON, ' + str(p.items) + ' лотов' if p.json_ok else (p.content_type or '—')}"
+        f"{'JSON, ' + str(p.items) + ' лотов' if p.json_ok else (f'{p.items} лотов, обычных {p.of}' if p.name == 'страница, как в скане' and p.status == 200 else (p.content_type or '—'))}"
         f"{' · свежий лот ' + str(p.newest_age_s // 60) + ' мин назад' if p.newest_age_s is not None else ''}"
         f"{' · ' + p.error if p.error else ''}"
     )
@@ -481,6 +499,7 @@ def build_report(search_url: str, user_url: Optional[str], per_channel: list[lis
             f"пути API: {', '.join(hints['api_paths']) or 'нет'}",
             f"город (locationId): {hints['location_id'] or 'нет'}, {hints.get('location_source', '')} ({hints['location_votes']})",
             f"Remix: {'да' if hints['remix'] else 'нет'} · React Router: {'да' if hints['react_router'] else 'нет'}",
+            f"варианты JSON: {', '.join(hints.get('candidates') or []) or 'не построены: ' + hints.get('no_candidates', '')}",
         ]
     else:
         lines.append("страница не получена ни на одном канале")
