@@ -178,12 +178,14 @@ def search_settings(data: dict, limit: int = 3) -> list[tuple[str, dict]]:
         if len(found) >= limit or depth > 6:
             return
         if isinstance(node, dict):
-            if _looks_like_lot(node):
+            if _looks_like_lot(node) or ("name" in node and "url" in node):  # a lot or a menu entry
                 return
             if "categoryId" in node and any(key in node for key in ("locationId", "params", "searchParams")):
                 found.append((path or "data", node))
                 return
             for key, value in node.items():
+                if not path and key in SSR_NOT_SEARCH:
+                    continue
                 walk(value, f"{path}.{key}" if path else key, depth + 1)
         elif isinstance(node, list):
             for value in node[:30]:
@@ -191,6 +193,48 @@ def search_settings(data: dict, limit: int = 3) -> list[tuple[str, dict]]:
 
     walk(data, "", 0)
     return found
+
+
+SSR_NOT_SEARCH = ("catalog", "rubricators", "seo", "seoTags", "seoNavigation", "faq", "features", "meta", "advert",
+                  "subscription")  # the category menu matched as «settings» on 06.11 (Транспорт, Недвижимость…)
+SELECTED_KEYS = ("selected", "checked", "isSelected", "active", "isActive")
+
+
+def selected_filters(data: dict, limit: int = 12) -> list[str]:
+    """What the page's filter panel (filtersV2 / filtersGroup) shows as chosen: id, name and value of each,
+    so the API's params can be written by hand from the next report."""
+    found: list[str] = []
+
+    def label(node: dict) -> str:
+        name = node.get("title") or node.get("name") or node.get("label") or ""
+        return f"{node.get('id', '?')}:{str(name)[:30]}={str(node.get('value'))[:40]}"
+
+    def walk(node: Any, depth: int) -> None:
+        if len(found) >= limit or depth > 8:
+            return
+        if isinstance(node, dict):
+            if any(node.get(key) is True for key in SELECTED_KEYS) or (node.get("value") not in (None, "", [], {}) and "id" in node):
+                found.append(label(node))
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node[:60]:
+                walk(value, depth + 1)
+
+    for key in ("filtersV2", "filtersGroup"):
+        walk(data.get(key), 0)
+    return found
+
+
+def _shape(node: Any) -> str:
+    if isinstance(node, dict):
+        first = next((v for v in node.values() if isinstance(v, (dict, list))), None)
+        inner = f" → {_shape(first)}" if first is not None else ""
+        return "{" + ", ".join(list(node)[:12]) + "}" + inner
+    if isinstance(node, list):
+        return f"[{len(node)}]" + (f" → {_shape(node[0])}" if node and isinstance(node[0], (dict, list)) else "")
+    return type(node).__name__
 
 
 def filter_params(settings: dict) -> list[tuple[str, str]]:
@@ -245,6 +289,9 @@ def page_hints(html: str, page_ids: Iterable[str] = (), search_url: str = "") ->
         "settings": [(path, {k: v for k, v in found.items() if not isinstance(v, (dict, list)) or k in ("params", "searchParams")})
                      for path, found in settings],
         "ssr_keys": list(data)[:20],
+        "filters_shape": "; ".join(f"{key}: {_shape(data[key])[:300]}" for key in ("filtersV2", "filtersGroup") if key in data),
+        "filters_selected": selected_filters(data),
+        "page_url": str(data.get("url") or "")[:300],
         "react_router": "__reactRouterContext" in html,
         "remix": "__remixContext" in html,
     }
@@ -413,6 +460,7 @@ def id_time_agreement(stamps: dict) -> str:
     timed = sorted((stamp, int(lot)) for lot, raw in stamps.items() if (stamp := _epoch(raw)) is not None)
     if len(timed) < 3:
         return "мало лотов со временем"
+    # Raised lots get a new time but keep their old id: ~50 % here means the id cannot stand in for the time.
     pairs = list(zip(timed, timed[1:]))
     rising = sum(1 for (_, a), (_, b) in pairs if b > a)
     return f"id растёт вместе со временем публикации в {rising} из {len(pairs)} пар"
@@ -578,12 +626,12 @@ def pick_channels(pool, count: Optional[int] = None, spare: Optional[int] = None
     return (direct[:1] + others)[:PROBE_CHANNELS if count is None else count]
 
 
-async def run_probe(search_url: str, user_url: Optional[str] = None, pool=None) -> str:
+async def run_probe(search_url: str, user_url: Optional[str] = None, pool=None, spare: Optional[int] = None) -> str:
     from proxy_pool import get_proxy_pool
 
     pool = pool or get_proxy_pool()
     search_url = AvitoParser.normalize_url(search_url)
-    channels = pick_channels(pool)
+    channels = pick_channels(pool, spare=spare)
     if not channels:
         return build_report(search_url, user_url, [], None)
 
@@ -701,6 +749,9 @@ def build_report(search_url: str, user_url: Optional[str], per_channel: list[lis
             + ("; ".join(f"{path}: {orjson.dumps(found).decode('utf-8', 'replace')[:400]}" for path, found in hints.get("settings") or [])
                or "не нашлись"),
             f"ключи данных страницы: {', '.join(hints.get('ssr_keys') or []) or '—'}",
+            f"адрес в данных страницы: {hints.get('page_url') or '—'}",
+            f"устройство фильтров: {hints.get('filters_shape') or '—'}",
+            f"выбранные фильтры: {'; '.join(hints.get('filters_selected') or []) or 'не нашлись'}",
             f"время и id на странице: {hints.get('id_order', '—')}",
             f"Remix: {'да' if hints['remix'] else 'нет'} · React Router: {'да' if hints['react_router'] else 'нет'}",
             f"варианты JSON: {', '.join(hints.get('candidates') or []) or 'не построены: ' + hints.get('no_candidates', '')}",

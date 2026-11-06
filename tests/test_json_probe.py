@@ -166,12 +166,17 @@ class TestJsonProbe(unittest.IsolatedAsyncioTestCase):
         lots = [{"id": lot, "title": "куртка", "categoryId": 27, "locationId": 653240} for lot in IDS]
         state = {"loaderData": {"data": {
             "menu": [{"id": 5, "categoryId": 9}] * 9,
+            "rubricators": {"categoryTreeTop": [{"id": 25984, "name": "Транспорт", "url": "/x", "categoryId": 1, "params": {}}]},
+            "filtersV2": {"items": [{"id": 178, "title": "Для кого", "options": [{"id": 1234, "title": "Мужская", "selected": True},
+                                                                                {"id": 1235, "title": "Женская", "selected": False}]}]},
             "searchCore": {"categoryId": 27, "locationId": 653240, "params": {"178": "1234", "550": [5, 6]}},
             "catalog": {"items": lots}}}}
         html = '{"categoryId":9}' * 9 + "<script>" + json.dumps(state) + "</script>"
         hints = json_probe.page_hints(html, IDS, "https://www.avito.ru/sankt-peterburg/odezhda/muzhskaya-ASgB?q=x")
         self.assertEqual((hints["category_id"], hints["category_source"]), ("27", "по лотам (5)"))
-        self.assertEqual(hints["settings"][0][0], "searchCore")
+        self.assertEqual([path for path, _ in hints["settings"]], ["searchCore"], "the category menu is not the search")
+        self.assertEqual(hints["filters_selected"], ["1234:Мужская=None"])
+        self.assertIn("filtersV2: {items} → [1] → {id, title, options}", hints["filters_shape"])
         found = json_probe.candidates("https://www.avito.ru/sankt-peterburg/odezhda/muzhskaya-ASgB?q=x", hints, None)
         url = next(c.url for c in found if c.name == "мобильный API 11 + фильтры страницы")
         self.assertIn("categoryId=27", url)

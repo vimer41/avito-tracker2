@@ -215,12 +215,13 @@ def pack_database_backup() -> Optional[str]:
 # Admins get the current note once, when a release carrying it is up: then they know the deploy went through.
 # A new note needs a new id; restarts of the same release send nothing.
 RELEASE_NOTE_KEY = "release_note_sent"
-RELEASE_NOTE_ID = "2026-11-06-probe-2"
-RELEASE_NOTE_TITLE = "Обновлено 06.11.2026, пятый раз"
+RELEASE_NOTE_ID = "2026-11-06-probe-3"
+RELEASE_NOTE_TITLE = "Обновлено 06.11.2026, шестой раз"
 RELEASE_NOTE_LINES = (
     "/jsonprobe: категория по лотам, фильтры ссылки из данных страницы, реклама и обычные лоты отдельно",
     "/jsonprobe показывает лоты API целиком (без продавца): ищем пометку рекламы и время; lastStamp убран",
-    "/jsonprobe не трогает 3 лучших прокси: после прошлых проверок их банили",
+    "/jsonprobe не трогает 3 лучших прокси (после прошлых проверок их банили); «лучшие» в конце команды — взять и их",
+    "/jsonprobe показывает выбранные фильтры страницы и не путает их с меню категорий",
 )
 # The deploy calls a release good after 20 s of uptime; the note waits past that.
 RELEASE_NOTE_DELAY = 30.0
