@@ -14,7 +14,7 @@ IDS = [str(4000000000 + i) for i in range(5)]
 
 def search_page() -> str:
     now_ms = int(time.time() * 1000)
-    cards = [{"id": lot, "title": f"Lot {lot}", "urlPath": f"/kazan/lot_{lot}", "sortTimeStamp": now_ms, "locationId": 650400}
+    cards = [{"id": lot, "title": f"Lot {lot}", "urlPath": f"/kazan/lot_{lot}", "sortTimeStamp": now_ms, "locationId": 650400, "categoryId": 99}
              for lot in IDS]
     state = {"loaderData": {"data": {"catalog": {"items": cards}}}}
     context = {"routes": [{"id": "root"}, {"id": "routes/search"}], "api": "/web/1/js/items/list"}
@@ -62,11 +62,21 @@ class TestJsonProbe(unittest.IsolatedAsyncioTestCase):
         names = [candidate.name for candidate in found]
         self.assertEqual(names[0], "ваш адрес")
         self.assertIn("https://www.avito.ru/kazan?q=lamp&s=104&_data=routes%2Fsearch", [c.url for c in found])
-        self.assertIn("https://www.avito.ru/kazan.data?q=lamp&s=104", [c.url for c in found])
+        self.assertNotIn(".data", " ".join(c.url for c in found), "Avito answers 404 to <path>.data")
         mobile = next(c.url for c in found if "m.avito.ru" in c.url)
         self.assertIn("locationId=650400", mobile)
         self.assertIn("query=lamp", mobile)
+        self.assertIn("categoryId=99", next(c.url for c in found if c.name == "мобильный API 11 + категория"))
+        self.assertTrue(any("/api/9/items" in c.url for c in found))
         self.assertLessEqual(len(found), json_probe.CANDIDATES_MAX)
+
+    def test_query_words_and_time_fields_are_shown(self):
+        data = json.loads(mobile_json(IDS))
+        data["result"]["items"][0]["value"]["title"] = "Настольная лампа"
+        described = json_probe.describe_json(data, json_probe.query_stems("https://www.avito.ru/kazan?q=лампа+настольная"))
+        self.assertEqual(described["title_hits"], 1)
+        self.assertEqual(described["result_keys"], ["items"])
+        self.assertTrue(described["time_paths"][0].startswith("time="))
 
     def test_lots_and_their_fields_are_found_at_any_depth(self):
         lots, fields, keys, newest = json_probe.analyze_json(json.loads(mobile_json(IDS)))
@@ -88,7 +98,9 @@ class TestJsonProbe(unittest.IsolatedAsyncioTestCase):
         summary = report.split("## Итог\n", 1)[1].split("\n\n", 1)[0]
         self.assertIn("- данные маршрута routes/search: ✅ те же лоты (5 из 5) на всех каналах", summary)
         self.assertIn("нет полей: продавец", summary)
-        self.assertIn("- <путь>.data (React Router): ❌ не отдаёт (404×1)", summary)
+        self.assertIn("слова запроса в названиях: 0 из 5", summary)
+        self.assertIn("поля времени у лота: time=", report)
+        self.assertIn('первый лот: {"id":4000000000', report)
         self.assertIn("- мобильный API /api/11/items: ❌ блок или капча", summary)
         self.assertIn("API со страницы /web/1/js/items/list: ⚠️ отвечает, но лоты другие (0 из 5)", summary)
         self.assertIn("город лотов (locationId): 650400", report)

@@ -45,6 +45,7 @@ ID_RE = re.compile(r"(?<![\d.])(\d{9,11})(?![\d.])")
 ROUTE_ID_RE = re.compile(r'"(?:id|routeId)"\s*:\s*"(routes/[^"\\]{1,120})"')
 API_PATH_RE = re.compile(r'"(/(?:web|api|js)/\d+/[A-Za-z0-9_\-/]{2,80})"')
 LOCATION_RE = re.compile(r'"locationId"\s*:\s*(\d{3,9})')
+CATEGORY_RE = re.compile(r'"categoryId"\s*:\s*(\d{1,6})')
 # The mobile site's public client key, as published in open Avito parsers; the probe shows whether it still works.
 MOBILE_API_KEY = "af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir"
 ITEM_FIELDS = {
@@ -84,6 +85,10 @@ class Probe:
     fields: dict = field(default_factory=dict)
     item_keys: list = field(default_factory=list)
     newest_age_s: Optional[int] = None
+    title_hits: int = 0  # lots whose title has a word of the query: is the query applied at all
+    result_keys: list = field(default_factory=list)
+    time_paths: list = field(default_factory=list)
+    first_item: str = ""
     error: str = ""
     sample: str = ""
 
@@ -98,11 +103,13 @@ def page_hints(html: str) -> dict:
     routes = list(dict.fromkeys(ROUTE_ID_RE.findall(html)))
     api_paths = sorted({path for path in API_PATH_RE.findall(html) if not path.startswith(("/web/1/u", "/web/2/ft"))})
     locations = Counter(LOCATION_RE.findall(html))
+    categories = Counter(CATEGORY_RE.findall(html))
     return {
         "routes": routes[:12],
         "api_paths": api_paths[:20],
         "location_id": locations.most_common(1)[0][0] if locations else None,
         "location_votes": locations.most_common(1)[0][1] if locations else 0,
+        "category_id": categories.most_common(1)[0][0] if categories else None,
         "react_router": "__reactRouterContext" in html,
         "remix": "__remixContext" in html,
     }
@@ -122,12 +129,15 @@ def candidates(search_url: str, hints: dict, user_url: Optional[str]) -> list[Ca
         found.append(Candidate("ваш адрес", user_url))
     for route in reversed(hints["routes"][-2:]):  # the catalog is usually the deepest (last) route
         found.append(Candidate(f"данные маршрута {route}", _with_param(search_url, "_data", route)))
-    data_path = (parts.path.rstrip("/") or "/_root") + ".data"
-    found.append(Candidate("<путь>.data (React Router)", urlunsplit((parts.scheme, parts.netloc, data_path, parts.query, ""))))
+    # `<path>.data` (React Router) answered 404 on every channel on 06.11: Avito is not that kind of app.
     if hints.get("location_id") and query.get("q"):
         params = {"key": MOBILE_API_KEY, "query": query["q"], "locationId": hints["location_id"], "sort": "date",
                   "page": 1, "display": "list", "limit": 30}
         found.append(Candidate("мобильный API /api/11/items", "https://m.avito.ru/api/11/items?" + urlencode(params)))
+        if hints.get("category_id"):
+            with_category = dict(params, categoryId=hints["category_id"])
+            found.append(Candidate("мобильный API 11 + категория", "https://m.avito.ru/api/11/items?" + urlencode(with_category)))
+        found.append(Candidate("мобильный API /api/9/items", "https://m.avito.ru/api/9/items?" + urlencode(params)))
     item_paths = [path for path in hints["api_paths"] if "item" in path or "search" in path]
     if item_paths:
         found.append(Candidate(f"API со страницы {item_paths[0]}", f"https://www.avito.ru{item_paths[0]}?{parts.query}"))
@@ -169,6 +179,39 @@ def analyze_json(data: Any) -> tuple[int, dict, list[str], Optional[float]]:
     return len(items), fields, [key for key, _ in keys.most_common(25)], max(times) if times else None
 
 
+def query_stems(search_url: str) -> list[str]:
+    """Word stems of the search query: «конская упряжь» -> ["конск", "упряж"]."""
+    words = re.findall(r"\w+", dict(parse_qsl(urlsplit(search_url).query)).get("q", "").lower())
+    return [word[:5] for word in words if len(word) >= 3]
+
+
+def _time_paths(item: dict, prefix: str = "", depth: int = 0) -> list[str]:
+    """Fields that look like a time (epoch seconds/ms in the last year, or a key named like one), with a value."""
+    found = []
+    for key, value in item.items():
+        path = f"{prefix}{key}"
+        if isinstance(value, dict) and depth < 3:
+            found += _time_paths(value, path + ".", depth + 1)
+        elif _epoch(value) is not None or (any(mark in key.lower() for mark in ("time", "date", "stamp")) and value not in (None, "", [])):
+            found.append(f"{path}={str(value)[:40]}")
+    return found[:8]
+
+
+def describe_json(data: Any, stems: list[str]) -> dict:
+    """Everything a probe report says about one JSON answer."""
+    lots, fields, keys, newest = analyze_json(data)
+    items = list(_item_dicts(data))
+    titles = [str(item.get("title") or "").lower() for item in items]
+    result = data.get("result") if isinstance(data, dict) and isinstance(data.get("result"), dict) else data
+    return {
+        "items": lots, "fields": fields, "keys": keys, "newest": newest,
+        "title_hits": sum(1 for title in titles if stems and any(stem in title for stem in stems)),
+        "result_keys": list(result)[:25] if isinstance(result, dict) else [],
+        "time_paths": _time_paths(items[0]) if items else [],
+        "first_item": orjson.dumps(items[0]).decode("utf-8", "replace")[:700] if items else "",
+    }
+
+
 def _json_headers(url: str, referer: str) -> dict:
     same_site = urlsplit(url).netloc == urlsplit(referer).netloc
     return {
@@ -183,7 +226,8 @@ def _json_headers(url: str, referer: str) -> dict:
 
 # ── Requests ──────────────────────────────────────────────────────────────
 
-async def _raw(client, session, channel: str, name: str, url: str, headers: dict, page_ids: list[str]) -> Probe:
+async def _raw(client, session, channel: str, name: str, url: str, headers: dict, page_ids: list[str],
+               stems: Optional[list[str]] = None) -> Probe:
     result = Probe(channel, name, of=len(page_ids))
     try:
         await client.wait_for_rate_slot(deadline=time.monotonic() + RATE_WAIT_S)
@@ -217,8 +261,11 @@ async def _raw(client, session, channel: str, name: str, url: str, headers: dict
     except (orjson.JSONDecodeError, TypeError, ValueError):
         return result
     result.json_ok = True
-    result.items, result.fields, result.item_keys, newest = analyze_json(data)
-    result.newest_age_s = int(time.time() - newest) if newest else None
+    described = describe_json(data, stems or [])
+    result.items, result.fields, result.item_keys = described["items"], described["fields"], described["keys"]
+    result.title_hits, result.result_keys = described["title_hits"], described["result_keys"]
+    result.time_paths, result.first_item = described["time_paths"], described["first_item"]
+    result.newest_age_s = int(time.time() - described["newest"]) if described["newest"] else None
     return result
 
 
@@ -252,9 +299,11 @@ async def probe_channel(client, search_url: str, user_url: Optional[str]) -> tup
         canonical = parser._canonical_cache.get(search_url, search_url)
         page_headers = dict(_default_headers(), Referer=canonical)
         results.append(await _raw(client, session, channel, "страница, замер", canonical, page_headers, page_ids))
+        stems = query_stems(search_url)
         for candidate in candidates(canonical, hints, user_url):
             results.append(await _raw(
                 client, session, channel, candidate.name, candidate.url, _json_headers(candidate.url, canonical), page_ids,
+                stems,
             ))
         return results, hints
     finally:
@@ -338,7 +387,9 @@ def _summary(per_channel: list[list[Probe]]) -> list[str]:
             compare = f" · {kb:.0f} КБ против {page_kb:.0f} у страницы, {ms / 1000:.1f} с против {page_ms / 1000:.1f}"
         missing = sorted({label for p in answered if p.json_ok for label, ok in p.fields.items() if not ok})
         fields = f" · нет полей: {', '.join(missing)}" if missing else ""
-        lines.append(f"- {name}: {_verdict(probes)}{compare}{fields}")
+        best = max((p for p in answered if p.json_ok), key=lambda p: p.items, default=None)
+        words = f" · слова запроса в названиях: {best.title_hits} из {best.items}" if best and best.items else ""
+        lines.append(f"- {name}: {_verdict(probes)}{compare}{words}{fields}")
     return lines
 
 
@@ -384,6 +435,16 @@ def build_report(search_url: str, user_url: Optional[str], per_channel: list[lis
                 samples[probe.name] = probe.sample
     if keys:
         lines += ["", "## Поля лотов в JSON", *(f"{name}: {', '.join(found)}" for name, found in keys.items())]
+    shapes = {}
+    for probes in per_channel:
+        for probe in probes:
+            if probe.json_ok and probe.name not in shapes:
+                shapes[probe.name] = probe
+    for name, probe in shapes.items():
+        lines += ["", f"## Устройство ответа: {name}",
+                  f"ключи ответа: {', '.join(probe.result_keys) or '—'}",
+                  f"поля времени у лота: {'; '.join(probe.time_paths) or 'не нашлось'}",
+                  f"первый лот: {probe.first_item or '—'}"]
     if samples:
         lines += ["", f"## Начало ответов ({SAMPLE_CHARS} символов)", *(f"{name}: {text}" for name, text in samples.items())]
     return "\n".join(lines)

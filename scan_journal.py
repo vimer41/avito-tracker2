@@ -126,6 +126,13 @@ def forget(radar_id: int) -> None:
     _lots.pop(int(radar_id), None)
 
 
+def reset() -> None:
+    """«Start over» in the admin panel: scans and lots of every radar start empty. The lot decisions stay:
+    «why did this lot not come» must still answer for lots found before the reset."""
+    _scans.clear()
+    _lots.clear()
+
+
 def summary(radar_id: int, window: float = 3600.0, now: Optional[float] = None) -> dict:
     """Real check rate over the last `window` seconds: gaps between scans, share of failures."""
     now = now or time.time()

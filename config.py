@@ -108,6 +108,8 @@ PROXY_MIN_RATE = positive_float_setting("PROXY_MIN_RATE", "0.5")
 # ~0.35 req/s per IP; two nearly double it, the rate limit and the 403 ratio limiter still hold per IP.
 # The admin switches 1/2 live (bot_settings.proxy_lanes); the server channel always has one.
 PROXY_MAX_IN_FLIGHT = positive_int_setting("PROXY_MAX_IN_FLIGHT", "2")
+# «Start over» mark of the admin panel (epoch seconds, bot_settings.report_since): reports count from it; 0 = off.
+REPORT_SINCE = 0.0
 PROXY_FAILURE_THRESHOLD = positive_int_setting("PROXY_FAILURE_THRESHOLD", "3")
 PROXY_BLOCK_WINDOW_SECONDS = positive_int_setting("PROXY_BLOCK_WINDOW_SECONDS", "600")
 PROXY_BLOCK_RATIO_THRESHOLD = positive_float_setting("PROXY_BLOCK_RATIO_THRESHOLD", "0.05")

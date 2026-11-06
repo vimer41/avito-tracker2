@@ -2,6 +2,7 @@ import asyncio
 import html
 import json
 import logging
+import time
 from aiogram import Router, F, Bot
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -2177,6 +2178,13 @@ async def cmd_admin_logs_menu(event):
     )
     if debug_left > 0:
         menu_text += f"\n\n{ui.e('time')} Подробный режим: ещё {int(debug_left // 60) + 1} мин."
+    since = float(config.REPORT_SINCE or 0.0)
+    if since:
+        stamp = datetime_msk(since)
+        menu_text += (
+            f"\n\n{ui.e('refresh')} Замер идёт с <b>{stamp}</b> МСК: отчёты, /stats, карточки прокси "
+            "и «Сканы радаров» считают только с этой минуты."
+        )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [ui.btn("Отчёт для отладки", "stats", callback_data="admin_log_get:report", style="primary")],
@@ -2186,6 +2194,8 @@ async def cmd_admin_logs_menu(event):
         [ui.btn("Почему не пришёл лот", "scope", callback_data="admin_lot_prompt")],
         [ui.btn("Выключить подробный режим" if debug_left > 0 else "Подробно на 10 мин", "scope",
                 callback_data="admin_log_debug")],
+        [ui.btn("Начать замер заново", "refresh", callback_data="admin_hist_reset")],
+        *([[ui.btn("Показывать всю историю", "logs", callback_data="admin_hist_all")]] if since else []),
         [ui.btn("Все логи (ZIP)", "box", callback_data="admin_log_get:all_zip")],
         [
             InlineKeyboardButton(text="bot.log", callback_data="admin_log_get:bot"),
@@ -2210,6 +2220,58 @@ async def cmd_admin_logs_menu(event):
             pass
 
     await message.answer(menu_text, reply_markup=kb, parse_mode="HTML")
+
+
+def datetime_msk(epoch: float) -> str:
+    return time.strftime("%d.%m %H:%M", time.gmtime(float(epoch) + 3 * 3600))
+
+
+@router.callback_query(F.data == "admin_hist_reset")
+async def cb_admin_hist_reset(call: CallbackQuery):
+    """Asks first: after «start over» the reports no longer show what happened before."""
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    text = (
+        f"{ui.e('refresh')} <b>Начать замер заново?</b>\n\n"
+        "С этой минуты «Нагрузка», «Отчёт для отладки», «Готовность к продаже», /stats, карточки прокси "
+        "и «Сканы радаров» считают только новые данные. Удобно сразу после обновления или смены прокси.\n"
+        "<blockquote>Файлы логов не удаляются: по ним работают «Почему не пришёл лот» и разбор споров по оплатам. "
+        "Старые данные вернёт кнопка «Показывать всю историю».</blockquote>"
+    )
+    await _show(call, text, InlineKeyboardMarkup(inline_keyboard=[
+        [ui.btn("Да, начать заново", "refresh", callback_data="admin_hist_reset_yes", style="danger")],
+        [ui.btn("Отмена", "cancel", callback_data="admin_logs_menu")],
+    ]))
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin_hist_reset_yes")
+async def cb_admin_hist_reset_yes(call: CallbackQuery):
+    import scan_journal
+    from runtime_metrics import METRICS
+
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    now = time.time()
+    config.REPORT_SINCE = now
+    await database.set_bot_setting("report_since", f"{now:.0f}")
+    METRICS.reset_history()
+    scan_journal.reset()
+    await database.log_admin_action(call.from_user.id, None, "report_reset", datetime_msk(now))
+    await cmd_admin_logs_menu(call)
+
+
+@router.callback_query(F.data == "admin_hist_all")
+async def cb_admin_hist_all(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    config.REPORT_SINCE = 0.0
+    await database.set_bot_setting("report_since", "0")
+    await database.log_admin_action(call.from_user.id, None, "report_reset", "вся история")
+    await cmd_admin_logs_menu(call)
 
 
 def _debug_live_state() -> dict:
@@ -2258,12 +2320,14 @@ async def _log_report(*args: str, live_state: dict | None = None) -> str:
 
 
 async def _report_text(args: tuple, build, *build_args) -> str:
-    """The report from a separate process; in this process if that one failed."""
+    """The report from a separate process; in this process if that one failed. Both count from the
+    «start over» mark when it is set."""
+    since = float(config.REPORT_SINCE or 0.0)
     try:
-        return await _log_report(*args, live_state=_debug_live_state())
+        return await _log_report(*args, *(("--since", f"{since:.0f}") if since else ()), live_state=_debug_live_state())
     except (OSError, RuntimeError, asyncio.TimeoutError) as exc:
         logger.warning("Отчёт отдельным процессом не построен (%s), строю в боте", str(exc)[:200])
-        return await asyncio.to_thread(build, *build_args, _debug_live_state())
+        return await asyncio.to_thread(build, *build_args, _debug_live_state(), since=since)
 
 
 async def _send_debug_report(message: Message, minutes: int) -> None:
@@ -3220,7 +3284,9 @@ async def _render_proxy_card(proxy_id: str, page: int) -> tuple[str, InlineKeybo
     summary = next((s for s in METRICS.get_proxy_summaries() if s["proxy_id"] == proxy_id), None)
     if summary is not None:
         lines += ["", "<b>За 60 минут</b>", *channel_card(summary)]
-    stats = await asyncio.to_thread(log_report.channel_history, "direct" if is_direct else _proxy_host(url))
+    stats = await asyncio.to_thread(
+        log_report.channel_history, "direct" if is_direct else _proxy_host(url), 24, float(config.REPORT_SINCE or 0.0)
+    )
     if stats is not None:
         lines += ["", *_channel_day_lines(stats)]
     if summary is None and stats is None:

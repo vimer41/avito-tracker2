@@ -1054,6 +1054,12 @@ async def init_db():
             lanes_row = await cur.fetchone()
         if lanes_row is not None and str(lanes_row[0]) in ("1", "2"):
             config.PROXY_MAX_IN_FLIGHT = int(lanes_row[0])
+        async with db.execute("SELECT value FROM bot_settings WHERE key = 'report_since'") as cur:
+            since_row = await cur.fetchone()
+        try:
+            config.REPORT_SINCE = float(since_row[0]) if since_row is not None and since_row[0] else 0.0
+        except (TypeError, ValueError):
+            config.REPORT_SINCE = 0.0
         logger.info("База данных успешно инициализирована")
 
 

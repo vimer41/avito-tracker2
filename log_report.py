@@ -170,9 +170,19 @@ def _channels(metrics: list[dict]) -> dict[str, dict]:
     return merged
 
 
-def channel_history(name: str, hours: int = 24) -> Optional[dict]:
+def report_start(window_seconds: float, since: float = 0.0, now: Optional[float] = None) -> tuple[float, str]:
+    """Where a report starts: its window, or the admin's «start over» mark when that is later; plus a note."""
+    now = time.time() if now is None else now
+    start = now - window_seconds
+    if since and since > start:
+        stamp = time.strftime("%d.%m %H:%M", time.gmtime(since + 3 * 3600))
+        return since, f"Отсчёт с {stamp} МСК: раньше нажата «Начать замер заново», более старые данные не входят."
+    return start, ""
+
+
+def channel_history(name: str, hours: int = 24, since: float = 0.0) -> Optional[dict]:
     """One channel's totals from the minute rows; they survive restarts, unlike METRICS."""
-    rows = read_rows(METRICS_LOG, time.time() - hours * 3600)
+    rows = read_rows(METRICS_LOG, report_start(hours * 3600, since)[0])
     stats = _channels(rows).get(name)
     if stats is None:
         return None
@@ -440,14 +450,15 @@ def _section(title: str, lines: list[str]) -> list[str]:
     return [f"## {title}", *(lines or ["нет данных"]), ""]
 
 
-def build_report(minutes: int = 60, live_state: Optional[dict] = None) -> str:
+def build_report(minutes: int = 60, live_state: Optional[dict] = None, since: float = 0.0) -> str:
     now = time.time()
-    since = now - minutes * 60
+    since, mark_note = report_start(minutes * 60, since, now)
     events = read_rows(EVENTS_LOG, since)
     metrics = read_rows(METRICS_LOG, since)
     stamp = time.strftime("%Y-%m-%d %H:%M", time.gmtime(now + 3 * 3600))
     lines = [f"# Avito Radar: отчёт за {minutes} мин, {stamp} МСК",
-             f"Минутных строк: {len(metrics)}, событий: {len(events)}.{_capped_note(events)}", ""]
+             f"Минутных строк: {len(metrics)}, событий: {len(events)}.{_capped_note(events)}",
+             *([mark_note] if mark_note else []), ""]
     lines += _section("Главное", [f"- {note}" for note in findings(metrics, events)])
     lines += _section("Запуски", _restarts(events))
     if live_state:
@@ -689,15 +700,18 @@ def _outage_lines(metrics: list[dict]) -> list[str]:
     return lines
 
 
-def build_readiness(hours: int = 24, live_state: Optional[dict] = None) -> str:
+def build_readiness(hours: int = 24, live_state: Optional[dict] = None, since: float = 0.0) -> str:
     """The sale decision on one page: verdict first, then the numbers behind each point."""
     now = time.time()
-    events = read_rows(EVENTS_LOG, now - hours * 3600, READINESS_TAGS)
-    metrics = read_rows(METRICS_LOG, now - hours * 3600)
-    checks = readiness_checks(metrics, events, hours)
+    start, mark_note = report_start(hours * 3600, since, now)
+    events = read_rows(EVENTS_LOG, start, READINESS_TAGS)
+    metrics = read_rows(METRICS_LOG, start)
+    # After «start over» the uptime share is measured against the time since the mark, not the whole window.
+    checks = readiness_checks(metrics, events, max((now - start) / 3600, 1 / 60))
     stamp = time.strftime("%Y-%m-%d %H:%M", time.gmtime(now + 3 * 3600))
     lines = [f"# Avito Radar: готовность к продаже за {hours} ч, {stamp} МСК",
-             f"Минутных строк: {len(metrics)}, событий: {len(events)}.{_capped_note(events)}", ""]
+             f"Минутных строк: {len(metrics)}, событий: {len(events)}.{_capped_note(events)}",
+             *([mark_note] if mark_note else []), ""]
     lines += _section("Вердикт", [readiness_verdict(checks)])
     lines += _section("Критерии", checks)
     lines += _section("Скорость лота", _lot_timing(events))
@@ -715,7 +729,7 @@ def build_readiness(hours: int = 24, live_state: Optional[dict] = None) -> str:
     stalls = _stall_lines(metrics)
     if stalls:
         lines += _section("Зависания", stalls)
-    crash = _crash_tail(now - hours * 3600)
+    crash = _crash_tail(start)
     if crash:
         lines += _section("crash.log", crash)
     return "\n".join(lines)
@@ -1074,14 +1088,15 @@ def _load_timeline(metrics: list[dict]) -> list[str]:
     return lines
 
 
-def build_load(minutes: int = 60, live_state: Optional[dict] = None) -> str:
+def build_load(minutes: int = 60, live_state: Optional[dict] = None, since: float = 0.0) -> str:
     """The load test on one page: does the bot keep the plan, what holds it back, how many links the channels carry."""
     now = time.time()
-    rows = read_rows(METRICS_LOG, now - minutes * 60)
+    start, mark_note = report_start(minutes * 60, since, now)
+    rows = read_rows(METRICS_LOG, start)
     metrics = [row for row in rows if "load" in row]
     stamp = time.strftime("%Y-%m-%d %H:%M", time.gmtime(now + 3 * 3600))
     lines = [f"# Avito Radar: нагрузка за {minutes} мин, {stamp} МСК",
-             f"Минут с замером нагрузки: {len(metrics)} из {len(rows)}."]
+             f"Минут с замером нагрузки: {len(metrics)} из {len(rows)}.", *([mark_note] if mark_note else [])]
     if not metrics:
         lines += ["", "Нет данных о нагрузке: бот работает без этого обновления или только что запущен."]
         return "\n".join(lines)
@@ -1126,6 +1141,7 @@ def main() -> None:
     args.add_argument("--minutes", type=int, default=60)
     args.add_argument("--ready", type=int, default=0)
     args.add_argument("--load", type=int, default=0, help="minutes of the load report")
+    args.add_argument("--since", type=float, default=0.0, help="epoch of the admin's «start over» mark")
     args.add_argument("--trace", default="")
     args.add_argument("--radar", type=int, default=0)
     args.add_argument("--chat", type=int, default=0)
@@ -1144,13 +1160,13 @@ def main() -> None:
         print(json.dumps(lot_history(options.lot), ensure_ascii=False))
         return
     if options.ready:
-        print(build_readiness(options.ready, live_state))
+        print(build_readiness(options.ready, live_state, since=options.since))
         return
     if options.load:
-        print(build_load(options.load, live_state))
+        print(build_load(options.load, live_state, since=options.since))
         return
     if not (options.trace or options.radar or options.chat or options.grep):
-        print(build_report(options.minutes, live_state))
+        print(build_report(options.minutes, live_state, since=options.since))
         return
     rows = read_rows(EVENTS_LOG, time.time() - options.minutes * 60)
     for row in select(rows, options.trace, options.radar, options.chat, options.grep)[-options.limit:]:

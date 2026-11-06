@@ -215,14 +215,11 @@ def pack_database_backup() -> Optional[str]:
 # Admins get the current note once, when a release carrying it is up: then they know the deploy went through.
 # A new note needs a new id; restarts of the same release send nothing.
 RELEASE_NOTE_KEY = "release_note_sent"
-RELEASE_NOTE_ID = "2026-11-06-load"
-RELEASE_NOTE_TITLE = "Обновлено 06.11.2026, вечер"
+RELEASE_NOTE_ID = "2026-11-06-reset"
+RELEASE_NOTE_TITLE = "Обновлено 06.11.2026, второй раз"
 RELEASE_NOTE_LINES = (
-    "2 запроса одновременно на прокси (выключатель: Сеть → «⚡ Запросов на прокси»)",
-    "мощность считается по реальной скорости прокси, при нехватке интервалы растягиваются поровну",
-    "запрос без ответа обрывается через 6 с и повторяется на другом прокси",
-    "отчёт «Нагрузка за час» (/load) и разовая проверка JSON (/jsonprobe)",
-    "«Удалить все» в «Мои радары» у админа",
+    "Логи → «Начать замер заново»: отчёты, /stats и карточки прокси считают с этой минуты",
+    "/jsonprobe: слова запроса в названиях, поля времени и ещё 2 варианта мобильного API",
 )
 # The deploy calls a release good after 20 s of uptime; the note waits past that.
 RELEASE_NOTE_DELAY = 30.0

@@ -617,6 +617,15 @@ class RuntimeMetricsRegistry:
             self._reset_daily()
         return summary
 
+    def reset_history(self) -> None:
+        """«Start over» in the admin panel: minute buckets, channel rings and per-link totals start empty,
+        so /stats, the channel cards and measured capacity show only what happens from now. The daily totals
+        of the morning report stay; channel states come back with the next snapshot."""
+        self._buckets = [MinuteBucket() for _ in range(self.NUM_BUCKETS)]
+        self._proxy_rings.clear()
+        self._source_stats = {}
+        self._last_row_minute = self._current_minute_id() - 1
+
     def _current_minute_id(self) -> int:
         return int(self._monotonic() // 60.0)
 
