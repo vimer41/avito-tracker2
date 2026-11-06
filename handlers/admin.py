@@ -2976,6 +2976,11 @@ async def _render_net(note: str = "") -> tuple[str, InlineKeyboardMarkup]:
     lines += [_channel_label(snap) for snap in snaps[:NET_CHANNELS_SHOWN]] or ["⏸ нет активных каналов — сканирование стоит"]
     if len(snaps) > NET_CHANNELS_SHOWN:
         lines.append(f"… и ещё {len(snaps) - NET_CHANNELS_SHOWN} — полный список в «🗂 Мои прокси»")
+    if snaps:
+        lines.append(
+            "<i>🟢 работает · 🟡 после паузы: позеленеет после первого удачного запроса или «🧪 Проверить каналы» · "
+            "🔴 пауза после блока Авито</i>"
+        )
     if mode in ("proxy", "both", "smart") and not pool.has_configured_proxy():
         lines += ["", "⚠️ Прокси не подключены — нажмите «➕ Добавить прокси»."]
     if pool.pool_file_overrides_single_proxy():
@@ -3097,10 +3102,20 @@ async def _probe_all_channels() -> str:
     results = await _probe_many(urls, attempts)
     target = (await _probe_target_url() or DEFAULT_PROBE_URL)[:80]
     lines = [f"🧪 <b>Проверка каналов</b> · по {attempts} запроса подряд", f"Поиск: <code>{html.escape(target)}</code>", ""]
+    clients = {client.proxy_url: client for client in get_proxy_pool().clients}
+    recovered = 0
     for url in urls:
         result = results[url]
         icon = "🟢" if result.successes == len(result.attempts) else ("🟡" if result.successes else "🔴")
         lines.append(f"{icon} {html.escape(_proxy_host(url))} — {_probe_summary(result)}")
+        # A channel resting after a block («после паузы») that answered every attempt is working again:
+        # without this it stays yellow until a scan goes through it, and with no radars that never happens.
+        client = clients.get(url)
+        if client is not None and result.attempts and result.successes == len(result.attempts) and client.state == "half_open":
+            client.record_success()
+            recovered += 1
+    if recovered:
+        lines += ["", f"🟢 Снова зелёные после проверки: {recovered}."]
     return "\n".join(lines[:60])
 
 

@@ -27,6 +27,7 @@ def get_capacity_mode_intervals() -> dict[str, tuple[float, float]]:
 
 
 CAPACITY_MODE_INTERVALS: dict[str, tuple[float, float]] = get_capacity_mode_intervals()
+BULK_NEW_SOURCES = 5  # more new links than this in one pass start spread over their interval
 
 
 @dataclass
@@ -248,6 +249,11 @@ class DeadlineScheduler:
             del self.sources[key]
 
         total_groups = max(1, len(groups))
+        # Many links added at once (an admin's bulk add) start spread over their interval. All due at once kept
+        # every channel flat out for minutes and Avito answered with a wave of 403s (130 links, 06.11).
+        # A link added on its own is still scanned at once.
+        new_keys = [key for key in sorted(groups) if key not in self.sources]
+        new_rank = {key: index for index, key in enumerate(new_keys)} if len(new_keys) > BULK_NEW_SOURCES else {}
         for rank, key in enumerate(sorted(groups)):
             radars = groups[key]
             revision = compute_group_revision(radars)
@@ -256,7 +262,10 @@ class DeadlineScheduler:
             state = self.sources.get(key)
             if state is None:
                 self._generation += 1
-                offset = (rank / total_groups) * min(startup_spread, interval) if startup else 0.0
+                if startup:
+                    offset = (rank / total_groups) * min(startup_spread, interval)
+                else:
+                    offset = (new_rank[key] / len(new_keys)) * interval if key in new_rank else 0.0
                 persisted = (persisted_states or {}).get(key) or {}
                 top_ids = tuple(persisted.get("last_top_ids") or ())
                 processed_at = float(persisted.get("processed_at") or 0.0)

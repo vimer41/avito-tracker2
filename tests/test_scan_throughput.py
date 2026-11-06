@@ -105,6 +105,22 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool.total_lanes(), 3)
 
 
+class TestBulkAdd(unittest.TestCase):
+    def test_a_bulk_add_starts_spread_and_a_single_link_at_once(self):
+        from scan_planner import DeadlineScheduler
+
+        planner = DeadlineScheduler()
+        planner.sync({"old": []}, {"old": 20}, 100, startup=True)
+        groups = {"old": [], **{f"n{i}": [] for i in range(10)}}
+        planner.sync(groups, {key: 20 for key in groups}, 101)
+        dues = sorted(planner.sources[f"n{i}"].due_at for i in range(10))
+        self.assertEqual(dues[0], 101)
+        self.assertAlmostEqual(dues[-1], 101 + 18, places=5, msg="10 links over one 20 s interval")
+        groups["single"] = []
+        planner.sync(groups, {key: 20 for key in groups}, 102)
+        self.assertEqual(planner.sources["single"].due_at, 102, "a link added on its own is scanned at once")
+
+
 class TestHonestCapacity(unittest.TestCase):
     def test_capacity_is_lanes_over_service_time_not_the_rate_limit(self):
         clock = [1000.0]

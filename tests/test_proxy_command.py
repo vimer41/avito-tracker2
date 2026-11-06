@@ -204,6 +204,20 @@ class TestNetworkScreen(ProxyEnvMixin, DispatcherFixture, unittest.IsolatedAsync
         self.assertEqual(config.NET_MODE, "direct")
         self.assertEqual(self.channels(), ["direct"])
 
+    async def test_a_resting_proxy_that_passes_the_check_turns_green(self):
+        await self.dispatch_callback("admin_net_add", config.ADMIN_ID)
+        with patch.object(proxy_check, "exit_ips_for", new=exit_ips({PROXY_URL: "10.1.2.3"})), \
+                patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=probe(True, True))):
+            await self.dispatch_message(text=PROXY_RAW, user_id=config.ADMIN_ID)
+        client = next(c for c in proxy_pool.get_proxy_pool().clients if c.proxy_url == PROXY_URL)
+        client._state = "half_open"  # rested after a 403 and no scan has gone through it since
+        await self.dispatch_callback("admin_net", config.ADMIN_ID)
+        self.assertIn("позеленеет после первого удачного запроса", self.methods("EditMessageText")[-1].text)
+        with patch.object(proxy_check, "probe_channel", new=AsyncMock(return_value=probe(True, True))):
+            await self.dispatch_callback("admin_net_probe", config.ADMIN_ID)
+        self.assertEqual(client.state, "healthy")
+        self.assertIn("Снова зелёные после проверки: 1", self.methods("EditMessageText")[-1].text)
+
     async def test_each_proxy_opens_its_own_statistics_card(self):
         await self.dispatch_callback("admin_net_add", config.ADMIN_ID)
         with patch.object(proxy_check, "exit_ips_for", new=exit_ips({PROXY_URL: "10.1.2.3"})), \
