@@ -45,11 +45,9 @@ class FakeSession:
             return answer(200, mobile_json(IDS))
         if ".data" in url:
             return answer(404, "not found", "text/plain")
-        if "m.avito.ru" in url and "lastStamp=" in url:
-            return answer(200, json.dumps({"status": "ok", "result": {"items": [], "lastStamp": 1793987000}}))
         if "m.avito.ru" in url and "categoryId=" in url:
             data = json.loads(mobile_json(IDS))
-            data["result"]["lastStamp"] = 1793987000
+            data["result"].update(lastStamp=1793987000, count=5, totalCount=5)
             return answer(200, json.dumps(data))
         if "m.avito.ru" in url:
             return answer(403, "<div class='firewall-container'>доступ ограничен</div>", "text/html")
@@ -102,16 +100,18 @@ class TestJsonProbe(unittest.IsolatedAsyncioTestCase):
             report = await json_probe.run_probe("https://www.avito.ru/kazan?q=lamp", pool=pool)
 
         summary = report.split("## Итог\n", 1)[1].split("\n\n", 1)[0]
-        self.assertIn("- данные маршрута routes/search: ✅ те же лоты (5 из 5) на всех каналах", summary)
+        self.assertIn("- данные маршрута routes/search: ✅ те же лоты (5 из 5) на всех живых каналах (1)", summary)
         self.assertIn("нет полей: продавец", summary)
         self.assertIn("слова запроса в названиях: 0 из 5", summary)
         self.assertIn("поля времени у лота: time=", report)
         self.assertIn('первый лот: {"id":4000000000', report)
         self.assertIn("- мобильный API /api/11/items: ❌ блок или капча", summary)
-        self.assertIn("- мобильный API 11 + категория: ✅ те же лоты (5 из 5) на всех каналах", summary)
-        self.assertIn("1.2.3.4:5500 · мобильный API 11 + категория: новые за час (lastStamp) · 200", report)
-        self.assertIn("мобильный API 11 + категория: новые после ответа (lastStamp) · 200", report)
-        self.assertIn("lastStamp=1793983400", " ".join(session.urls), "an hour before the answer's stamp")
+        self.assertIn("- мобильный API 11 + категория: ✅ те же лоты (5 из 5) на всех живых каналах (1)", summary)
+        self.assertIn("обычных со страницы 5 из 5, рекламных 0 из 0", summary)
+        self.assertNotIn("lastStamp=", " ".join(session.urls), "lastStamp is not a filter: no longer tried")
+        self.assertIn("счётчики: count=5", report)
+        self.assertIn("порядок обычных как на странице: 4 из 4 пар", report)
+        self.assertIn("обычный на странице: 4000000000", report)
         self.assertIn('первый лот: {"id":4000000000', report)
         first_lots = [line for line in report.splitlines() if line.startswith("первый лот:")]
         self.assertTrue(first_lots)
@@ -149,7 +149,8 @@ class TestJsonProbe(unittest.IsolatedAsyncioTestCase):
     async def test_json_is_probed_even_where_the_page_was_blocked(self):
         blocked, good = proxy_pool.ProxyClient(PROXY_URL), proxy_pool.ProxyClient("http://user:pass@5.6.7.8:5500")
         sessions = {blocked: FakeSession(), good: FakeSession()}
-        patches = [patch.object(json_probe.AvitoParser, "fetch_page_async", new=AsyncMock(side_effect=[None, search_page()]))]
+        patches = [patch.object(json_probe.AvitoParser, "fetch_page_async", new=AsyncMock(side_effect=[None, search_page()])),
+                   patch.object(json_probe, "PROBE_SPARE_BEST", 0)]
         for client in (blocked, good):
             patches += [patch.object(client, "lane_sessions", return_value={json_probe.PROBE_LANE: sessions[client]}),
                         patch.object(client, "wait_for_rate_slot", new=AsyncMock())]
@@ -160,6 +161,54 @@ class TestJsonProbe(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1.2.3.4:5500 · данные маршрута routes/search · 200", report)
         self.assertNotIn("1.2.3.4:5500 · страница, замер", report, "no second page load where the page failed")
         self.assertIn("5.6.7.8:5500 · страница, замер · 200", report)
+
+    def test_a_filter_in_the_path_comes_from_the_page_settings_and_the_category_from_its_lots(self):
+        lots = [{"id": lot, "title": "куртка", "categoryId": 27, "locationId": 653240} for lot in IDS]
+        state = {"loaderData": {"data": {
+            "menu": [{"id": 5, "categoryId": 9}] * 9,
+            "searchCore": {"categoryId": 27, "locationId": 653240, "params": {"178": "1234", "550": [5, 6]}},
+            "catalog": {"items": lots}}}}
+        html = '{"categoryId":9}' * 9 + "<script>" + json.dumps(state) + "</script>"
+        hints = json_probe.page_hints(html, IDS, "https://www.avito.ru/sankt-peterburg/odezhda/muzhskaya-ASgB?q=x")
+        self.assertEqual((hints["category_id"], hints["category_source"]), ("27", "по лотам (5)"))
+        self.assertEqual(hints["settings"][0][0], "searchCore")
+        found = json_probe.candidates("https://www.avito.ru/sankt-peterburg/odezhda/muzhskaya-ASgB?q=x", hints, None)
+        url = next(c.url for c in found if c.name == "мобильный API 11 + фильтры страницы")
+        self.assertIn("categoryId=27", url)
+        self.assertIn("params%5B178%5D=1234", url)
+        self.assertIn("params%5B550%5D%5B%5D=5", url)
+        self.assertIn("params%5B550%5D%5B%5D=6", url)
+
+    def test_ads_and_relative_times_are_shown_by_example(self):
+        reference = json_probe.PageResult(None, "c", None, json_probe.Probe("c", "p"),
+                                          organic_ids=IDS[:3], promoted_ids=IDS[3:], stamps={IDS[0]: int(time.time() * 1000) - 120_000})
+        data = {"result": {"items": [{"type": "item", "value": {"id": int(lot), "title": "x", "freeForm": [{"text": "5 минут назад"}],
+                                                                "badgeBar": {"badges": [{"title": "Продвинуто"}]} if lot in IDS[3:] else {}}}
+                                     for lot in IDS]}}
+        probe = json_probe.Probe("c", "api")
+        json_probe.compare_with_page(probe, data, reference)
+        self.assertEqual((probe.organic_hits, probe.organic_of, probe.promo_hits, probe.promo_of), (3, 3, 2, 2))
+        self.assertIn("Продвинуто", probe.promo_dump)
+        self.assertIn("на странице 2 мин назад", probe.organic_dump)
+        described = json_probe.describe_json(data, [])
+        self.assertIn("freeForm[0].text=5 минут назад", described["time_paths"])
+
+    def test_id_order_against_time(self):
+        now = int(time.time() * 1000)
+        self.assertIn("в 2 из 2 пар", json_probe.id_time_agreement({"300000001": now - 3000, "300000002": now - 2000, "300000003": now}))
+
+    def test_verdict_ignores_channels_blocked_for_everything(self):
+        ok = json_probe.Probe("a", "api", status=200, matched=5, of=5)
+        dead = json_probe.Probe("b", "api", status=403, blocked=True)
+        self.assertIn("на всех живых каналах (1)", json_probe._verdict([ok, dead], {"a"}))
+
+    def test_the_best_proxies_are_left_to_the_scans(self):
+        def channel(health, direct=False):
+            return SimpleNamespace(is_direct=direct, state="healthy", long_health=lambda h=health: h)
+        server, proxies = channel(0, True), [channel(h / 10) for h in range(9, 3, -1)]
+        picked = json_probe.pick_channels(SimpleNamespace(clients=[server, *proxies]))
+        self.assertEqual(picked, [server, *proxies[3:6]])
+        self.assertEqual(json_probe.pick_channels(SimpleNamespace(clients=proxies[:2])), [proxies[1]])
 
     async def test_no_channels_says_so(self):
         report = await json_probe.run_probe("https://www.avito.ru/kazan?q=lamp", pool=SimpleNamespace(clients=[]))
