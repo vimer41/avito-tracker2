@@ -41,6 +41,7 @@ os.environ.update({
     "ADMIN_IDS": "986832959,455386428",
     "DATA_DIR": str(root / "data"),
     "DB_PATH": str(root / "test.db"),
+    "BACKUP_DIR": str(root / "backups"),
     "LOGS_DIR": str(root / "logs"),
     "COMBINED_LOG": str(root / "bot.log"),
     "PROXY_URL": "",

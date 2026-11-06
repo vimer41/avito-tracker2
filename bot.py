@@ -12,8 +12,10 @@ from aiogram.exceptions import TelegramNetworkError
 from aiogram.types import BotCommand
 from aiogram.fsm.storage.memory import MemoryStorage
 
-import config
+import config  # first: loads .env before other modules read the environment
+import anti_bot.challenge_process as challenge_process
 import database
+import reports
 import ui
 from handlers import main_router
 from middlewares import AccessControlMiddleware, ActionLoggingMiddleware
@@ -145,6 +147,7 @@ async def main():
             config.STARS_SUBSCRIPTION_DAYS,
         )
         background_tasks = start_background_services(bot)
+        challenge_process.start_background()
         if config.PLATEGA_ENABLED:
             import platega_webhook
             import rub_payments
@@ -166,6 +169,7 @@ async def main():
             net_mode=config.NET_MODE,
             pid=os.getpid(),
         )
+        background_tasks.append(asyncio.create_task(reports.announce_release(bot, version), name="release-note"))
         await dp.start_polling(bot)
     finally:
         logger.info("Завершение работы бота...")
@@ -174,6 +178,7 @@ async def main():
         await asyncio.gather(*background_tasks, return_exceptions=True)
         await close_image_session()
         await close_proxy_pool()
+        challenge_process.shutdown()
         await database.close_db()
         if bot is not None:
             await bot.session.close()

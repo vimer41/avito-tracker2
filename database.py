@@ -4055,16 +4055,17 @@ async def purge_user_by_pattern(pattern: str) -> Dict[str, Any]:
 
         await db.commit()
 
-        try:
-            from logger_setup import sanitize_logs_for_user
-            sanitize_logs_for_user(clean)
-        except Exception as e:
-            logger.warning(f"Ошибка очистки логов при удалении пользователя {pattern}: {e}")
+    # Outside the write lock and off the event loop: a month of logs takes seconds to rewrite.
+    try:
+        from logger_setup import sanitize_logs_for_user
+        await asyncio.to_thread(sanitize_logs_for_user, clean)
+    except Exception as e:
+        logger.warning(f"Ошибка очистки логов при удалении пользователя {pattern}: {e}")
 
-        logger.info(f"🗑 Полностью удалены данные пользователей: {', '.join(deleted_users)}")
-        return {
-            "success": True,
-            "deleted": len(deleted_users),
-            "users": deleted_users,
-            "message": f"Успешно удалено: {', '.join(deleted_users)}"
-        }
+    logger.info(f"🗑 Полностью удалены данные пользователей: {', '.join(deleted_users)}")
+    return {
+        "success": True,
+        "deleted": len(deleted_users),
+        "users": deleted_users,
+        "message": f"Успешно удалено: {', '.join(deleted_users)}"
+    }

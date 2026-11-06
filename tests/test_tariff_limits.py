@@ -358,6 +358,41 @@ class TestDailyBackup(DatabaseCase):
         self.assertTrue(document.path.endswith(".db.gz"))
         self.assertFalse(Path(document.path).exists())
 
+    async def test_a_dated_copy_stays_on_the_server_for_two_weeks(self):
+        import gzip
+
+        backups = Path(config.BACKUP_DIR)
+        backups.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: [path.unlink() for path in backups.glob("daily-*.db.gz")])
+        for day in ("20260101", "20260102", "20260103"):
+            (backups / f"daily-{day}.db.gz").write_bytes(b"old")
+        bot = SimpleNamespace(send_document=AsyncMock(), send_message=AsyncMock())
+        with patch.object(config, "DAILY_BACKUP_KEEP", 2):
+            await reports.send_daily_backup(bot)
+        kept = sorted(path.name for path in backups.glob("daily-*.db.gz"))
+        self.assertEqual(kept[0], "daily-20260103.db.gz")
+        self.assertEqual(len(kept), 2)
+        with gzip.open(backups / kept[1]) as packed:
+            self.assertEqual(packed.read(15), b"SQLite format 3")
+        bot.send_document.assert_awaited_once()
+        self.assertEqual(config.DAILY_BACKUP_KEEP, 14)
+
+    async def test_admins_hear_about_the_release_once(self):
+        bot = SimpleNamespace(send_message=AsyncMock())
+        self.assertEqual(await reports.announce_release(bot, "abc1234", delay=0), len(config.ADMIN_IDS))
+        self.assertEqual({call.args[0] for call in bot.send_message.await_args_list}, set(config.ADMIN_IDS))
+        text = bot.send_message.await_args.args[1]
+        self.assertIn("Обновлено 06.11.2026", text)
+        self.assertIn("версия abc1234", text)
+        self.assertEqual(await reports.announce_release(bot, "abc1234", delay=0), 0, "a restart sends nothing")
+        self.assertEqual(bot.send_message.await_count, len(config.ADMIN_IDS))
+
+    async def test_an_undelivered_release_note_waits_for_the_next_start(self):
+        bot = SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("telegram down")))
+        self.assertEqual(await reports.announce_release(bot, "abc1234", delay=0), 0)
+        bot.send_message = AsyncMock()
+        self.assertEqual(await reports.announce_release(bot, "abc1234", delay=0), len(config.ADMIN_IDS))
+
     async def test_copy_over_the_telegram_limit_is_reported(self):
         bot = SimpleNamespace(send_document=AsyncMock(), send_message=AsyncMock())
         with patch.object(reports, "BACKUP_MAX_BYTES", 1):

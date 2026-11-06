@@ -27,16 +27,24 @@ import re
 import secrets
 import sys
 import time
-from pathlib import Path
 from threading import Event
 from typing import Any, Optional
 from urllib.parse import urljoin, urlsplit
 
 from curl_cffi import requests
 
+import anti_bot.challenge_process as challenge_process
+from anti_bot import geetest_solve
 from anti_bot.firewallpow_payload_reference import (
     build_get_payload,
     build_verify_payload,
+    decode_challenge_jwt,
+)
+from anti_bot.geetest_solve import (
+    GEETEST_BASE_URL,
+    GEETEST_CAPTCHA_ID,
+    GEETEST_LOAD_URL,
+    GeetestUnavailable,
 )
 from anti_bot.generate_qrator_variants import (
     DEFAULT_BASE_F,
@@ -67,13 +75,13 @@ QRATOR_FT_URL = f"{BASE_URL}/web/2/ft"
 QRATOR_PIXEL_URL = f"{BASE_URL}/web/1/u"
 QRATOR_FAVICON_URL = f"{BASE_URL}/favicon.ico"
 
-GEETEST_LOAD_URL = "https://gcaptcha4.geevisit.com/load"
-GEETEST_BASE_URL = "https://gcaptcha4.geevisit.com"
-GEETEST_CAPTCHA_ID = "2d9c743cf7d63dbc9db578a608196bcd"
+GEEKED_TEST_ROOT = geetest_solve.GEEKED_TEST_ROOT
+geetest_solve.ensure_geeked_path()
 
-GEEKED_TEST_ROOT = Path(__file__).resolve().parent / "GeekedTest"
-if str(GEEKED_TEST_ROOT) not in sys.path:
-    sys.path.insert(0, str(GEEKED_TEST_ROOT))
+# On top of the PoW search budget: the worker process's start-up and its answer.
+POW_PROCESS_SLACK = 10.0
+# Upper bound for one GeeTest solve in the worker, the scan's own deadline permitting.
+GEETEST_PROCESS_TIMEOUT = 45.0
 
 
 def get_browser_user_agent() -> str:
@@ -332,6 +340,28 @@ def extract_pow_challenge(response: Any, session: requests.Session) -> Optional[
     return None
 
 
+def _pow_verify_payload(
+    challenge_jwt: str,
+    *,
+    timeout: float,
+    max_iterations: int,
+    cancel_event: Event | None,
+) -> dict:
+    """The nonce is searched in the worker process; without one, in this thread as before."""
+    if challenge_process.enabled():
+        parameters = decode_challenge_jwt(challenge_jwt)
+        try:
+            nonce = challenge_process.run(
+                "pow", parameters.challenge_id, parameters.complexity, timeout, max_iterations,
+                timeout=timeout + POW_PROCESS_SLACK, cancel_event=cancel_event,
+            )
+        except challenge_process.ChallengeProcessUnavailable:
+            pass
+        else:
+            return {"challenge": challenge_jwt, "nonce": int(nonce)}
+    return build_verify_payload(challenge_jwt, timeout=timeout, max_iterations=max_iterations, cancel_event=cancel_event)
+
+
 def solve_pow_challenge(
     session: requests.Session,
     pow_challenge: str,
@@ -380,7 +410,7 @@ def solve_pow_challenge(
 
         # 2. Вычисление SHA-256 PoW
         logger.debug("🧩 firewallPow/get получен, вычисляем SHA-256 PoW...")
-        verify_payload = build_verify_payload(
+        verify_payload = _pow_verify_payload(
             challenge_jwt, timeout=pow_timeout, max_iterations=max_iterations, cancel_event=cancel_event,
         )
         check_cancelled(cancel_event)
@@ -450,18 +480,48 @@ def is_geetest_challenge(response: Any) -> bool:
 GEETEST_DIRECT = os.getenv("GEETEST_DIRECT", "1").strip() != "0"
 
 
+def _session_user_agent(avito_session: Any) -> str:
+    headers = getattr(avito_session, "headers", None) or {}
+    return headers.get("User-Agent") or headers.get("user-agent") or get_browser_user_agent()
+
+
 def _geetest_session(avito_session: Any) -> tuple[Any, bool]:
     """(session for GeeTest calls, whether it must be closed afterwards)."""
     if not GEETEST_DIRECT:
         return avito_session, False
-    headers = getattr(avito_session, "headers", None) or {}
-    user_agent = headers.get("User-Agent") or headers.get("user-agent") or get_browser_user_agent()
-    direct = requests.Session(
-        impersonate=BROWSER_PROFILE,
-        headers={"User-Agent": user_agent, "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"},
-        timeout=(5, 10),
-    )
-    return direct, True
+    return geetest_solve.direct_session(_session_user_agent(avito_session), BROWSER_PROFILE), True
+
+
+def _geetest_seccode(
+    session: Any,
+    captcha_id: str,
+    *,
+    cancel_event: Event | None,
+    deadline: float | None,
+) -> Optional[dict]:
+    """GeeTest's answer: from the worker process when GeeTest goes direct, else in this thread."""
+    if GEETEST_DIRECT and challenge_process.enabled():
+        budget = GEETEST_PROCESS_TIMEOUT
+        if deadline is not None:
+            budget = min(budget, deadline - time.monotonic())
+        if budget <= 0:
+            return None  # the scan is out of time: Avito's verify could not be sent anyway
+        try:
+            return challenge_process.run(
+                "geetest", captcha_id, _session_user_agent(session), BROWSER_PROFILE,
+                timeout=budget, cancel_event=cancel_event,
+            )
+        except challenge_process.ChallengeProcessUnavailable:
+            pass
+    geetest_session, owns_geetest_session = _geetest_session(session)
+    try:
+        return geetest_solve.request_seccode(geetest_session, captcha_id, cancel_event=cancel_event)
+    finally:
+        if owns_geetest_session:
+            try:
+                geetest_session.close()
+            except Exception:
+                pass
 
 
 def solve_geetest_if_available(
@@ -470,83 +530,22 @@ def solve_geetest_if_available(
     page_url: str,
     *,
     cancel_event: Event | None = None,
+    deadline: float | None = None,
 ) -> bool:
     """
-    Пытается решить GeeTest v4 локально с помощью модуля GeekedTest.
+    Решает GeeTest v4 модулем GeekedTest: в процессе антибота, если он запущен, иначе в этом потоке.
     Если ML-библиотеки (opencv, ddddocr, pycryptodome) не установлены,
     выводит понятное предупреждение в лог без падения бота.
     """
     check_cancelled(cancel_event)
-    geetest_session, owns_geetest_session = session, False
-    geeked_root_str = str(GEEKED_TEST_ROOT)
-    if geeked_root_str not in sys.path:
-        sys.path.insert(0, geeked_root_str)
-
     try:
-        from geeked import Geeked, CaptchaSolveRejected
-    except ImportError as e:
-        logger.warning(
-            "⚠️ Авито выдал визуальную капчу GeeTest v4! "
-            "Для автономного решения установите зависимости: "
-            "pip install opencv-python numpy pycryptodome requests ddddocr. "
-            f"(Причина отсутствия модуля: {e})"
-        )
-        return False
-
-    try:
-        text = getattr(response, "text", "") or ""
-        m = re.search(r"const\s+captchaId\s*=\s*['\"]([^'\"]+)['\"]", text)
-        captcha_id = m.group(1) if m else GEETEST_CAPTCHA_ID
-
+        captcha_id = geetest_solve.captcha_id_from_page(getattr(response, "text", "") or "")
         logger.debug(
             f"🤖 Запуск автономного решателя GeeTest v4 (id: {captcha_id}, "
             f"{'GeeTest напрямую с сервера' if GEETEST_DIRECT else 'через канал сканирования'})..."
         )
-        geetest_session, owns_geetest_session = _geetest_session(session)
-
-        # Получаем задачу от GeeTest
-        challenge = str(secrets.token_hex(16))
-        callback = f"geetest_{int(time.time() * 1000) + secrets.randbelow(10000)}"
-
-        load_resp = geetest_session.get(
-            GEETEST_LOAD_URL,
-            params={
-                "callback": callback,
-                "captcha_id": captcha_id,
-                "challenge": challenge,
-                "client_type": "web",
-                "lang": "rus",
-            },
-            headers={"Referer": BASE_URL + "/"},
-            timeout=(5, 10),
-            allow_redirects=False,
-        )
-        check_cancelled(cancel_event)
-        if load_resp.status_code != 200:
-            return False
-
-        match = re.fullmatch(rf"\s*{re.escape(callback)}\((.*)\)\s*;?\s*", load_resp.text, re.DOTALL)
-        if not match:
-            logger.warning("GeeTest load: некорректный JSONP ответ")
-            return False
-
-        load_data = json.loads(match.group(1))
-        if load_data.get("status") != "success":
-            return False
-
-        task_data = load_data.get("data", {})
-        solver = Geeked(
-            captcha_id,
-            lang="rus",
-            session=geetest_session,
-            request_headers={"Referer": BASE_URL + "/"},
-            cancel_event=cancel_event,
-        )
-        solver.lot_number = task_data.get("lot_number")
-        solver.base_url = GEETEST_BASE_URL
-
-        seccode = solver.submit_captcha(task_data)
-        if not isinstance(seccode, dict) or "lot_number" not in seccode:
+        seccode = _geetest_seccode(session, captcha_id, cancel_event=cancel_event, deadline=deadline)
+        if seccode is None:
             return False
 
         # Подтверждение уходит на Авито с того же IP, который получил капчу (через канал сканирования)
@@ -583,15 +582,17 @@ def solve_geetest_if_available(
 
     except PowSearchError:
         raise
+    except GeetestUnavailable as e:
+        logger.warning(
+            "⚠️ Авито выдал визуальную капчу GeeTest v4! "
+            "Для автономного решения установите зависимости: "
+            "pip install opencv-python numpy pycryptodome requests ddddocr. "
+            f"(Причина отсутствия модуля: {e})"
+        )
+        return False
     except Exception as e:
         logger.warning(f"Не удалось решить GeeTest: {str(e)[:200]}")
         return False
-    finally:
-        if owns_geetest_session:
-            try:
-                geetest_session.close()
-            except Exception:
-                pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -625,12 +626,14 @@ def handle_anti_bot_challenge(
     page_url: str,
     *,
     cancel_event: Event | None = None,
+    deadline: float | None = None,
 ) -> bool:
     """
     Универсальный обработчик защиты Авито.
     Проверяет тип защиты (QRATOR, PoW 439, GeeTest) и решает её.
     True означает, что этап решения принят и можно повторить запрос.
     Это НЕ подтверждение доступа: вызывающий код обязан проверить исходную страницу.
+    deadline (time.monotonic) ограничивает решение GeeTest в процессе антибота сроком скана.
     """
     check_cancelled(cancel_event)
     # 1. QRATOR 302/429
@@ -644,6 +647,7 @@ def handle_anti_bot_challenge(
 
     # 3. GeeTest v4 Captcha
     if is_geetest_challenge(response):
-        return _timed_solve("geetest", solve_geetest_if_available, session, response, page_url, cancel_event=cancel_event)
+        return _timed_solve("geetest", solve_geetest_if_available, session, response, page_url,
+                            cancel_event=cancel_event, deadline=deadline)
 
     return False

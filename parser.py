@@ -689,7 +689,9 @@ class AvitoParser:
 
                 temp_session.request = budgeted_bridge_request
 
-            accepted = handle_anti_bot_challenge(temp_session, response, actual_url, cancel_event=cancel_event)
+            accepted = handle_anti_bot_challenge(
+                temp_session, response, actual_url, cancel_event=cancel_event, deadline=deadline,
+            )
             check_cancelled(cancel_event)
             if accepted:
                 _copy_cookie_jar(temp_session.cookies.jar, cookie_jar)
@@ -1028,7 +1030,9 @@ class AvitoParser:
                             return None
                         challenge_attempts += 1
                         logger.debug("🛡 %s: проверка HTTP %s (попытка %d/2)", human, response.status_code, challenge_attempts)
-                        accepted = handle_anti_bot_challenge(self.session, response, actual_url, cancel_event=cancel_event)
+                        accepted = handle_anti_bot_challenge(
+                            self.session, response, actual_url, cancel_event=cancel_event, deadline=deadline,
+                        )
                         check_cancelled(cancel_event)
                         if not accepted:
                             if not self.is_blocked():

@@ -646,5 +646,78 @@ class TestProductionScanLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self._dead_link_alerts("catalog_missing", ok_window=0.0), [])
 
 
+class TestMonthOfHistory(LogFixture):
+    def test_rotations_are_kept_by_age_not_by_count(self):
+        self.flush()
+        with patch.object(logger_setup, "EVENTS_MAX_MB", 0.002):
+            setup_logging()
+        logger = logging.getLogger("monitoring")
+        for index in range(300):
+            log_event(logger, logging.INFO, "scan.fail", "x", src=f"источник {index}", kind="timeout", padding="y" * 40)
+        self.flush()
+        self.assertGreater(len(list(self.logs.glob("events.jsonl.*.gz"))), 6, "the old scheme kept only six")
+        rows = log_report.read_rows(self.logs / "events.jsonl", time.time() - 60)
+        self.assertEqual([row["f"]["src"] for row in rows if row.get("ev") == "scan.fail"],
+                         [f"источник {index}" for index in range(300)])
+
+    def test_prune_drops_old_copies_then_the_oldest_over_the_size_cap(self):
+        import os
+
+        base, now = self.logs / "x.log", time.time()
+        for index, age_days in enumerate((1, 5, 31, 40), 1):
+            path = self.logs / f"x.log.{index}.gz"
+            path.write_bytes(b"z" * 1000)
+            os.utime(path, (now - age_days * 86400, now - age_days * 86400))
+        self.assertEqual(logger_setup.prune_rotations(base, 30, 10**6, now=now), 2)
+        self.assertEqual(sorted(p.name for p in self.logs.glob("x.log.*")), ["x.log.1.gz", "x.log.2.gz"])
+        self.assertEqual(logger_setup.prune_rotations(base, 30, 1500, now=now), 1)
+        self.assertEqual([p.name for p in self.logs.glob("x.log.*")], ["x.log.1.gz"])
+
+    def test_past_the_row_cap_the_newest_rows_are_kept(self):
+        logger = logging.getLogger("monitoring")
+        for index in range(10):
+            log_event(logger, logging.INFO, "scan.fail", "x", n=index)
+        self.flush()
+        with patch.object(log_report, "MAX_LINES", 4):
+            rows = log_report.read_rows(self.logs / "events.jsonl", time.time() - 60)
+        self.assertEqual([row["f"]["n"] for row in rows], [6, 7, 8, 9])
+
+    def test_readiness_reads_only_the_events_it_uses(self):
+        logger = logging.getLogger("scheduler")
+        log_event(logger, logging.INFO, "send.ok", "x", chat=1, item="1")
+        log_event(logger, logging.INFO, "lot.new", "x", rid=1, item="2", age=3.0)
+        log_event(logger, logging.WARNING, "send.flood", "x", chat=1)
+        self.flush()
+        rows = log_report.read_rows(self.logs / "events.jsonl", time.time() - 60, log_report.READINESS_TAGS)
+        self.assertEqual([row["ev"] for row in rows], ["lot.new", "send.flood"])
+
+    def test_lot_history_has_the_finds_and_deliveries_of_that_lot_only(self):
+        logger = logging.getLogger("scheduler")
+        log_event(logger, logging.INFO, "lot.new", "x", rid=7, item="4123456789", age=12.0, pos=0)
+        log_event(logger, logging.INFO, "lot.new", "x", rid=7, item="4123456780", age=1.0, pos=1)
+        log_event(logger, logging.INFO, "send.ok", "x", chat=55, item="4123456789", seen_to_sent_s=1.5)
+        log_event(logging.getLogger("monitoring"), logging.INFO, "scan.fail", "лот 4123456789", src="x")
+        self.flush()
+        rows = log_report.lot_history("4123456789")
+        self.assertEqual([(row["ev"], (row["f"].get("rid") or row["f"].get("chat"))) for row in rows],
+                         [("lot.new", 7), ("send.ok", 55)])
+
+    def test_the_bot_reads_lot_history_and_reports_in_a_separate_process(self):
+        import os
+        from handlers import admin
+
+        log_event(logging.getLogger("scheduler"), logging.INFO, "lot.new", "x", rid=7, item="4123456789", age=3.0,
+                  gap=2.0, fresh=True, promo=False, pos=0, ch="direct")
+        self.flush()
+        with patch.dict(os.environ, {"LOGS_DIR": str(self.logs)}), \
+                patch.object(log_report, "lot_history", side_effect=AssertionError("read in the bot's process")), \
+                patch.object(log_report, "build_readiness", side_effect=AssertionError("built in the bot's process")):
+            rows = asyncio.run(admin._lot_history("4123456789"))
+            report = asyncio.run(admin._log_report("--ready", "1", live_state={"net_mode": "smart"}))
+        self.assertEqual([(row["ev"], row["f"]["rid"]) for row in rows], [("lot.new", 7)])
+        self.assertIn("готовность к продаже за 1 ч", report)
+        self.assertIn('"net_mode": "smart"', report)
+
+
 if __name__ == "__main__":
     unittest.main()

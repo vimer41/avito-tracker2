@@ -8,6 +8,10 @@ what is needed to diagnose the bot without reading raw logs.
     python log_report.py --radar 12         recent events of a radar
     python log_report.py --chat 986832959   recent deliveries to a chat
     python log_report.py --grep "catalog"   any text in the events
+    python log_report.py --lot 4123456789   a lot's finds and deliveries over the kept history, JSON
+
+The bot runs it as a separate process (handlers/admin.py `_log_report`), so reading weeks of logs
+never holds the bot's GIL; `--live-stdin` takes the bot's current state as JSON on stdin.
 """
 
 import argparse
@@ -16,13 +20,17 @@ import json
 import re
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
-from logger_setup import CRASH_LOG, EVENTS_LOG, METRICS_LOG
+from logger_setup import CRASH_LOG, EVENTS_LOG, LOG_KEEP_DAYS, METRICS_LOG
 
 MAX_LINES = 400000
+# The readiness report needs only these events; skipping the rest unread keeps a week's report light.
+READINESS_TAGS = ('"ev":"app.', '"ev":"lot.new"', '"l":"W"', '"l":"E"', '"l":"C"')
+LOT_TAGS = ('"ev":"lot.new"', '"ev":"send.ok"')
+LOT_HISTORY_LIMIT = 40
 ERROR_GROUPS = 15
 SAMPLE_TRACEBACK_CHARS = 1500
 TAIL_EVENTS = 25
@@ -59,12 +67,16 @@ def _epoch_prefix(line: str) -> Optional[float]:
         return None
 
 
-def read_rows(path: Path, since: float) -> list[dict]:
-    rows: list[dict] = []
+def read_rows(path: Path, since: float, tags: Optional[tuple[str, ...]] = None) -> list[dict]:
+    """Rows since `since`, oldest first; past MAX_LINES the newest are kept. `tags`: read only lines
+    holding one of these substrings."""
+    rows: deque = deque(maxlen=MAX_LINES)
     for file in _files_oldest_first(path, since):
         for index, line in enumerate(_read_lines(file)):
             if index % 2000 == 0:
                 time.sleep(0)  # gives the event loop the GIL when run from the bot
+            if tags is not None and not any(tag in line for tag in tags):
+                continue
             stamp = _epoch_prefix(line)
             if stamp is None or stamp < since:
                 continue
@@ -72,9 +84,29 @@ def read_rows(path: Path, since: float) -> list[dict]:
                 rows.append(json.loads(line))
             except ValueError:
                 continue  # a line cut by a crash
-            if len(rows) >= MAX_LINES:
-                return rows
-    return rows
+    return list(rows)
+
+
+def _capped_note(rows: list) -> str:
+    return f" Событий больше {MAX_LINES}: взяты последние." if len(rows) >= MAX_LINES else ""
+
+
+def lot_history(item_id: str, days: float = LOG_KEEP_DAYS, limit: int = LOT_HISTORY_LIMIT) -> list[dict]:
+    """Every find (lot.new) and delivery (send.ok) of one lot in the kept events, newest last."""
+    needle = str(item_id)
+    since = time.time() - days * 86400
+    found: deque = deque(maxlen=limit)
+    for file in _files_oldest_first(EVENTS_LOG, since):
+        for line in _read_lines(file):
+            if needle not in line or not any(tag in line for tag in LOT_TAGS):
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if str((row.get("f") or {}).get("item")) == needle and (row.get("t") or 0) >= since:
+                found.append(row)
+    return list(found)
 
 
 def _sum(rows: Iterable[dict], *path: str) -> int:
@@ -412,7 +444,8 @@ def build_report(minutes: int = 60, live_state: Optional[dict] = None) -> str:
     events = read_rows(EVENTS_LOG, since)
     metrics = read_rows(METRICS_LOG, since)
     stamp = time.strftime("%Y-%m-%d %H:%M", time.gmtime(now + 3 * 3600))
-    lines = [f"# Avito Radar: отчёт за {minutes} мин, {stamp} МСК", f"Минутных строк: {len(metrics)}, событий: {len(events)}.", ""]
+    lines = [f"# Avito Radar: отчёт за {minutes} мин, {stamp} МСК",
+             f"Минутных строк: {len(metrics)}, событий: {len(events)}.{_capped_note(events)}", ""]
     lines += _section("Главное", [f"- {note}" for note in findings(metrics, events)])
     lines += _section("Запуски", _restarts(events))
     if live_state:
@@ -657,11 +690,12 @@ def _outage_lines(metrics: list[dict]) -> list[str]:
 def build_readiness(hours: int = 24, live_state: Optional[dict] = None) -> str:
     """The sale decision on one page: verdict first, then the numbers behind each point."""
     now = time.time()
-    events = read_rows(EVENTS_LOG, now - hours * 3600)
+    events = read_rows(EVENTS_LOG, now - hours * 3600, READINESS_TAGS)
     metrics = read_rows(METRICS_LOG, now - hours * 3600)
     checks = readiness_checks(metrics, events, hours)
     stamp = time.strftime("%Y-%m-%d %H:%M", time.gmtime(now + 3 * 3600))
-    lines = [f"# Avito Radar: готовность к продаже за {hours} ч, {stamp} МСК", f"Минутных строк: {len(metrics)}, событий: {len(events)}.", ""]
+    lines = [f"# Avito Radar: готовность к продаже за {hours} ч, {stamp} МСК",
+             f"Минутных строк: {len(metrics)}, событий: {len(events)}.{_capped_note(events)}", ""]
     lines += _section("Вердикт", [readiness_verdict(checks)])
     lines += _section("Критерии", checks)
     lines += _section("Скорость лота", _lot_timing(events))
@@ -710,12 +744,23 @@ def main() -> None:
     args.add_argument("--chat", type=int, default=0)
     args.add_argument("--grep", default="")
     args.add_argument("--limit", type=int, default=200)
+    args.add_argument("--lot", default="")
+    args.add_argument("--live-stdin", action="store_true", help="the bot's current state as JSON on stdin")
     options = args.parse_args()
+    live_state = None
+    if options.live_stdin:
+        try:
+            live_state = json.loads(sys.stdin.read() or "null")
+        except ValueError:
+            live_state = None
+    if options.lot:
+        print(json.dumps(lot_history(options.lot), ensure_ascii=False))
+        return
     if options.ready:
-        print(build_readiness(options.ready))
+        print(build_readiness(options.ready, live_state))
         return
     if not (options.trace or options.radar or options.chat or options.grep):
-        print(build_report(options.minutes))
+        print(build_report(options.minutes, live_state))
         return
     rows = read_rows(EVENTS_LOG, time.time() - options.minutes * 60)
     for row in select(rows, options.trace, options.radar, options.chat, options.grep)[-options.limit:]:

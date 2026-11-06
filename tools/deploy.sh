@@ -133,11 +133,12 @@ if [[ -z "${MOCK_ROOT:-}" ]]; then
 
     # Clean package manager cache and systemd journals
     command -v apt-get >/dev/null 2>&1 && apt-get clean 2>/dev/null || true
-    command -v journalctl >/dev/null 2>&1 && journalctl --vacuum-size=20M --vacuum-time=2d 2>/dev/null || true
+    command -v journalctl >/dev/null 2>&1 && journalctl --vacuum-size=300M --vacuum-time=30d 2>/dev/null || true
 
     # Clean pip caches and system temp directories
     rm -rf /root/.cache/pip ~/.cache/pip /tmp/pip-* /tmp/*.whl /var/tmp/pip-* "$TARGET_DIR/.tmp" 2>/dev/null || true
-    find "$TARGET_DIR/logs" "$TARGET_DIR" -maxdepth 2 -name "*.log.*" -mtime +2 -delete 2>/dev/null || true
+    # The bot keeps its own logs 30 days (logger_setup.LOG_KEEP_DAYS); this only catches strays.
+    find "$TARGET_DIR/logs" "$TARGET_DIR" -maxdepth 2 -name "*.log.*" -mtime +31 -delete 2>/dev/null || true
 
     # Prune old releases in .releases to free disk BEFORE building NEW_ENV:
     # Always keep the active venv and at most 1 rollback candidate (newest previous-venv).
@@ -165,9 +166,12 @@ if [[ -z "${MOCK_ROOT:-}" ]]; then
         done
     fi
 
-    # Prune old SQLite backups in backups/ (keep at most 3 newest)
+    # Prune old SQLite backups in backups/ (keep the DEPLOY_KEEP_BACKUPS newest; daily-*.db.gz are the bot's)
+    KEEP_BACKUPS="${DEPLOY_KEEP_BACKUPS:-14}"
+    [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] || KEEP_BACKUPS=14
+    (( KEEP_BACKUPS >= 3 )) || KEEP_BACKUPS=3
     if [[ -d "$TARGET_DIR/backups" ]]; then
-        ls -dt "$TARGET_DIR/backups"/bot-before-*.db 2>/dev/null | tail -n +4 | xargs -r rm -f 2>/dev/null || true
+        ls -dt "$TARGET_DIR/backups"/bot-before-*.db 2>/dev/null | tail -n +"$((KEEP_BACKUPS + 1))" | xargs -r rm -f 2>/dev/null || true
     fi
 
     echo "=== Disk Status After Pre-Deploy Cleanup ==="

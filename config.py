@@ -528,3 +528,6 @@ def tariff_delivery_delay(tariff_key: str) -> float:
 # Database path
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).expanduser().resolve()
 DB_PATH = Path(os.getenv("DB_PATH", str(DATA_DIR / "bot.db"))).expanduser().resolve()
+# The deploy's copies (bot-before-*.db) and the daily ones (daily-YYYYMMDD.db.gz) live here.
+BACKUP_DIR = Path(os.getenv("BACKUP_DIR", str(BASE_DIR / "backups"))).expanduser().resolve()
+DAILY_BACKUP_KEEP = positive_int_setting("DAILY_BACKUP_KEEP", "14")

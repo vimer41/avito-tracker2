@@ -95,9 +95,9 @@ jobs:
           DEPLOY_PLATEGA_SECRET: ${{ secrets.PLATEGA_SECRET }}
           DEPLOY_CLEANUP: ${{ vars.DEPLOY_CLEANUP || '1' }}
           DEPLOY_KEEP_RELEASES: ${{ vars.DEPLOY_KEEP_RELEASES || '2' }}
-          DEPLOY_KEEP_BACKUPS: ${{ vars.DEPLOY_KEEP_BACKUPS || '3' }}
+          DEPLOY_KEEP_BACKUPS: ${{ vars.DEPLOY_KEEP_BACKUPS || '14' }}
           DEPLOY_RELEASE_MIN_AGE_DAYS: ${{ vars.DEPLOY_RELEASE_MIN_AGE_DAYS || '1' }}
-          DEPLOY_BACKUP_MIN_AGE_DAYS: ${{ vars.DEPLOY_BACKUP_MIN_AGE_DAYS || '2' }}
+          DEPLOY_BACKUP_MIN_AGE_DAYS: ${{ vars.DEPLOY_BACKUP_MIN_AGE_DAYS || '14' }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USERNAME }}

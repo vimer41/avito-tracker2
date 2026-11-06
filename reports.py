@@ -2,12 +2,14 @@
 
 import asyncio
 import gzip
+import html
 import logging
 import os
 import re
 import shutil
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from aiogram import Bot
@@ -210,12 +212,77 @@ def pack_database_backup() -> Optional[str]:
     return packed
 
 
+# Admins get the current note once, when a release carrying it is up: then they know the deploy went through.
+# A new note needs a new id; restarts of the same release send nothing.
+RELEASE_NOTE_KEY = "release_note_sent"
+RELEASE_NOTE_ID = "2026-11-06"
+RELEASE_NOTE_TITLE = "Обновлено 06.11.2026"
+RELEASE_NOTE_LINES = (
+    "капча и PoW решаются в отдельном процессе: бот не замирает",
+    "логи хранятся 30 дней, /ready — до 168 ч",
+    "«Почему не пришёл лот» смотрит логи за 30 дней",
+    "на сервере 14 копий базы: перед деплоями и ежедневные",
+)
+# The deploy calls a release good after 20 s of uptime; the note waits past that.
+RELEASE_NOTE_DELAY = 30.0
+
+
+async def announce_release(bot: Bot, version: str, delay: float = RELEASE_NOTE_DELAY) -> int:
+    """Sends the release note to every admin once; returns how many got it."""
+    try:
+        await asyncio.sleep(delay)
+        if await database.get_bot_setting(RELEASE_NOTE_KEY) == RELEASE_NOTE_ID:
+            return 0
+        text = (
+            f"{ui.e('ok')} <b>{RELEASE_NOTE_TITLE}</b>\n"
+            f"Деплой прошёл, версия {html.escape(version)}.\n\n"
+            + "\n".join(f"• {html.escape(line)}" for line in RELEASE_NOTE_LINES)
+        )
+        delivered = 0
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, text, parse_mode="HTML")
+                delivered += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Сообщение об обновлении не доставлено %s: %s", admin_id, exc)
+        if delivered:  # nobody reached: try again at the next start
+            await database.set_bot_setting(RELEASE_NOTE_KEY, RELEASE_NOTE_ID)
+        return delivered
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Сообщение об обновлении не отправлено")
+        return 0
+
+
+DAILY_BACKUP_PREFIX = "daily-"
+
+
+def keep_daily_copy(packed: str, now: Optional[float] = None) -> Path:
+    """A dated copy of the packed backup in BACKUP_DIR; only the newest DAILY_BACKUP_KEEP stay."""
+    directory = Path(config.BACKUP_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
+    day = time.strftime("%Y%m%d", time.gmtime((time.time() if now is None else now) + 3 * 3600))
+    target = directory / f"{DAILY_BACKUP_PREFIX}{day}.db.gz"
+    shutil.copyfile(packed, target)
+    copies = sorted(directory.glob(f"{DAILY_BACKUP_PREFIX}*.db.gz"), reverse=True)  # the names sort by date
+    for old in copies[max(1, int(config.DAILY_BACKUP_KEEP)):]:
+        old.unlink(missing_ok=True)
+    return target
+
+
 async def send_daily_backup(bot: Bot) -> None:
-    """The deploy's backups stay on the VPS: this copy is the one that survives losing the server."""
+    """A dated copy stays on the server (two weeks); the one sent to the admin survives losing it."""
     packed = await asyncio.to_thread(pack_database_backup)
     if packed is None:
         await bot.send_message(config.ADMIN_ID, "Не удалось создать ежедневную копию базы, смотрите errors.log.")
         return
+    try:
+        await asyncio.to_thread(keep_daily_copy, packed)
+    except OSError as exc:
+        logger.warning("Ежедневная копия базы не сохранена на сервере: %s", exc)
     try:
         size = os.path.getsize(packed)
         if size > BACKUP_MAX_BYTES:

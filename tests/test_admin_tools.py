@@ -6,7 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from aiogram.types import PreCheckoutQuery, SuccessfulPayment, Update, User
 
@@ -87,6 +87,22 @@ class TestWhyLotDidNotCome(AdminToolsBase):
     async def test_unknown_lot_says_the_bot_never_saw_it(self):
         text = await admin.explain_lot("9199999999")
         self.assertIn("Бот этот лот не видел", text)
+
+    async def test_after_a_restart_the_logs_tell_when_the_lot_was_found_and_sent(self):
+        radar_id = await database.add_search(USER_ID, "PSP", "https://www.avito.ru/moskva?q=psp", initial_items=[])
+        found_at = time.time() - 3 * 86400
+        history = [
+            {"t": found_at, "ev": "lot.new", "f": {"rid": radar_id, "item": "9100000009", "age": 75.0, "pos": 1}},
+            {"t": found_at + 2, "ev": "send.ok", "f": {"chat": USER_ID, "item": "9100000009", "seen_to_sent_s": 1.6}},
+        ]
+        with patch.object(admin, "_lot_history", AsyncMock(return_value=history)) as read:
+            text = await admin.explain_lot("9100000009")
+        read.assert_awaited_once_with("9100000009")
+        self.assertIn("Из логов за 30 дн.", text)
+        self.assertIn(f"#{radar_id} «PSP»", text)
+        self.assertIn("через 1 м 15 с после публикации, место 2 в выдаче", text)
+        self.assertIn(f"польз. {USER_ID}: отправлен", text)
+        self.assertNotIn("Бот этот лот не видел", text)
 
     async def test_button_asks_for_a_link_and_a_link_does_not_make_a_radar(self):
         await self.dispatch_callback("admin_lot_prompt", config.ADMIN_ID)

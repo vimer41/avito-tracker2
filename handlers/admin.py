@@ -980,6 +980,8 @@ async def explain_lot(item_id: str) -> str:
         lines.append("")
 
     traces = await database.find_lot_traces(item_id)
+    # The journal of decisions lives in memory; after a restart or for an old lot the logs still know it.
+    history = [] if decided else await _lot_history(item_id)
     if traces["deliveries"]:
         lines.append("<b>Доставка</b>")
         for row in traces["deliveries"]:
@@ -1000,6 +1002,24 @@ async def explain_lot(item_id: str) -> str:
         lines.append("<b>В последней выдаче</b>")
         lines += placed
         lines.append("")
+    if history:
+        lines.append(f"<b>Из логов за {logger_setup.LOG_KEEP_DAYS} дн.</b>")
+        for row in history[-LOT_HISTORY_LINES:]:
+            fields = row.get("f") or {}
+            when = _msk(float(row.get("t") or 0), "%d.%m %H:%M:%S")
+            if row.get("ev") == "lot.new":
+                rid = fields.get("rid")
+                line = f"{await radar_name(int(rid)) if rid is not None else 'радар ?'}: найден {when}"
+                if fields.get("age") is not None:
+                    line += f", через {_dur(fields['age'])} после публикации"
+                if fields.get("pos") is not None:
+                    line += f", место {int(fields['pos']) + 1} в выдаче"
+            else:
+                line = f"польз. {fields.get('chat')}: отправлен {when}"
+                if fields.get("seen_to_sent_s") is not None:
+                    line += f", через {_dur(fields['seen_to_sent_s'])} после находки"
+            lines.append(line)
+        lines.append("")
     if traces["seen"] and not decided:
         lines.append("<b>Помечен как просмотренный</b>")
         for row in traces["seen"][:8]:
@@ -1009,7 +1029,7 @@ async def explain_lot(item_id: str) -> str:
             "лоты, которые уже были в выдаче при создании радара, не присылаются.</blockquote>"
         )
 
-    if not decided and not traces["seen"] and not traces["deliveries"] and not placed:
+    if not decided and not traces["seen"] and not traces["deliveries"] and not placed and not history:
         lines.append(
             "Бот этот лот не видел: его нет ни в журнале, ни в базе, ни в последних выдачах радаров.\n\n"
             "<blockquote>Значит, он не подходит под ссылку радара (город, категория, цена или фильтры в самой ссылке) "
@@ -1017,7 +1037,27 @@ async def explain_lot(item_id: str) -> str:
         )
     elif decided:
         lines.append("<blockquote>Журнал решений в памяти, сбрасывается при перезапуске бота. Время МСК.</blockquote>")
+    elif history:
+        lines.append(
+            "<blockquote>Журнал решений пуст: бот перезапускался или лот старый. Логи хранят находки и отправки, "
+            "но не причину отказа (стоп-слово, фильтр). Время МСК.</blockquote>"
+        )
     return "\n".join(lines).rstrip()
+
+
+LOT_HISTORY_LINES = 12
+
+
+async def _lot_history(item_id: str) -> list[dict]:
+    """The lot's finds and deliveries from the kept logs, read by a separate process."""
+    import log_report
+
+    try:
+        rows = json.loads(await _log_report("--lot", item_id) or "[]")
+    except (OSError, RuntimeError, asyncio.TimeoutError, ValueError) as exc:
+        logger.warning("История лота отдельным процессом не прочитана (%s), читаю в боте", str(exc)[:200])
+        rows = await asyncio.to_thread(log_report.lot_history, item_id)
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
 @router.message(Command("lot"))
@@ -2121,7 +2161,8 @@ async def cmd_admin_logs_menu(event):
         f"{ui.e('logs')} <b>Логи</b>\n\n"
         "<b>Отчёт для отладки</b> — главное за час одним файлом: причины сбоев, каналы, ошибки. "
         "Его достаточно прислать разработчику.\n"
-        "<b>Готовность к продаже</b> — вердикт за сутки: скорость, надёжность, прокси, ссылки.\n"
+        "<b>Готовность к продаже</b> — вердикт за сутки: скорость, надёжность, прокси, ссылки. "
+        f"За другой срок: /ready 168 (часы, до {READY_MAX_HOURS}).\n"
         "<b>Сканы радаров</b> — как часто проверяется каждый радар и кто задержал лот: Авито или бот.\n"
         "<b>Почему не пришёл лот</b> — пришлите ссылку на объявление: видел ли его бот и что решил.\n"
         "<b>Подробно на 10 мин</b> — в events.jsonl пишутся все шаги сканов.\n\n"
@@ -2183,12 +2224,50 @@ def _debug_live_state() -> dict:
     return state
 
 
+LOG_REPORT_TIMEOUT = 600.0
+READY_MAX_HOURS = 168  # a week; the logs keep 30 days
+ZIP_LOG_HOURS = 48
+ZIP_LOG_MAX_BYTES = 45 * 1024 * 1024  # Telegram takes a bot's document up to 50 MB
+
+
+async def _log_report(*args: str, live_state: dict | None = None) -> str:
+    """log_report.py in a process of its own: reading weeks of logs must not hold the bot's GIL."""
+    import sys
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-B", str(config.BASE_DIR / "log_report.py"), *args,
+        *(["--live-stdin"] if live_state is not None else []),
+        stdin=asyncio.subprocess.PIPE if live_state is not None else asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=str(config.BASE_DIR),
+    )
+    payload = json.dumps(live_state, ensure_ascii=False, default=str).encode("utf-8") if live_state is not None else None
+    try:
+        out, err = await asyncio.wait_for(process.communicate(payload), LOG_REPORT_TIMEOUT)
+    except BaseException:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
+    if process.returncode != 0:
+        raise RuntimeError(err.decode("utf-8", "replace")[-500:] or f"exit code {process.returncode}")
+    return out.decode("utf-8").removesuffix("\n")
+
+
+async def _report_text(args: tuple, build, *build_args) -> str:
+    """The report from a separate process; in this process if that one failed."""
+    try:
+        return await _log_report(*args, live_state=_debug_live_state())
+    except (OSError, RuntimeError, asyncio.TimeoutError) as exc:
+        logger.warning("Отчёт отдельным процессом не построен (%s), строю в боте", str(exc)[:200])
+        return await asyncio.to_thread(build, *build_args, _debug_live_state())
+
+
 async def _send_debug_report(message: Message, minutes: int) -> None:
     from datetime import datetime
     from aiogram.types import BufferedInputFile
     import log_report
 
-    report = await asyncio.to_thread(log_report.build_report, minutes, _debug_live_state())
+    report = await _report_text(("--minutes", str(minutes)), log_report.build_report, minutes)
     name = f"avito_report_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
     await message.answer_document(
         BufferedInputFile(report.encode("utf-8"), filename=name),
@@ -2202,7 +2281,7 @@ async def _send_readiness_report(message: Message, hours: int) -> None:
     from aiogram.types import BufferedInputFile
     import log_report
 
-    report = await asyncio.to_thread(log_report.build_readiness, hours, _debug_live_state())
+    report = await _report_text(("--ready", str(hours)), log_report.build_readiness, hours)
     verdict = report.split("## Вердикт\n", 1)[-1].split("\n", 1)[0]
     name = f"avito_ready_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
     await message.answer_document(
@@ -2218,7 +2297,7 @@ async def cmd_admin_ready(message: Message):
         return
     parts = (message.text or "").split()
     hours = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 24
-    await _send_readiness_report(message, max(1, min(hours, 72)))
+    await _send_readiness_report(message, max(1, min(hours, READY_MAX_HOURS)))
 
 
 @router.message(Command("report"))
@@ -2268,37 +2347,46 @@ async def cb_admin_log_get(call: CallbackQuery):
 
     # 1. Выгрузка ВСЕХ логов единым ZIP-архивом
     if target == "all_zip":
-        zip_buffer = io.BytesIO()
-        total_raw_size = 0
-        files_count = 0
+        def build_zip() -> tuple[bytes, int, int, int]:
+            zip_buffer = io.BytesIO()
+            total, count, skipped_files = 0, 0, 0
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                # Общий bot.log
+                bot_log = base_dir / "bot.log"
+                if bot_log.exists() and bot_log.is_file():
+                    sz = bot_log.stat().st_size
+                    if sz > 0:
+                        zf.write(bot_log, arcname="bot.log")
+                        total += sz
+                        count += 1
 
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            # Общий bot.log
-            bot_log = base_dir / "bot.log"
-            if bot_log.exists() and bot_log.is_file():
-                sz = bot_log.stat().st_size
-                if sz > 0:
-                    zf.write(bot_log, arcname="bot.log")
-                    total_raw_size += sz
-                    files_count += 1
-
-            # Файлы из папки logs/
-            logs_dir = base_dir / "logs"
-            if logs_dir.exists() and logs_dir.is_dir():
-                for p in sorted(logs_dir.iterdir()):
-                    if p.is_file():
+                # Файлы из папки logs/: свежие первыми, за ZIP_LOG_HOURS и не больше ZIP_LOG_MAX_BYTES —
+                # архив должен пройти в Telegram; вся история (30 дней) остаётся на сервере.
+                logs_dir = base_dir / "logs"
+                if logs_dir.exists() and logs_dir.is_dir():
+                    cutoff = datetime.now().timestamp() - ZIP_LOG_HOURS * 3600
+                    candidates = sorted(
+                        (p for p in logs_dir.iterdir() if p.is_file() and p.stat().st_size > 0),
+                        key=lambda p: p.stat().st_mtime, reverse=True,
+                    )
+                    for p in candidates:
                         sz = p.stat().st_size
-                        if sz > 0:
-                            zf.write(p, arcname=f"logs/{p.name}")
-                            total_raw_size += sz
-                            files_count += 1
+                        if p.stat().st_mtime < cutoff or total + sz > ZIP_LOG_MAX_BYTES:
+                            skipped_files += 1
+                            continue
+                        # .gz is already packed: stored as is instead of deflating it again.
+                        zf.write(p, arcname=f"logs/{p.name}",
+                                 compress_type=zipfile.ZIP_STORED if p.suffix == ".gz" else zipfile.ZIP_DEFLATED)
+                        total += sz
+                        count += 1
+            return zip_buffer.getvalue(), total, count, skipped_files
 
+        # Off the event loop: packing tens of megabytes takes seconds.
+        zip_bytes, total_raw_size, files_count, skipped = await asyncio.to_thread(build_zip)
         if files_count == 0:
             await call.message.answer("⚠️ Файлы логов в системе пока отсутствуют или пусты.")
             return
 
-        zip_buffer.seek(0)
-        zip_bytes = zip_buffer.getvalue()
         zip_filename = f"avito_radar_logs_{timestamp}.zip"
         file_to_send = BufferedInputFile(zip_bytes, filename=zip_filename)
 
@@ -2307,12 +2395,14 @@ async def cb_admin_log_get(call: CallbackQuery):
         await call.message.answer_document(
             document=file_to_send,
             caption=(
-                "📦 <b>Полный архив системных логов AVITO RADAR</b>\n"
+                f"📦 <b>Архив логов за {ZIP_LOG_HOURS} ч</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 f"🗂 Файлов в архиве: <b>{files_count}</b>\n"
                 f"📊 Исходный размер: <b>{total_raw_size / 1024:.1f} KB</b>\n"
                 f"🗜 Размер архива: <b>{len(zip_bytes) / 1024:.1f} KB</b> (сжатие {compression_pct}%)\n"
                 f"📅 Дата выгрузки: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+                + (f"\n🕰 Не вошли {skipped} старых файлов: история за {logger_setup.LOG_KEEP_DAYS} дн. "
+                   "лежит на сервере в logs/" if skipped else "")
             ),
             parse_mode="HTML"
         )

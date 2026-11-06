@@ -9,6 +9,9 @@ the disk from the event loop.
   logs/metrics.jsonl    one row per minute; survives restarts
   logs/crash.log        native crashes (segfault in onnx/cv2)
 
+Every file except crash.log rotates by size into .gz copies that are kept LOG_KEEP_DAYS (30) days,
+within a total size cap per file (LOG_LIMITS_MB).
+
 Levels: ERROR = bug, WARNING = needs attention, INFO = what happened, DEBUG = routine detail
 (goes to events.jsonl only while debug mode is on). Avito's 403 is routine, not a warning.
 Every scan gets a 4-char trace id that follows it through parser, anti-bot, fanout and delivery.
@@ -51,8 +54,18 @@ metrics_logger = logging.getLogger("metrics.minute")
 
 MSK_OFFSET_SECONDS = 3 * 3600
 QUEUE_SIZE = 20000
-EVENTS_MAX_MB = 8
-EVENTS_BACKUPS = 6
+# History: files rotate by size and are kept by age and total size, not by a fixed count.
+LOG_KEEP_DAYS = max(1, int(os.getenv("LOG_KEEP_DAYS", "30") or 30))
+MAX_ROTATIONS = 999
+EVENTS_MAX_MB = 16
+# (live file MB, MB of rotated .gz files kept): a safety cap far above a month of normal traffic.
+LOG_LIMITS_MB = {
+    "bot": (8, 400),
+    "errors": (4, 200),
+    "user_actions": (8, 300),
+    "events": (EVENTS_MAX_MB, 3000),
+    "metrics": (8, 600),
+}
 PROJECT_LOGGERS = ("monitoring", "scheduler", "parser", "collector", "proxy_pool", "anti_bot", "reports", "handlers")
 
 _LEVEL_TAGS = {"DEBUG": "DBG", "INFO": "   ", "WARNING": "WRN", "ERROR": "ERR", "CRITICAL": "CRT"}
@@ -219,8 +232,49 @@ def _gzip_rotator(source: str, dest: str) -> None:
     os.remove(source)
 
 
-def _rotating(path: Path, max_mb: float, backups: int) -> RotatingFileHandler:
-    return RotatingFileHandler(path, maxBytes=int(max_mb * 1024 * 1024), backupCount=backups, encoding="utf-8")
+def prune_rotations(path: Path, keep_days: float, keep_bytes: int, now: Optional[float] = None) -> int:
+    """Deletes rotated copies of `path` older than keep_days, then the oldest beyond keep_bytes."""
+    now = time.time() if now is None else now
+    found = []
+    for rotated in path.parent.glob(f"{path.name}.*"):
+        try:
+            info = rotated.stat()
+        except OSError:
+            continue
+        if rotated.is_file():
+            found.append((info.st_mtime, info.st_size, rotated))
+    found.sort(key=lambda entry: entry[0], reverse=True)
+    cutoff = now - keep_days * 86400
+    total = removed = 0
+    for mtime, size, rotated in found:
+        total += size
+        if mtime < cutoff or total > keep_bytes:
+            try:
+                rotated.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+class _KeepingRotatingFileHandler(RotatingFileHandler):
+    """Size rotation into .gz; old files go by age (LOG_KEEP_DAYS) and total size."""
+
+    def __init__(self, path: Path, max_mb: float, keep_mb: float):
+        super().__init__(path, maxBytes=int(max_mb * 1024 * 1024), backupCount=MAX_ROTATIONS, encoding="utf-8")
+        self.keep_bytes = int(keep_mb * 1024 * 1024)
+        self.namer = lambda name: f"{name}.gz"
+        self.rotator = _gzip_rotator
+
+    def doRollover(self) -> None:
+        super().doRollover()
+        prune_rotations(Path(self.baseFilename), LOG_KEEP_DAYS, self.keep_bytes)
+
+
+def _rotating(path: Path, kind: str, max_mb: Optional[float] = None) -> RotatingFileHandler:
+    live_mb, keep_mb = LOG_LIMITS_MB[kind]
+    prune_rotations(path, LOG_KEEP_DAYS, int(keep_mb * 1024 * 1024))  # old-scheme files (.1, .2) age out too
+    return _KeepingRotatingFileHandler(path, live_mb if max_mb is None else max_mb, keep_mb)
 
 
 def _stdout_is_combined_log() -> bool:
@@ -277,21 +331,17 @@ def setup_logging():
 
     if not _stdout_is_combined_log():
         add(logging.StreamHandler(sys.stdout), human, logging.INFO, timeline)
-    add(_rotating(COMBINED_LOG, 5, 2), human, logging.INFO, timeline)
-    add(_rotating(ERRORS_LOG, 3, 2), human, logging.WARNING, _ErrorsFilter())
+    add(_rotating(COMBINED_LOG, "bot"), human, logging.INFO, timeline)
+    add(_rotating(ERRORS_LOG, "errors"), human, logging.WARNING, _ErrorsFilter())
     add(
-        _rotating(USER_ACTIONS_LOG, 5, 2),
+        _rotating(USER_ACTIONS_LOG, "user_actions"),
         logging.Formatter(fmt="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"),
         logging.INFO,
         _NameFilter(only=(user_logger.name,)),
     )
-
-    events_handler = _rotating(EVENTS_LOG, EVENTS_MAX_MB, EVENTS_BACKUPS)
-    events_handler.namer = lambda name: f"{name}.gz"
-    events_handler.rotator = _gzip_rotator
-    add(events_handler, JsonFormatter(), logging.DEBUG, _NameFilter(exclude=(metrics_logger.name,)))
-
-    add(_rotating(METRICS_LOG, 5, 1), MetricsFormatter(), logging.INFO, _NameFilter(only=(metrics_logger.name,)))
+    add(_rotating(EVENTS_LOG, "events", EVENTS_MAX_MB), JsonFormatter(), logging.DEBUG,
+        _NameFilter(exclude=(metrics_logger.name,)))
+    add(_rotating(METRICS_LOG, "metrics"), MetricsFormatter(), logging.INFO, _NameFilter(only=(metrics_logger.name,)))
 
     record_queue: queue.Queue = queue.Queue(QUEUE_SIZE)
     root_logger.addHandler(_Handoff(record_queue))
