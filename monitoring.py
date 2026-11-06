@@ -21,11 +21,11 @@ import scan_journal
 import ui
 from collector import collect_source, settled_item_ids
 from logger_setup import get_trace, log_event, new_trace, set_trace, write_metrics_row
-from parser import AvitoParser
+from parser import AvitoParser, channel_parsers, lane_parser
 from proxy_pool import get_proxy_pool
 from request_budget import get_network_block_state
 from runtime_metrics import FAILURE_LABELS, METRICS, format_minute_line, short_channel
-from scan_planner import DeadlineScheduler, ScheduledScan, calculate_interval_plan
+from scan_planner import DeadlineScheduler, ScheduledScan, calculate_interval_plan, stretch_factor
 from seen_cache import InMemorySeenStore
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,8 @@ LONG_STALL_ALERT_INTERVAL = 3 * 3600.0
 STALL_DUMP_REARM_SECONDS = 1.0
 SOURCE_STATS_SECONDS = 600
 WORKER_CRASH_PAUSE = 1.0
+STRETCH_CHECK_SECONDS = 30.0  # how often the interval stretch is reconsidered
+STRETCH_STEP = 0.1  # smaller changes of the stretch are not applied, so intervals do not jitter
 CRASH_ALERT_INTERVAL = 24 * 3600  # the same code error pushes once a day; every repeat is in errors.log
 # Failures that describe the page itself. Blocks and timeouts say nothing about the link.
 DEAD_LINK_KINDS = frozenset({"catalog_missing", "invalid_redirect", "invalid_html", "invalid_response", "http_client"})
@@ -82,6 +84,12 @@ def source_interval(radars: list[dict], key: str = "") -> float:
     # Stable per URL so the planner does not reschedule every second, yet URLs of one tariff do not tick in step.
     jitter = (zlib.crc32(key.encode("utf-8")) % 1000) / 10000.0
     return round(float(base) * (1.0 - jitter), 2)
+
+
+def pool_lanes(pool) -> int:
+    """Scans the channels can serve at once: one worker per lane keeps every lane busy."""
+    total = getattr(pool, "total_lanes", None)
+    return int(total()) if callable(total) else len(getattr(pool, "clients", []) or [])
 
 
 def source_label(radars) -> str:
@@ -187,7 +195,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         use_source_backoff=False,
     )
 
-    worker_count = max(1, int(config.MAX_CONCURRENT_WORKERS), len(pool.clients))
+    worker_count = max(1, int(config.MAX_CONCURRENT_WORKERS), pool_lanes(pool))
     parsers: list[AvitoParser] = [parser] if parser is not None else []
     try:
         for _ in range(worker_count - len(parsers)):
@@ -397,6 +405,12 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             if min_cd > 0:
                 await asyncio.sleep(min(min_cd, 1.0))
                 return None
+        elif not uses_patched_process(worker_parser) and callable(getattr(pool, "has_free_lane", None)) \
+                and not pool.has_free_lane():
+            # Every channel routing would use is busy: the link waits here, most overdue first, instead of
+            # queueing on one channel's lock while another channel frees up and idles.
+            await pool.wait_for_free_lane(1.0)
+            return None
 
         task = planner.take_due(time.monotonic(), now_epoch=time.time())
         if task is None:
@@ -509,10 +523,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             client = lease.client
             scan_client = client  # the channel that produced this scan's final outcome
             tried_proxy_ids.add(client.proxy_id)
-            proxy_parser = getattr(client, "_bound_parser", None)
-            if proxy_parser is None:
-                proxy_parser = AvitoParser(proxy_client=client)
-                setattr(client, "_bound_parser", proxy_parser)
+            proxy_parser = lane_parser(client, getattr(lease, "lane", 0), AvitoParser)
             try:
                 collection = await collect_source(
                     proxy_parser,
@@ -564,6 +575,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             proxy_id=scan_client.proxy_id if scan_client is not None else "direct",
             masked_url=scan_client.masked_url if scan_client is not None else "direct",
             failure_kind=None if ok else (last_failure.kind if last_failure else ("unknown" if attempts else "no_channel")),
+            channels_tried=len(tried_proxy_ids),
         )
         try:
             scan_journal.record_scan(
@@ -695,6 +707,8 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         previous_scans = 0
         outbox_metrics = await database.get_outbox_metrics()
         persisted_states = await database.load_all_source_scan_states()
+        capacity_rps: Optional[float] = None  # the channels' measured capacity, req/s
+        stretch, stretch_checked_at = 1.0, 0.0  # all tariff intervals × stretch while the capacity falls short
 
         while True:
             searches = await database.get_all_active_searches()
@@ -733,17 +747,18 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             for extra in extra_workers:
                 if extra.done():
                     extra.result()
-            # Proxies added at runtime get their own scan workers, so capacity grows without a restart.
-            missing_workers = min(MAX_SCAN_WORKERS, len(pool.clients)) - len(parsers) - len(extra_workers)
+            # Proxies (and lanes) added at runtime get their own scan workers, so capacity grows without a restart.
+            missing_workers = min(MAX_SCAN_WORKERS, pool_lanes(pool)) - len(parsers) - len(extra_workers)
             for _ in range(max(0, missing_workers)):
                 index = len(parsers) + len(extra_workers) + 1
                 extra_workers.append(asyncio.create_task(worker(index, parsers[0]), name=f"scan-worker-{index}"))
-            effective_rps = (
+            limits_rps = (
                 sum(float(p.get("current_rps") or 0.0) for p in proxy_snaps if p.get("state") in ("healthy", "degraded", "half_open"))
                 if proxy_snaps
                 else float(network["current_rps"])
             )
-            effective_rps = max(0.1, effective_rps)
+            # What the channels measurably give (previous pass of this loop); their rate limits until measured.
+            effective_rps = max(0.1, capacity_rps if (capacity_rps and proxy_snaps) else limits_rps)
 
             base = {key: source_interval(radars, key) for key, radars in groups.items()}
             METRICS.set_planned_scan_rate(sum(1.0 / interval for interval in base.values()))
@@ -755,9 +770,26 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 request_cost,
             )
             now = time.monotonic()
+            if now - stretch_checked_at >= STRETCH_CHECK_SECONDS:
+                stretch_checked_at = now
+                demand_rps = sum(request_cost / interval for interval in base.values())
+                target = stretch_factor(
+                    demand_rps,
+                    capacity_rps or 0.0,
+                    utilization=float(config.SCAN_STRETCH_UTILIZATION),
+                    max_factor=float(config.SCAN_STRETCH_MAX),
+                ) if (capacity_rps and proxy_snaps) else 1.0
+                if abs(target - stretch) >= STRETCH_STEP or (target == 1.0) != (stretch == 1.0):
+                    log_event(
+                        logger, logging.INFO, "scan.stretch",
+                        f"Мощности не хватает: интервалы ×{target:g} (нужно {demand_rps:.2f} запр/с, каналы дают {capacity_rps:.2f})"
+                        if target > 1.0 else "Мощности хватает: интервалы по тарифам",
+                        factor=target, need=round(demand_rps, 2), have=round(capacity_rps or 0.0, 2),
+                    )
+                    stretch = target
             planner.sync(
                 groups,
-                base,  # Per-tariff interval of every URL
+                base if stretch <= 1.0 else {key: round(value * stretch, 2) for key, value in base.items()},
                 now,
                 startup=startup,
                 startup_spread=config.SCAN_STARTUP_SPREAD,
@@ -773,6 +805,12 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             changed.set()
 
             planner_snap = planner.snapshot(now)
+            METRICS.sample_workers(
+                total=len(parsers) + len(extra_workers),
+                busy=planner_snap["http_in_flight"],
+                queued=planner_snap["due"],
+                oldest_due=planner_snap["oldest_due_seconds"],
+            )
             metrics_snap = METRICS.snapshot(
                 active_unique_urls=len(groups),
                 proxy_snapshots=proxy_snaps,
@@ -780,6 +818,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 full_coverage_age_seconds=planner_snap["full_coverage_age_seconds"],
             )
             cap = metrics_snap["capacity"]
+            capacity_rps = float(cap.get("available_rps") or 0.0) or None
             note_demand = getattr(pool, "note_demand", None)
             if callable(note_demand):
                 note_demand(cap.get("required_rps") or plan.requested_rps)
@@ -833,6 +872,9 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                         radars=len(searches),
                         rps_need=round(cap["required_rps"], 2),
                         rps_have=round(cap["available_rps"], 2),
+                        rps_limits=round(limits_rps, 2),
+                        stretch=stretch,
+                        lanes=int(config.PROXY_MAX_IN_FLIGHT),
                         channels=f"{healthy_proxies}/{len(proxy_snaps)}",
                         coverage_s=round(planner_snap["full_coverage_age_seconds"] or 0.0, 1),
                         coverage_rid=planner_snap["least_covered_radar"],
@@ -890,7 +932,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         for entry in owned_parsers:
             entry.close()
         for client in pool.clients:
-            bound = getattr(client, "_bound_parser", None)
-            if bound is not None:
+            for bound in channel_parsers(client):
                 bound.close()
-                setattr(client, "_bound_parser", None)
+            setattr(client, "_bound_parser", None)
+            setattr(client, "_lane_parsers", None)

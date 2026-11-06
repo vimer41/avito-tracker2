@@ -19,7 +19,7 @@ from threading import Event, Lock, RLock
 from typing import List, Optional, TYPE_CHECKING
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
-from curl_cffi import requests
+from curl_cffi import CurlInfo, CurlOpt, requests
 import config
 from config import DATA_DIR
 from freshness import normalize_timestamp
@@ -121,6 +121,29 @@ def page_fingerprint(html: str) -> str:
 
 def _error_detail(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"[:120]
+
+
+# Asked from curl for every page request: time to first byte splits Avito's own slowness from a slow proxy.
+PAGE_CURL_INFOS = [CurlInfo.STARTTRANSFER_TIME]
+CANONICAL_URLS: dict = {}  # link -> Avito's canonical address, shared by all channels (bounded to 1000 in use)
+
+
+def stall_curl_options() -> dict:
+    """A request that gets not a single byte for AVITO_STALL_TIMEOUT seconds is dropped and retried on another
+    channel. A slow page that keeps flowing still has the whole connect + read timeout."""
+    return {CurlOpt.LOW_SPEED_LIMIT: 1, CurlOpt.LOW_SPEED_TIME: max(1, math.ceil(float(config.AVITO_STALL_TIMEOUT)))}
+
+
+def _response_size(response) -> int:
+    """Body bytes as received (compressed); 0 when the response does not say."""
+    size = getattr(response, "download_size", 0)
+    return int(size) if isinstance(size, (int, float)) and size > 0 else 0
+
+
+def _response_ttfb(response) -> Optional[float]:
+    infos = getattr(response, "infos", None)
+    value = infos.get(CurlInfo.STARTTRANSFER_TIME) if isinstance(infos, dict) else None
+    return float(value) if isinstance(value, (int, float)) and value > 0 else None
 
 
 SELLER_PROFILE_PATH_RE = re.compile(r"^/(user|brands)/[^/?#]+")
@@ -274,6 +297,33 @@ def remove_cache_busting(url: str) -> str:
         return url
 
 
+def lane_parser(client, lane: int, factory) -> "AvitoParser":
+    """The parser of one lane of a channel. A scan keeps its state (last_failure, request count) on its parser,
+    so two scans going through one IP at once need a parser each. Lane 0 stays `client._bound_parser`.
+    `factory` is the caller's AvitoParser, so a test that replaces it there still gets its fake."""
+    lane = lane if isinstance(lane, int) and not isinstance(lane, bool) else 0
+    if lane <= 0:
+        parser = getattr(client, "_bound_parser", None)
+        if parser is None:
+            parser = factory(proxy_client=client)
+            setattr(client, "_bound_parser", parser)
+        return parser
+    parsers = getattr(client, "_lane_parsers", None)
+    if parsers is None:
+        parsers = {}
+        setattr(client, "_lane_parsers", parsers)
+    parser = parsers.get(lane)
+    if parser is None:
+        parser = parsers[lane] = factory(proxy_client=client, lane=lane)
+    return parser
+
+
+def channel_parsers(client) -> list:
+    """Every lane parser of a channel, for shutdown."""
+    found = [getattr(client, "_bound_parser", None), *(getattr(client, "_lane_parsers", None) or {}).values()]
+    return [parser for parser in found if parser is not None]
+
+
 def _copy_cookie_jar(source_jar, target_jar) -> None:
     try:
         target_jar.clear()
@@ -293,8 +343,10 @@ class AvitoParser:
         *,
         block_state: Optional[NetworkBlockState] = None,
         proxy_client: Optional["ProxyClient"] = None,
+        lane: int = 0,
     ):
         self.proxy_client: Optional["ProxyClient"] = proxy_client
+        self._lane = int(lane)  # which of the channel's parallel sessions this parser drives
         if proxy_client is not None and proxy is None:
             proxy = proxy_client.proxy_url
         self.current_proxy: Optional[str] = proxy
@@ -323,8 +375,9 @@ class AvitoParser:
         self._cookie_write: Optional[Future] = None
         self._load_cookies()
 
-        # Кэш SSR-редиректов Авито: исходный URL -> канонический URL (экономит 1 запрос на радар)
-        self._canonical_cache: dict = {}
+        # SSR redirects of Avito: link -> canonical address. Shared by every channel: the target does not depend on
+        # the IP, and a per-channel cache cost each of 20 channels one extra page load per link.
+        self._canonical_cache: dict = CANONICAL_URLS
 
     # ─── Состояние блокировки ────────────────────────────────────────────
     def is_blocked(self) -> bool:
@@ -681,9 +734,13 @@ class AvitoParser:
                         kwargs["timeout"] = min(float(timeout or 15), remaining)
                     kwargs["allow_redirects"] = False
                     req_t0 = time.monotonic()
-                    resp = raw_request(*args, **kwargs)
+                    try:
+                        resp = raw_request(*args, **kwargs)
+                    except Exception:
+                        METRICS.record_transport_time(client.proxy_id, client.masked_url, time.monotonic() - req_t0)
+                        raise
                     req_elapsed = max(0.0, time.monotonic() - req_t0)
-                    client.record_raw_http_response(resp.status_code, req_elapsed)
+                    client.record_raw_http_response(resp.status_code, req_elapsed, size_bytes=_response_size(resp))
                     check_cancelled(cancel_event)
                     return resp
 
@@ -727,9 +784,16 @@ class AvitoParser:
             )
             req_t0 = time.monotonic()
             req_url = apply_cache_busting(url)
-            response = await async_session.request("GET", req_url, timeout=timeout, allow_redirects=False)
+            try:
+                response = await async_session.request("GET", req_url, timeout=timeout, allow_redirects=False)
+            except Exception:
+                METRICS.record_transport_time(client.proxy_id, client.masked_url, time.monotonic() - req_t0)
+                raise
             req_elapsed = max(0.0, time.monotonic() - req_t0)
-            client.record_raw_http_response(response.status_code, req_elapsed)
+            client.record_raw_http_response(
+                response.status_code, req_elapsed,
+                size_bytes=_response_size(response), ttfb_seconds=_response_ttfb(response),
+            )
             text = getattr(response, "text", "") or ""
             clean_url = remove_cache_busting(url)
             if self._is_firewall(response) or self._needs_challenge(response, text, async_session):
@@ -772,12 +836,14 @@ class AvitoParser:
                 proxies=proxies,
                 max_clients=1,
                 timeout=(config.AVITO_CONNECT_TIMEOUT, config.AVITO_READ_TIMEOUT),
+                curl_infos=PAGE_CURL_INFOS,
+                curl_options=stall_curl_options(),
             )
             self._load_cookies_into_jar(sess.cookies)
             return sess
 
         try:
-            async_session = await client.get_or_create_async_session(_create_async_session)
+            async_session = await client.get_or_create_async_session(_create_async_session, lane=self._lane)
             while True:
                 if not client.is_available():
                     self.last_failure = self.last_failure or FetchFailure("cooldown", retry_after=client.cooldown_remaining())
@@ -795,7 +861,7 @@ class AvitoParser:
                             retry_after=retry_after,
                             reason="rate_limit" if response.status_code == 429 else "forbidden",
                         )
-                        await client.reset_async_session()
+                        await client.reset_async_session(self._lane)
                         self.last_failure = FetchFailure(
                             "rate_limit" if response.status_code == 429 else "forbidden",
                             retry_after=cooldown,
@@ -819,7 +885,7 @@ class AvitoParser:
                                 retry_after=retry_after,
                                 reason="challenge",
                             )
-                            await client.reset_async_session()
+                            await client.reset_async_session(self._lane)
                             self.last_failure = FetchFailure("challenge", retry_after=cooldown, status=response.status_code)
                             return None
                         challenge_attempts += 1
@@ -856,9 +922,10 @@ class AvitoParser:
                                 retry_after=retry_after,
                                 reason="challenge",
                             )
-                            await client.reset_async_session()
+                            await client.reset_async_session(self._lane)
                             self.last_failure = FetchFailure("challenge", retry_after=cooldown, status=response.status_code)
                             return None
+                        self._share_clearance(client, async_session)
                         await asyncio.sleep(random.uniform(0.2, 0.3))
                         continue
 
@@ -918,7 +985,7 @@ class AvitoParser:
                 except PowSearchError as exc:
                     logger.debug("PoW stopped [%s]: %s", client.proxy_id, exc)
                     cooldown = client.record_block_or_challenge_failure(status=439, reason="pow_error")
-                    await client.reset_async_session()
+                    await client.reset_async_session(self._lane)
                     self.last_failure = FetchFailure("challenge", retry_after=cooldown, status=439, detail=_error_detail(exc))
                     return None
                 except ValueError as exc:
@@ -949,11 +1016,29 @@ class AvitoParser:
         finally:
             self.last_http_requests = request_counter[0]
 
+    def _share_clearance(self, client, async_session) -> None:
+        """Cookies of a solved challenge go to the other lanes of the same IP, so they do not solve it again."""
+        lane_sessions = getattr(client, "lane_sessions", None)
+        if not callable(lane_sessions):
+            return
+        for lane, session in lane_sessions().items():
+            if lane != self._lane and session is not async_session:
+                _copy_cookie_jar(async_session.cookies.jar, session.cookies.jar)
+
     async def fetch_page_async(self, url: str, *, deadline: float | None = None) -> Optional[str]:
         """Signal cancellation to the worker and wait for it before reusing its session."""
+        queued_at = time.monotonic()
         async with self._async_fetch_lock:
             if self.proxy_client is not None:
-                return await self._fetch_page_async_with_proxy_client(url, deadline=deadline)
+                # One fetch at a time per channel: the time a scan queued here and the time it held the channel.
+                held_at = time.monotonic()
+                try:
+                    return await self._fetch_page_async_with_proxy_client(url, deadline=deadline)
+                finally:
+                    METRICS.record_channel_use(
+                        self.proxy_client.proxy_id, self.proxy_client.masked_url,
+                        wait_seconds=held_at - queued_at, busy_seconds=time.monotonic() - held_at,
+                    )
 
             cancel_event = Event()
             kwargs = {"cancel_event": cancel_event}

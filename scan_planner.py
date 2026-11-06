@@ -56,6 +56,16 @@ def calculate_interval_plan(
     return IntervalPlan(intervals, demand, planned, available, planned > available * (1 + 1e-9))
 
 
+def stretch_factor(demand_rps: float, available_rps: float, *, utilization: float, max_factor: float) -> float:
+    """How much longer every interval must be so the planned load fits the measured capacity; 1.0 while it fits.
+    Every link stretches by the same factor, so the tariffs keep their proportion (20/30/40 s stay 1 : 1.5 : 2),
+    and nothing piles up in the queue: without it an overload left every link minutes late at random."""
+    values = (demand_rps, available_rps, utilization, max_factor)
+    if any(not math.isfinite(value) for value in values) or demand_rps <= 0 or available_rps <= 0 or utilization <= 0:
+        return 1.0
+    return round(min(max(1.0, max_factor), max(1.0, demand_rps / (available_rps * utilization))), 2)
+
+
 def compute_group_revision(radars: Iterable[dict]) -> str:
     """Compute a deterministic revision hash for the active radars of a URL group."""
     normalized = []

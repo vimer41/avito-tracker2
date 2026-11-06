@@ -173,9 +173,12 @@ class ProxyClient:
         if self.is_direct:
             self.configured_rate = max(1.5, self.configured_rate)
         self.effective_rate: float = self.configured_rate
-        self.max_in_flight: int = max(
-            1, int(config.PROXY_MAX_IN_FLIGHT if max_in_flight is None else max_in_flight)
-        )
+        # Lanes: requests through one IP at the same time, each lane with its own session and parser, while the rate
+        # limit, health and quarantine stay per IP. The server keeps one lane: it is fast, its rate limit binds first.
+        if max_in_flight is None:
+            max_in_flight = 1 if self.is_direct else config.PROXY_MAX_IN_FLIGHT
+        self.max_in_flight: int = max(1, int(max_in_flight))
+        self._lane_users: dict[int, int] = {}
 
         self._state: str = "healthy"  # healthy | quarantined | half_open | draining
         self.quarantined_until: float = 0.0
@@ -198,8 +201,8 @@ class ProxyClient:
         # Last answers however old: a reserve proxy may stay idle for hours, its record must not vanish.
         self._outcomes: deque[bool] = deque(maxlen=max(1, int(config.PROXY_QUALITY_WINDOW)))
 
-        # Persistent AsyncSession (created lazily)
-        self._async_session: curl_requests.AsyncSession | None = None
+        # Persistent AsyncSession per lane (created lazily)
+        self._async_sessions: dict[int, curl_requests.AsyncSession] = {}
         self._session_generation: int = 0
         self._draining: bool = False
 
@@ -224,7 +227,29 @@ class ProxyClient:
             configured_rate=self.configured_rate,
             effective_rate=self.effective_rate,
             quarantined_until=self.quarantined_until,
+            lanes=self.max_in_flight,
         )
+
+    def _take_lane(self) -> int:
+        """The least used lane (caller holds _pacing_lock); with every lane busy the scan queues on one."""
+        lane = min(range(max(1, self.max_in_flight)), key=lambda index: (self._lane_users.get(index, 0), index))
+        self._lane_users[lane] = self._lane_users.get(lane, 0) + 1
+        return lane
+
+    def _free_lane(self, lane: int) -> None:
+        users = self._lane_users.get(lane, 0)
+        if users > 1:
+            self._lane_users[lane] = users - 1
+        else:
+            self._lane_users.pop(lane, None)
+
+    @property
+    def _async_session(self) -> curl_requests.AsyncSession | None:
+        """Lane 0's session, for callers from before lanes."""
+        return self._async_sessions.get(0)
+
+    def lane_sessions(self) -> dict[int, curl_requests.AsyncSession]:
+        return dict(self._async_sessions)
 
     def is_available_for_scan(self, now: float | None = None) -> bool:
         if self._draining:
@@ -275,10 +300,12 @@ class ProxyClient:
     async def get_or_create_async_session(
         self,
         factory_or_headers: Callable[[], curl_requests.AsyncSession] | dict[str, str] | None = None,
+        lane: int = 0,
     ) -> curl_requests.AsyncSession:
-        if self._async_session is None:
+        session = self._async_sessions.get(lane)
+        if session is None:
             if callable(factory_or_headers):
-                self._async_session = factory_or_headers()
+                session = factory_or_headers()
             else:
                 merged_headers = dict(self.default_headers)
                 if isinstance(factory_or_headers, dict):
@@ -290,13 +317,17 @@ class ProxyClient:
                 }
                 if self.proxy_url:
                     kwargs["proxies"] = {"http": self.proxy_url, "https": self.proxy_url}
-                self._async_session = curl_requests.AsyncSession(**kwargs)
+                session = curl_requests.AsyncSession(**kwargs)
+            self._async_sessions[lane] = session
             self._session_generation += 1
-        return self._async_session
+        return session
 
-    async def reset_async_session(self) -> None:
-        session, self._async_session = self._async_session, None
-        if session is not None:
+    async def reset_async_session(self, lane: int | None = 0) -> None:
+        """Drops one lane's session (None: every lane); another lane's request in flight is not touched."""
+        for key in (list(self._async_sessions) if lane is None else [lane]):
+            session = self._async_sessions.pop(key, None)
+            if session is None:
+                continue
             try:
                 close_fn = getattr(session, "close", None)
                 if close_fn is not None:
@@ -309,7 +340,7 @@ class ProxyClient:
     async def close(self) -> None:
         self._draining = True
         self._sync_metrics_state()
-        await self.reset_async_session()
+        await self.reset_async_session(None)
 
     def _reserve_pacing_delay(self) -> float:
         """
@@ -330,6 +361,7 @@ class ProxyClient:
         if deadline is not None and self._monotonic() + delay > deadline:
             raise TimeoutError("HTTP operation deadline exceeded")
         if delay > 0:
+            METRICS.record_pacing(self.proxy_id, self.masked_url, delay)
             await self._sleep(delay)
 
     async def wait_for_rate_slot(self, deadline: float | None = None) -> None:
@@ -340,6 +372,7 @@ class ProxyClient:
         if deadline is not None and self._monotonic() + delay > deadline:
             raise TimeoutError("HTTP operation deadline exceeded")
         if delay > 0:
+            METRICS.record_pacing(self.proxy_id, self.masked_url, delay)
             if cancel_event is not None:
                 if cancel_event.wait(timeout=delay):
                     raise TimeoutError("HTTP operation cancelled")
@@ -435,6 +468,8 @@ class ProxyClient:
         latency_seconds: float,
         *,
         is_transport_error: bool = False,
+        size_bytes: int = 0,
+        ttfb_seconds: float | None = None,
     ) -> None:
         now = self._monotonic()
         self._prune_10m_history(now)
@@ -447,6 +482,8 @@ class ProxyClient:
             status_code,
             latency_seconds,
             is_transport_error=is_transport_error,
+            size_bytes=size_bytes,
+            ttfb_seconds=ttfb_seconds,
         )
 
         if is_transport_error or status_code is None or status_code >= 500:
@@ -613,6 +650,7 @@ class ProxyClient:
             "effective_rate": self.effective_rate,
             "current_rps": self.effective_rate,
             "in_flight": self.in_flight,
+            "lanes": self.max_in_flight,
             "quarantined_until": self.quarantined_until,
             "quarantine_remaining": max(0.0, round(self.quarantined_until - now, 1)) if st == "quarantined" else 0.0,
             "quarantine_reason": self.quarantine_reason,
@@ -623,7 +661,9 @@ class ProxyClient:
 @dataclass
 class ProxyLease:
     client: ProxyClient
+    lane: int = 0
     _released: bool = False
+    _on_release: Callable[[], None] | None = None
 
     def release(self) -> None:
         if self._released:
@@ -631,8 +671,11 @@ class ProxyLease:
         self._released = True
         with self.client._pacing_lock:
             self.client.in_flight = max(0, self.client.in_flight - 1)
+            self.client._free_lane(self.lane)
             if self.client._half_open_probe_active:
                 self.client._half_open_probe_active = False
+        if self._on_release is not None:
+            self._on_release()
 
 
 class ProxyPool:
@@ -657,6 +700,7 @@ class ProxyPool:
         self._draining_clients: list[ProxyClient] = []
         self._rr_cursor: int = 0
         self._lock = threading.Lock()
+        self._lane_freed: asyncio.Event | None = None  # set when a lease ends; scan workers wait on it
         # Smart mode state: planned load from the monitoring loop, until when proxies stay in work, and why.
         self._demand_rps: float = 0.0
         self._smart_mixed_until: float = -math.inf
@@ -922,42 +966,87 @@ class ProxyPool:
         исключая уже опробованные в этом скане прокси.
         """
         now = self._monotonic()
-        excluded = exclude_ids or set()
         with self._lock:
-            all_clients = list(self._clients.values())
-            if not all_clients:
+            picked = self._choose(now, exclude_ids or set())
+            if picked is None:
                 return None
-
-            n = len(all_clients)
-            server_first = self._evaluate_smart(now, all_clients)
-            candidates: list[tuple[float, float, int, ProxyClient]] = []
-            for offset in range(n):
-                idx = (self._rr_cursor + offset) % n
-                client = all_clients[idx]
-                if client.proxy_id in excluded:
-                    continue
-                if not client.is_available_for_scan(now):
-                    continue
-                with client._pacing_lock:
-                    # A busy fast channel usually frees up sooner than a throttled idle one becomes ready.
-                    queued = max(0, client.in_flight - client.max_in_flight + 1)
-                    starts_at = max(now, client._next_request_at) + queued * float(config.PROXY_BUSY_PENALTY)
-                candidates.append((-client.routing_score(now, server_first=server_first), starts_at, offset, client))
-
-            if not candidates:
-                return None
-
-            candidates.sort(key=lambda item: item[:3])
-            _, _, chosen_offset, chosen = candidates[0]
+            chosen, chosen_offset, n, _ = picked
             self._rr_cursor = (self._rr_cursor + chosen_offset + 1) % n
 
             chosen.last_acquired_at = now
             with chosen._pacing_lock:
                 chosen.in_flight += 1
+                lane = chosen._take_lane()
                 if chosen._state == "half_open":
                     chosen._half_open_probe_active = True
 
-            return ProxyLease(client=chosen)
+            return ProxyLease(client=chosen, lane=lane, _on_release=self._notify_lane_freed)
+
+    def _choose(self, now: float, excluded: set[str]) -> tuple[ProxyClient, int, int, bool] | None:
+        """The channel a scan would get now (caller holds self._lock):
+        (client, its round-robin offset, pool size, smart mode lets the server scan alone)."""
+        all_clients = list(self._clients.values())
+        if not all_clients:
+            return None
+        n = len(all_clients)
+        server_first = self._evaluate_smart(now, all_clients)
+        candidates: list[tuple[float, float, int, ProxyClient]] = []
+        for offset in range(n):
+            idx = (self._rr_cursor + offset) % n
+            client = all_clients[idx]
+            if client.proxy_id in excluded:
+                continue
+            if not client.is_available_for_scan(now):
+                continue
+            with client._pacing_lock:
+                # A busy fast channel usually frees up sooner than a throttled idle one becomes ready.
+                queued = max(0, client.in_flight - client.max_in_flight + 1)
+                starts_at = max(now, client._next_request_at) + queued * float(config.PROXY_BUSY_PENALTY)
+            candidates.append((-client.routing_score(now, server_first=server_first), starts_at, offset, client))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[:3])
+        _, _, chosen_offset, chosen = candidates[0]
+        return chosen, chosen_offset, n, server_first
+
+    def has_free_lane(self) -> bool:
+        """Would a scan started now get a lane of its own? False when the channel routing would pick is busy:
+        the scan then waits in the planner (most overdue first) instead of queueing on that channel's lock
+        while another channel idles."""
+        with self._lock:
+            picked = self._choose(self._monotonic(), set())
+        if picked is None:
+            return True  # nothing to wait for: the scan finds out by itself (no channel, cooldown)
+        client, _, _, server_first = picked
+        with client._pacing_lock:
+            if server_first and client.is_direct:
+                # Smart mode lets one scan queue behind the server; the next one routing sends to a reserve proxy.
+                return client.in_flight <= client.max_in_flight
+            return client.in_flight < client.max_in_flight
+
+    def _notify_lane_freed(self) -> None:
+        if self._lane_freed is not None:
+            self._lane_freed.set()
+
+    async def wait_for_free_lane(self, timeout: float = 1.0) -> None:
+        if self._lane_freed is None:
+            self._lane_freed = asyncio.Event()
+        self._lane_freed.clear()
+        try:
+            await asyncio.wait_for(self._lane_freed.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
+
+    def total_lanes(self) -> int:
+        return sum(max(1, int(getattr(client, "max_in_flight", 1))) for client in self.clients)
+
+    def set_lanes(self, lanes: int) -> None:
+        """Requests through one proxy at a time, switched live; the server keeps one lane."""
+        value = max(1, int(lanes))
+        for client in self.clients:
+            if not client.is_direct:
+                client.max_in_flight = value
+                client._sync_metrics_state()
 
     def earliest_available_delay(self, *, exclude_ids: set[str] | None = None) -> float:
         now = self._monotonic()

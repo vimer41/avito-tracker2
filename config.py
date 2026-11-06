@@ -104,7 +104,10 @@ PROXY_RATE_LIMIT = positive_float_setting("PROXY_RATE_LIMIT", "1.5")
 PROXY_RATE_RECOMMENDATION_MAX = positive_float_setting("PROXY_RATE_RECOMMENDATION_MAX", "2.0")
 PROXY_CAPACITY_RESERVE = non_negative_float_setting("PROXY_CAPACITY_RESERVE", "0.20")
 PROXY_MIN_RATE = positive_float_setting("PROXY_MIN_RATE", "0.5")
-PROXY_MAX_IN_FLIGHT = positive_int_setting("PROXY_MAX_IN_FLIGHT", "1")
+# Requests through one proxy at the same time (lanes). A page takes 2-3 s through a proxy, so one lane gave
+# ~0.35 req/s per IP; two nearly double it, the rate limit and the 403 ratio limiter still hold per IP.
+# The admin switches 1/2 live (bot_settings.proxy_lanes); the server channel always has one.
+PROXY_MAX_IN_FLIGHT = positive_int_setting("PROXY_MAX_IN_FLIGHT", "2")
 PROXY_FAILURE_THRESHOLD = positive_int_setting("PROXY_FAILURE_THRESHOLD", "3")
 PROXY_BLOCK_WINDOW_SECONDS = positive_int_setting("PROXY_BLOCK_WINDOW_SECONDS", "600")
 PROXY_BLOCK_RATIO_THRESHOLD = positive_float_setting("PROXY_BLOCK_RATIO_THRESHOLD", "0.05")
@@ -147,6 +150,8 @@ COOKIE_SAVE_INTERVAL = non_negative_float_setting("COOKIE_SAVE_INTERVAL", "30")
 
 AVITO_CONNECT_TIMEOUT = positive_float_setting("AVITO_CONNECT_TIMEOUT", "3.0")
 AVITO_READ_TIMEOUT = positive_float_setting("AVITO_READ_TIMEOUT", "8.0")
+# Not a single byte for this long = a dead request: dropped and retried on another channel (it held 11 s before).
+AVITO_STALL_TIMEOUT = positive_float_setting("AVITO_STALL_TIMEOUT", "6.0")
 AVITO_COLLECTION_DEADLINE = positive_float_setting("AVITO_COLLECTION_DEADLINE", "20.0")
 AVITO_MAX_REQUESTS_PER_SCAN = positive_int_setting("AVITO_MAX_REQUESTS_PER_SCAN", "8")
 AVITO_MAX_PAGES_PER_SCAN = min(5, positive_int_setting("AVITO_MAX_PAGES_PER_SCAN", "2"))
@@ -265,6 +270,10 @@ AVITO_FETCH_TIMEOUT = positive_float_setting("AVITO_FETCH_TIMEOUT", str(AVITO_CO
 AVITO_MAX_REQUESTS_PER_FETCH = max(1, int(os.getenv("AVITO_MAX_REQUESTS_PER_FETCH", str(AVITO_MAX_REQUESTS_PER_SCAN))))
 SCAN_MAX_INTERVAL = max(float(SCAN_INTERVAL_MIN), positive_float_setting("SCAN_MAX_INTERVAL", str(SCAN_INTERVAL_MAX)))
 SCAN_BUDGET_UTILIZATION = positive_float_setting("SCAN_BUDGET_UTILIZATION", "0.8")
+# When the measured capacity falls short, every tariff interval stretches by one factor so the load uses
+# SCAN_STRETCH_UTILIZATION of it (the rest absorbs retries); never more than ×SCAN_STRETCH_MAX.
+SCAN_STRETCH_UTILIZATION = positive_float_setting("SCAN_STRETCH_UTILIZATION", "0.9")
+SCAN_STRETCH_MAX = positive_float_setting("SCAN_STRETCH_MAX", "3.0")
 if SCAN_BUDGET_UTILIZATION > 1:
     raise ValueError("SCAN_BUDGET_UTILIZATION must not exceed 1")
 SCAN_MAX_RETRIES = min(3, max(0, int(os.getenv("SCAN_MAX_RETRIES", "2"))))

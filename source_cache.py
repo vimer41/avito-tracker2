@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import config
 from collector import collect_source
-from parser import AvitoParser, AvitoItem
+from parser import AvitoParser, AvitoItem, lane_parser
 from proxy_pool import get_proxy_pool
 
 
@@ -89,10 +89,7 @@ class SourceSnapshotCache:
                 break
             client = lease.client
             excluded.add(client.proxy_id)
-            parser = getattr(client, "_bound_parser", None)
-            if parser is None:
-                parser = AvitoParser(proxy_client=client)
-                setattr(client, "_bound_parser", parser)
+            parser = lane_parser(client, getattr(lease, "lane", 0), AvitoParser)
             try:
                 result = await collect_source(parser, key, max_age_minutes=30, max_pages=1)
                 if result is not None:

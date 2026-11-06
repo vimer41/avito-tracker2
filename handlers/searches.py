@@ -551,7 +551,8 @@ async def show_searches(event, state: Optional[FSMContext] = None):
         add_row.insert(0, ui.btn("Добавить", "add", callback_data="add_search_prompt"))
     rows.append(add_row)
     if config.is_admin(user_id) and len(searches) > 1:
-        rows.append([ui.btn("Удалить несколько", "trash", callback_data="bulk_del:new")])
+        rows.append([ui.btn("Удалить несколько", "trash", callback_data="bulk_del:new"),
+                     ui.btn("Удалить все", "trash", callback_data="bulk_wipe", style="danger")])
     rows.append([ui.home_btn()])
     await ui.show(event, "\n".join(lines), ui.kb(*rows))
 
@@ -886,6 +887,36 @@ async def cb_bulk_delete(call: CallbackQuery, state: FSMContext):
         deleted += int(await database.delete_search(int(search_id), call.from_user.id))
     log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Массовое удаление радаров",
                    f"Удалено {deleted} из {len(selected)}", status="OK")
+    await call.answer(f"Удалено радаров: {deleted}")
+    await show_searches(call)
+
+
+@router.callback_query(F.data == "bulk_wipe")
+async def cb_bulk_wipe_confirm(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("Доступно только администраторам", show_alert=True)
+        return
+    count = len(await database.get_user_searches(call.from_user.id))
+    if not count:
+        await call.answer("Радаров нет", show_alert=True)
+        return
+    await ui.show(call, (
+        f"{ui.e('trash')} <b>Вы уверены? Удалить все ваши радары ({count})?</b>\n\n"
+        "Их стоп-слова тоже удалятся. Отменить это нельзя."
+    ), ui.kb([ui.btn("Да, удалить все", "trash", callback_data="bulk_wipe_yes", style="danger"),
+              ui.btn("Отмена", callback_data="list_searches")]))
+
+
+@router.callback_query(F.data == "bulk_wipe_yes")
+async def cb_bulk_wipe(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        return
+    searches = await database.get_user_searches(call.from_user.id)
+    deleted = 0
+    for s in searches:
+        deleted += int(await database.delete_search(int(s["id"]), call.from_user.id))
+    log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Удаление всех радаров",
+                   f"Удалено {deleted} из {len(searches)}", status="OK")
     await call.answer(f"Удалено радаров: {deleted}")
     await show_searches(call)
 

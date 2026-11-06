@@ -4,6 +4,7 @@ what is needed to diagnose the bot without reading raw logs.
 
     python log_report.py [--minutes 60]     the report (the same as the button in the admin panel)
     python log_report.py --ready 24         can the bot be sold: a verdict with its evidence
+    python log_report.py --load 60          load test: plan against fact, the bottleneck, what the channels carry
     python log_report.py --trace a1f3       everything that happened to one scan
     python log_report.py --radar 12         recent events of a radar
     python log_report.py --chat 986832959   recent deliveries to a chat
@@ -17,6 +18,7 @@ never holds the bot's GIL; `--live-stdin` takes the bot's current state as JSON 
 import argparse
 import gzip
 import json
+import math
 import re
 import sys
 import time
@@ -719,6 +721,390 @@ def build_readiness(hours: int = 24, live_state: Optional[dict] = None) -> str:
     return "\n".join(lines)
 
 
+# ── Load report: plan against fact, where scan time goes, what the channels can carry ──
+
+LOAD_SUM_KEYS = ("http", "ok", "403", "429", "5xx", "terr", "coll", "coll_ok", "fetch", "busy_s", "wait_s", "waited",
+                 "pace_s", "http_s", "terr_s", "kb", "pages", "page_kb")
+LOAD_WINDOW_MIN = 5  # a channel's rate and its blocks are judged over 5 minutes, one minute holds too few requests
+RATE_BINS = (3, 6, 12, 18, 24, 30)  # requests per minute through one IP; 30 a minute is 0.5 req/s
+BANNED_SHARE = 0.3  # this share of 403/429 or of broken requests makes a channel useless
+BUSY_FOR_CEILING_S = 30.0  # a channel's throughput ceiling is measured only after this much work
+SLOW_PAGE_S = 3.0
+TOP_BOUND = {"lat_h": 20.0, "scan_h": 300.0, "due_h": 300.0, "revisit_h": 300.0}
+
+
+def _bound(key: str) -> float:
+    return float("inf") if key == "inf" else float(key)
+
+
+def _hist_merge(rows: Iterable[dict], *path: str) -> Counter:
+    merged: Counter = Counter()
+    for value in _values(rows, *path):
+        if isinstance(value, dict):
+            merged.update(value)
+    return merged
+
+
+def _hist_value(hist: Counter, share: float) -> Optional[float]:
+    """Upper bound of the bucket that holds `share` of the samples; None without samples."""
+    total = sum(hist.values())
+    if not total:
+        return None
+    target, running = max(1, math.ceil(total * share)), 0
+    for key in sorted(hist, key=_bound):
+        running += hist[key]
+        if running >= target:
+            return _bound(key)
+    return None
+
+
+def _hist_text(hist: Counter, share: float, kind: str, scale: float = 1.0, unit: str = "с") -> str:
+    value = _hist_value(hist, share)
+    if value is None:
+        return "—"
+    if math.isinf(value):
+        return f"> {TOP_BOUND[kind] * scale:g} {unit}"
+    return f"≤ {value * scale:g} {unit}"
+
+
+def _load_channels(metrics: list[dict]) -> dict[str, dict]:
+    merged: dict[str, dict] = defaultdict(lambda: {"lat_h": Counter(), "fail": Counter(), "ttfb_sum": 0.0})
+    for row in metrics:
+        for name, stats in (row.get("ch") or {}).items():
+            target = merged[name]
+            for key in LOAD_SUM_KEYS:
+                target[key] = target.get(key, 0) + (stats.get(key) or 0)
+            target["lat_h"].update(stats.get("lat_h") or {})
+            target["fail"].update(stats.get("fail") or {})
+            target["ttfb_sum"] += (stats.get("ttfb_ms") or 0) * (stats.get("pages") or 0)
+            target["state"], target["rate"] = stats.get("state"), stats.get("rate")
+    return merged
+
+
+def _channel_verdict(stats: dict) -> str:
+    http = stats.get("http", 0)
+    if http < 10:
+        return "мало данных"
+    if (stats.get("403", 0) + stats.get("429", 0)) / http >= BANNED_SHARE:
+        return "блок Авито"
+    if stats.get("terr", 0) / http >= BANNED_SHARE:
+        return "обрывы"
+    if stats.get("ok", 0) / http < GOOD_CHANNEL_OK:
+        return "слабый"
+    page_p50 = _hist_value(stats["lat_h"], 0.5)
+    return "медленный" if page_p50 is not None and page_p50 > SLOW_PAGE_S else "хороший"
+
+
+def _usable(stats: dict) -> bool:
+    return _channel_verdict(stats) in ("хороший", "медленный")
+
+
+def _ceiling_rps(stats: dict, lanes: int = 1) -> Optional[float]:
+    """Requests per second the channel gives when busy all the time: it serves `lanes` requests at a time,
+    so the ceiling is lanes / (time per request), capped by its rate limit."""
+    work = stats.get("busy_s", 0) - stats.get("pace_s", 0)
+    if work < BUSY_FOR_CEILING_S or not stats.get("http"):
+        return None
+    return min(lanes * stats["http"] / work, float(stats.get("rate") or 1.5))
+
+
+def _lanes_of(name: str, metrics: list[dict]) -> int:
+    """Lanes of a channel in the period: the server always has one, proxies the setting of the minute rows."""
+    if name == "direct":
+        return 1
+    values = sorted(_values(metrics, "lanes"))
+    return max(1, int(values[len(values) // 2])) if values else 1
+
+
+def _load_summary(metrics: list[dict]) -> dict:
+    """The numbers every section of the load report reads."""
+    minutes = len(metrics)
+    loads = [row.get("load") or {} for row in metrics]
+    channels = _load_channels(metrics)
+    usable = {name: stats for name, stats in channels.items() if _usable(stats)}
+    scans = _sum(metrics, "scans", "ok") + _sum(metrics, "scans", "fail")
+    http = sum(stats.get("http", 0) for stats in channels.values())
+    plan_values = sorted(load.get("plan_sps") or 0 for load in loads if load.get("plan_sps"))
+    plan_sps = plan_values[len(plan_values) // 2] if plan_values else 0.0
+    urls = sorted(row.get("urls") or 0 for row in metrics if row.get("urls"))
+    url_count = urls[len(urls) // 2] if urls else 0
+    workers = sum(load.get("workers") or 0 for load in loads) / max(minutes, 1)
+    busy_workers = sum(load.get("busy") or 0 for load in loads) / max(minutes, 1)
+    lanes = {name: _lanes_of(name, metrics) for name in channels}
+    ceilings = {name: _ceiling_rps(stats, lanes[name]) for name, stats in usable.items()}
+    measured = [value for value in ceilings.values() if value]
+    challenge_s = sum(
+        stats.get("avg_s", 0) * (stats.get("ok", 0) + stats.get("fail", 0))
+        for row in metrics for stats in (row.get("challenge") or {}).values()
+    )
+    return {
+        "minutes": minutes,
+        "channels": channels,
+        "usable": usable,
+        "ceilings": ceilings,
+        "pool_rps": sum(measured) + (len(usable) - len(measured)) * (sum(measured) / len(measured) if measured else 0.0),
+        "pool_safe_rps": (
+            sum(min(value, SAFE_RPS_PER_IP) for value in measured)
+            + (len(usable) - len(measured)) * (min(sum(measured) / len(measured), SAFE_RPS_PER_IP) if measured else 0.0)
+        ),
+        "scans": scans,
+        "http": http,
+        "fact_sps": scans / (60.0 * max(minutes, 1)),
+        "plan_sps": plan_sps,
+        "urls": url_count,
+        "interval": url_count / plan_sps if plan_sps else 0.0,
+        "cost": http / scans if scans else 0.0,
+        "workers": workers,
+        "busy_workers": busy_workers,
+        "queue": sum(load.get("queue") or 0 for load in loads) / max(minutes, 1),
+        "queue_max": max((load.get("queue_max") or 0 for load in loads), default=0),
+        "oldest_s": max((load.get("oldest_s") or 0 for load in loads), default=0),
+        "scan_busy_s": sum(load.get("scan_busy_s") or 0 for load in loads),
+        "wait_s": sum(stats.get("wait_s", 0) for stats in channels.values()),
+        "http_s": sum(stats.get("http_s", 0) for stats in channels.values()),
+        "terr_s": sum(stats.get("terr_s", 0) for stats in channels.values()),
+        "pace_s": sum(stats.get("pace_s", 0) for stats in channels.values()),
+        "challenge_s": challenge_s,
+        "lanes": lanes,
+        "good_busy": (
+            sum(stats.get("busy_s", 0) / lanes[name] for name, stats in usable.items()) / (60.0 * minutes * len(usable))
+            if usable and minutes else 0.0
+        ),
+        "revisit_h": _hist_merge(loads, "revisit_h"),
+        "due_h": _hist_merge(loads, "due_h"),
+        "scan_h": _hist_merge(loads, "scan_h"),
+        "tries": _hist_merge(loads, "tries"),
+    }
+
+
+def _time_split(s: dict) -> list[tuple[str, float]]:
+    """Where the scan workers' time went, largest first."""
+    total = s["scan_busy_s"]
+    if total <= 0:
+        return []
+    parts = [
+        ("ждали занятый канал", s["wait_s"]),
+        ("ответы Авито", s["http_s"]),
+        ("таймауты и обрывы", s["terr_s"]),
+        ("капча", s["challenge_s"]),
+        ("лимит частоты", s["pace_s"]),
+    ]
+    parts.append(("разбор и прочее", max(0.0, total - sum(value for _, value in parts))))
+    return sorted(((name, min(1.0, value / total)) for name, value in parts), key=lambda part: -part[1])
+
+
+def _load_conclusions(s: dict, metrics: list[dict]) -> list[str]:
+    lines = []
+    fulfil = s["fact_sps"] / s["plan_sps"] if s["plan_sps"] else 0.0
+    revisit = _hist_text(s["revisit_h"], 0.5, "revisit_h")
+    lines.append(
+        f"Сканов по плану: {fulfil:.0%} (факт {s['fact_sps']:.2f} из {s['plan_sps']:.2f} в секунду). "
+        f"Ссылку проверяют в среднем раз в {revisit}, цель {s['interval']:.0f} с."
+    )
+    worker_use = s["busy_workers"] / s["workers"] if s["workers"] else 0.0
+    split = _time_split(s)
+    top = ", ".join(f"{name} {share:.0%}" for name, share in split[:3]) or "нет данных"
+    due_p95 = _hist_value(s["due_h"], 0.95) or 0.0
+    cpu_p95 = _percentile(_values(metrics, "cpu_pct"), 0.95)
+    if fulfil >= 0.95 and due_p95 <= 5:
+        lines.append(f"Бот успевает: сканы идут по плану. Хорошие каналы заняты на {s['good_busy']:.0%}.")
+    elif cpu_p95 >= 85:
+        lines.append(f"Упор в процессор бота: CPU p95 {cpu_p95:g}% одного ядра. Время сканов: {top}.")
+    elif s["good_busy"] >= 0.8:
+        lines.append(
+            f"Упор в каналы: хорошие каналы заняты {s['good_busy']:.0%} времени (по одному запросу за раз), "
+            f"воркеры заняты на {worker_use:.0%}. Время сканов: {top}."
+        )
+    elif worker_use >= 0.9:
+        lines.append(
+            f"Упор в воркеры: заняты {worker_use:.0%} из {s['workers']:.0f}, а хорошие каналы работают лишь "
+            f"{s['good_busy']:.0%} времени. Время сканов: {top}."
+        )
+    elif s["queue"] < 1:
+        lines.append("Очереди нет, но сканов меньше плана: ссылки замедлены после ошибок (интервал ×5) или каналы на паузе.")
+    else:
+        lines.append(f"Сканы отстают. Время сканов: {top}.")
+    if s["usable"] and s["pool_rps"] and s["cost"] and s["interval"]:
+        per_channel = s["pool_rps"] / len(s["usable"])
+        links = s["pool_rps"] * s["interval"] / s["cost"]
+        need = s["urls"] * s["cost"] / s["interval"]
+        lines.append(
+            f"Мощность: {len(s['usable'])} хороших каналов дают {s['pool_rps']:.2f} запр/с "
+            f"(≈{per_channel:.2f} на канал) → ~{links:.0f} ссылок при проверке раз в {s['interval']:.0f} с. "
+            f"Сейчас ссылок {s['urls']}: им нужно {need:.2f} запр/с, это ~{math.ceil(need / per_channel)} таких каналов, "
+            f"с запасом 20% — {math.ceil(need * 1.2 / per_channel)}."
+        )
+        if s["pool_safe_rps"] < s["pool_rps"] * 0.95:
+            lines.append(
+                f"Если держать не больше {SAFE_RPS_PER_IP} запр/с на IP: {s['pool_safe_rps']:.2f} запр/с → "
+                f"~{s['pool_safe_rps'] * s['interval'] / s['cost']:.0f} ссылок."
+            )
+    bot_view = _median(metrics, "rps_have")
+    limits = _median(metrics, "rps_limits")
+    if bot_view != "—" and limits != "—":
+        lines.append(f"Оценка мощности у бота: {bot_view} запр/с по замерам каналов (сумма лимитов частоты {limits}).")
+    elif bot_view != "—":
+        lines.append(f"Бот сам считает, что у него {bot_view} запр/с: это сумма лимитов частоты, а не то, что каналы реально успевают.")
+    stretches = [value for value in _values(metrics, "stretch") if value]
+    if stretches and max(stretches) > 1.0:
+        stretched = sum(1 for value in stretches if value > 1.0)
+        lines.append(
+            f"Интервалы растягивались из-за нехватки мощности {stretched} мин из {len(stretches)}, "
+            f"до ×{max(stretches):g}: тарифы сохраняли пропорцию, ссылки не копились в очередь."
+        )
+    lanes = sorted(set(_values(metrics, "lanes")))
+    if lanes:
+        lines.append(f"Запросов на прокси одновременно: {'/'.join(f'{value:g}' for value in lanes)}.")
+    return lines
+
+
+def _plan_lines(s: dict) -> list[str]:
+    tries = s["tries"]
+    tried = sum(tries.values())
+    tries_text = ", ".join(f"{key} канал{'а' if key != '1' else ''} — {_pct(count, tried)}" for key, count in sorted(tries.items())) or "—"
+    worker_use = s["busy_workers"] / s["workers"] if s["workers"] else 0.0
+    return [
+        f"ссылок: {s['urls']}, цель: раз в {s['interval']:.1f} с, план {s['plan_sps']:.2f} скан/с",
+        f"факт: {s['fact_sps']:.2f} скан/с, {s['http'] / (60.0 * max(s['minutes'], 1)):.2f} запр/с, запросов на скан {s['cost']:.2f}",
+        f"повторная проверка ссылки: p50 {_hist_text(s['revisit_h'], 0.5, 'revisit_h')} · p95 {_hist_text(s['revisit_h'], 0.95, 'revisit_h')}",
+        f"опоздание старта скана: p50 {_hist_text(s['due_h'], 0.5, 'due_h')} · p95 {_hist_text(s['due_h'], 0.95, 'due_h')}",
+        f"ждут свободного воркера: в среднем {s['queue']:.1f} ссылок, максимум {s['queue_max']}, самая старая {s['oldest_s']:.0f} с",
+        f"воркеры: {s['workers']:.0f}, заняты в среднем {s['busy_workers']:.1f} ({worker_use:.0%})",
+        f"длительность скана: p50 {_hist_text(s['scan_h'], 0.5, 'scan_h')} · p95 {_hist_text(s['scan_h'], 0.95, 'scan_h')}",
+        f"каналов на скан: {tries_text}",
+    ]
+
+
+def _load_channel_lines(s: dict) -> list[str]:
+    minutes = max(s["minutes"], 1)
+    lines = ["канал: запр/мин · занят · ждали его · ok · 403/429 · обрывы · страница p50/p95 · до 1-го байта · КБ/стр · потолок · вывод"]
+    for name, stats in sorted(s["channels"].items(), key=lambda pair: -pair[1].get("http", 0)):
+        http, pages = stats.get("http", 0), stats.get("pages", 0)
+        ceiling = s["ceilings"].get(name)
+        verdict = _channel_verdict(stats)
+        if pages:
+            page = (f"{_hist_text(stats['lat_h'], 0.5, 'lat_h', 1000, 'мс')}/"
+                    f"{_hist_text(stats['lat_h'], 0.95, 'lat_h', 1000, 'мс')} · "
+                    f"{stats['ttfb_sum'] / pages:.0f} мс · {stats.get('page_kb', 0) / pages:.0f}")
+        else:
+            page = "— · — · —"
+        lines.append(
+            f"{name}: {http / minutes:.1f} · {stats.get('busy_s', 0) / (60.0 * minutes * s['lanes'].get(name, 1)):.0%} · "
+            f"{stats.get('wait_s', 0) / max(stats.get('fetch', 0), 1):.1f} с · {_pct(stats.get('ok', 0), http)} · "
+            f"{_pct(stats.get('403', 0) + stats.get('429', 0), http)} · {_pct(stats.get('terr', 0), http)} · {page} · "
+            f"{f'{ceiling:.2f}/с' if ceiling else '—'} · {verdict}"
+            + ("" if verdict in ("хороший", "медленный") else f" ({_top(stats['fail'], 2)})")
+        )
+    return lines
+
+
+def _rate_block_lines(metrics: list[dict], s: dict) -> list[str]:
+    """Blocks against the request rate of one IP, over 5-minute windows of the channels that are not banned:
+    shows the rate where Avito starts to answer 403/429."""
+    bins: dict[int, Counter] = defaultdict(Counter)
+    names = [name for name, stats in s["channels"].items() if _channel_verdict(stats) not in ("блок Авито", "обрывы")]
+    for start in range(0, len(metrics), LOAD_WINDOW_MIN):
+        window = metrics[start:start + LOAD_WINDOW_MIN]
+        for name in names:
+            minutes = [row["ch"][name] for row in window if name in (row.get("ch") or {})]
+            http = sum(minute.get("http", 0) for minute in minutes)
+            if not http:
+                continue
+            rate = http / len(window)
+            index = next((i for i, edge in enumerate(RATE_BINS) if rate < edge), len(RATE_BINS))
+            target = bins[index]
+            target["windows"] += 1
+            target["http"] += http
+            target["blocks"] += sum(minute.get("403", 0) + minute.get("429", 0) for minute in minutes)
+            target["terr"] += sum(minute.get("terr", 0) for minute in minutes)
+    if not bins:
+        return []
+    lines = ["запр/мин на IP (запр/с) · окон по 5 мин · запросов · 403/429 · обрывы"]
+    edges = (0, *RATE_BINS)
+    for index in sorted(bins):
+        low = edges[index]
+        label = f"{low}+" if index == len(RATE_BINS) else f"{low}–{RATE_BINS[index]}"
+        per_second = f"до {RATE_BINS[index] / 60:.2f}" if index < len(RATE_BINS) else f"от {low / 60:.2f}"
+        target = bins[index]
+        lines.append(
+            f"{label} ({per_second}) · {target['windows']} · {target['http']} · "
+            f"{_pct(target['blocks'], target['http'])} · {_pct(target['terr'], target['http'])}"
+        )
+    return lines
+
+
+def _time_lines(s: dict) -> list[str]:
+    split = _time_split(s)
+    if not split:
+        return []
+    return [
+        " · ".join(f"{name} {share:.0%}" for name, share in split),
+        f"всего {s['scan_busy_s'] / 60:.0f} воркер-минут за {s['minutes']} мин",
+    ]
+
+
+def _server_lines(metrics: list[dict]) -> list[str]:
+    cpu = _values(metrics, "cpu_pct")
+    if not cpu:
+        return []
+    return [
+        f"CPU бота (доля одного ядра): p50 {_percentile(cpu, 0.5):g}% · p95 {_percentile(cpu, 0.95):g}% · макс {max(cpu):g}%",
+        f"CPU сервера p95 {_percentile(_values(metrics, 'sys_cpu'), 0.95):g}% · steal макс {_worst(metrics, 'steal')}% · "
+        f"iowait макс {_worst(metrics, 'iowait')}%",
+        f"память бота макс {_worst(metrics, 'rss_mb')} МБ · свободно на сервере мин "
+        f"{min(_values(metrics, 'mem_avail_mb') or [0]):g} МБ",
+        f"задержка event loop макс {_worst(metrics, 'loop_max_ms')} мс · зависаний {_sum(metrics, 'stalls')}",
+    ]
+
+
+def _load_timeline(metrics: list[dict]) -> list[str]:
+    lines = ["время · ссылок · скан/с план/факт · запр/с · воркеры заняты · ждут ср/макс · опозд p95 · ok · CPU"]
+    for start in range(0, len(metrics), BUCKET_MINUTES):
+        chunk = metrics[start:start + BUCKET_MINUTES]
+        loads = [row.get("load") or {} for row in chunk]
+        ok, failed = _sum(chunk, "scans", "ok"), _sum(chunk, "scans", "fail")
+        http = sum(stats.get("http", 0) for row in chunk for stats in (row.get("ch") or {}).values())
+        seconds = 60.0 * len(chunk)
+        lines.append(
+            f"{chunk[0].get('ts', '')[-5:]} · {_median(chunk, 'urls')} · {_median(loads, 'plan_sps')}/{(ok + failed) / seconds:.2f} · "
+            f"{http / seconds:.2f} · {_median(loads, 'busy')}/{_median(loads, 'workers')} · "
+            f"{_median(loads, 'queue')}/{_worst(loads, 'queue_max')} · {_hist_text(_hist_merge(loads, 'due_h'), 0.95, 'due_h')} · "
+            f"{_pct(ok, ok + failed)} · {_median(chunk, 'cpu_pct')}%"
+        )
+    return lines
+
+
+def build_load(minutes: int = 60, live_state: Optional[dict] = None) -> str:
+    """The load test on one page: does the bot keep the plan, what holds it back, how many links the channels carry."""
+    now = time.time()
+    rows = read_rows(METRICS_LOG, now - minutes * 60)
+    metrics = [row for row in rows if "load" in row]
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.gmtime(now + 3 * 3600))
+    lines = [f"# Avito Radar: нагрузка за {minutes} мин, {stamp} МСК",
+             f"Минут с замером нагрузки: {len(metrics)} из {len(rows)}."]
+    if not metrics:
+        lines += ["", "Нет данных о нагрузке: бот работает без этого обновления или только что запущен."]
+        return "\n".join(lines)
+    urls = _values(metrics, "urls")
+    lines.append(
+        f"Ссылок {min(urls or [0]):g}–{max(urls or [0]):g}, радаров {_worst(metrics, 'radars')}, "
+        f"каналов в работе сейчас {metrics[-1].get('channels', '—')}"
+        + (f", сеть {live_state.get('net_mode')}" if live_state and live_state.get("net_mode") else "") + "."
+    )
+    lines.append("")
+    summary = _load_summary(metrics)
+    lines += _section("Вывод", [f"- {line}" for line in _load_conclusions(summary, metrics)])
+    lines += _section("План и факт", _plan_lines(summary))
+    lines += _section("Куда уходит время сканов", _time_lines(summary))
+    lines += _section("Каналы", _load_channel_lines(summary))
+    lines += _section("Частота запросов на IP и блоки", _rate_block_lines(metrics, summary))
+    lines += _section("Провалы сканов", [_top(_merge(metrics, "fail"), 8)])
+    lines += _section("Антибот", _challenges(metrics))
+    lines += _section("Сервер", _server_lines(metrics))
+    lines += _section(f"По {BUCKET_MINUTES} мин", _load_timeline(metrics))
+    return "\n".join(lines)
+
+
 def select(rows: list[dict], trace: str = "", radar: int = 0, chat: int = 0, text: str = "") -> list[dict]:
     def matches(row: dict) -> bool:
         fields = row.get("f") or {}
@@ -739,6 +1125,7 @@ def main() -> None:
     args = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     args.add_argument("--minutes", type=int, default=60)
     args.add_argument("--ready", type=int, default=0)
+    args.add_argument("--load", type=int, default=0, help="minutes of the load report")
     args.add_argument("--trace", default="")
     args.add_argument("--radar", type=int, default=0)
     args.add_argument("--chat", type=int, default=0)
@@ -758,6 +1145,9 @@ def main() -> None:
         return
     if options.ready:
         print(build_readiness(options.ready, live_state))
+        return
+    if options.load:
+        print(build_load(options.load, live_state))
         return
     if not (options.trace or options.radar or options.chat or options.grep):
         print(build_report(options.minutes, live_state))

@@ -1050,6 +1050,10 @@ async def init_db():
                 config.apply_stars_prices(*json.loads(str(p_row[0])))
             except (TypeError, ValueError):
                 logger.warning("Некорректные цены Stars в bot_settings: оставляю цены из настроек окружения")
+        async with db.execute("SELECT value FROM bot_settings WHERE key = 'proxy_lanes'") as cur:
+            lanes_row = await cur.fetchone()
+        if lanes_row is not None and str(lanes_row[0]) in ("1", "2"):
+            config.PROXY_MAX_IN_FLIGHT = int(lanes_row[0])
         logger.info("База данных успешно инициализирована")
 
 

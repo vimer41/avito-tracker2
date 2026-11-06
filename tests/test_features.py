@@ -162,6 +162,25 @@ class TestRadarEditing(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_callback("bulk_yes", user_id=self.user_id)
         self.assertEqual([s["id"] for s in await database.get_user_searches(self.user_id)], [ids[1]])
 
+    async def test_admin_wipe_all_asks_then_deletes_every_radar(self):
+        for n in range(3):
+            await self.add(n)
+        await self.dispatch_callback("list_searches", user_id=self.user_id)
+        self.assertIn("bulk_wipe", self.callback_values())
+        await self.dispatch_callback("bulk_wipe", user_id=self.user_id)
+        self.assertIn("Вы уверены", self.last_text())
+        self.assertEqual(len(await database.get_user_searches(self.user_id)), 3)
+        await self.dispatch_callback("bulk_wipe_yes", user_id=self.user_id)
+        self.assertEqual(await database.get_user_searches(self.user_id), [])
+
+    async def test_wipe_all_is_admin_only(self):
+        user_id = 777002
+        await database.get_or_create_user(user_id)
+        await database.set_user_allowed(user_id, 1)
+        await database.add_search(user_id, "x", "https://www.avito.ru/kazan?q=x&s=104")
+        await self.dispatch_callback("bulk_wipe_yes", user_id=user_id)
+        self.assertEqual(len(await database.get_user_searches(user_id)), 1)
+
     async def test_bulk_delete_is_admin_only(self):
         user_id = 777001
         await database.get_or_create_user(user_id)

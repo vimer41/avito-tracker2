@@ -28,6 +28,12 @@ HTTP_COST_BOUNDS: tuple[float, ...] = (
 PUB_DELAY_BOUNDS: tuple[float, ...] = (
     5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 120.0, 180.0, 300.0, 600.0, 900.0, 1800.0, float("inf")
 )
+# Load time of a search page (HTTP 200) through a channel, seconds.
+PAGE_LATENCY_BOUNDS: tuple[float, ...] = (
+    0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 11.0, 20.0, float("inf")
+)
+CHANNEL_WAIT_NOTICE = 0.05  # a fetch that waited longer for its channel queued behind another scan
+THROUGHPUT_MIN_REQUESTS = 10  # requests in 10 minutes before a channel's own speed replaces the pool's typical one
 
 TARIFF_KEYS: tuple[str, ...] = ("pro", "standart", "lite", "base")
 
@@ -142,6 +148,11 @@ def summarize_histograms(slices: Iterable[HistogramSlice], bounds: tuple[float, 
     }
 
 
+def sparse_histogram(sl: HistogramSlice) -> dict[str, int]:
+    """Non-empty buckets keyed by their upper bound ("inf" for the last), so a report merges minutes exactly."""
+    return {("inf" if math.isinf(bound) else f"{bound:g}"): count for bound, count in zip(sl.bounds, sl.counts) if count}
+
+
 def _make_tariff_histograms(bounds: tuple[float, ...]) -> dict[str, HistogramSlice]:
     return {k: HistogramSlice(bounds) for k in TARIFF_KEYS}
 
@@ -162,9 +173,27 @@ class ProxyMinuteSlice:
     scans_new: int = 0
     failures: dict[str, int] = field(default_factory=dict)
     http_latency: HistogramSlice = field(default_factory=lambda: HistogramSlice(HTTP_LATENCY_BOUNDS))
+    # Load accounting. A channel serves one fetch at a time, so busy_s / 60 is how much of the minute it worked.
+    fetches: int = 0
+    busy_s: float = 0.0  # held by a fetch: answers, broken requests, rate-limit waits, anti-bot
+    wait_s: float = 0.0  # scans queued behind another scan's fetch on this channel
+    waited: int = 0
+    pace_s: float = 0.0  # token-bucket waits inside busy_s
+    http_s: float = 0.0  # Avito answered (any status)
+    terr_s: float = 0.0  # spent on requests that broke: timeouts, resets
+    kb: float = 0.0
+    pages: int = 0  # HTTP 200
+    page_kb: float = 0.0
+    ttfb_s: float = 0.0
+    ttfb_n: int = 0
+    page_latency: HistogramSlice = field(default_factory=lambda: HistogramSlice(PAGE_LATENCY_BOUNDS))
 
     def reset(self, minute_id: int) -> None:
         self.minute_id = minute_id
+        self.fetches = self.waited = self.pages = self.ttfb_n = 0
+        self.busy_s = self.wait_s = self.pace_s = self.http_s = self.terr_s = 0.0
+        self.kb = self.page_kb = self.ttfb_s = 0.0
+        self.page_latency.reset()
         self.raw_http_total = 0
         self.raw_http_2xx_3xx = 0
         self.raw_http_403 = 0
@@ -234,9 +263,25 @@ class MinuteBucket:
     catchup_omitted_count: int = 0
     outbox_expired_count: int = 0
     outbox_failed_count: int = 0
+    # Load accounting: every scan's duration (failed ones too), channels tried, scan workers sampled once a second.
+    scan_any: HistogramSlice = field(default_factory=lambda: HistogramSlice(SCAN_INTERVAL_BOUNDS))
+    scan_busy_s: float = 0.0
+    scan_tries: dict[int, int] = field(default_factory=dict)
+    worker_samples: int = 0
+    workers_sum: int = 0
+    workers_busy_sum: int = 0
+    workers_busy_max: int = 0
+    queue_sum: int = 0
+    queue_max: int = 0
+    queue_oldest_max: float = 0.0
 
     def reset(self, minute_id: int) -> None:
         self.minute_id = minute_id
+        self.scan_any.reset()
+        self.scan_busy_s = self.queue_oldest_max = 0.0
+        self.scan_tries.clear()
+        self.worker_samples = self.workers_sum = self.workers_busy_sum = self.workers_busy_max = 0
+        self.queue_sum = self.queue_max = 0
         for d in (self.pub_to_seen, self.seen_to_queued, self.queued_to_sent, self.deliver_at_to_sent):
             for sl in d.values():
                 sl.reset()
@@ -326,9 +371,19 @@ def calculate_capacity_report(
     healthy_count = len(healthy_list)
     quarantined_count = len(quarantined_list)
 
-    available_rate_now = round(
-        sum(float(p.get("effective_rate") or p.get("current_rps") or 0.0) for p in healthy_list), 4
-    )
+    # A channel gives what it measurably does (lanes / service time, capped by its rate limit), not its rate
+    # limit: with pages loading 2-3 s a proxy did ~0.35 req/s while the limit said 1.5. A channel not measured
+    # yet counts as the typical measured one.
+    measured = [float(p["throughput_rps"]) for p in healthy_list if p.get("throughput_rps")]
+    typical_rps = sum(measured) / len(measured) if measured else None
+
+    def channel_rps(p: dict[str, Any]) -> float:
+        if p.get("throughput_rps"):
+            return float(p["throughput_rps"])
+        limit = float(p.get("effective_rate") or p.get("current_rps") or 0.0)
+        return min(limit, typical_rps) if typical_rps else limit
+
+    available_rate_now = round(sum(channel_rps(p) for p in healthy_list), 4)
 
     # Reserve: exclude top 20% endpoints by effective_rate; already quarantined count toward the 20%
     reserve_target_healthy = math.floor(total_proxies * (1.0 - reserve)) if total_proxies > 0 else 0
@@ -338,14 +393,9 @@ def calculate_capacity_report(
     else:
         reserve_keep_count = min(healthy_count, max(0, reserve_target_healthy))
 
-    sorted_healthy = sorted(
-        healthy_list,
-        key=lambda item: float(item.get("effective_rate") or item.get("current_rps") or 0.0),
-    )
+    sorted_healthy = sorted(healthy_list, key=channel_rps)
     kept_for_reserve = sorted_healthy[:reserve_keep_count]
-    available_rate_with_reserve = round(
-        sum(float(p.get("effective_rate") or p.get("current_rps") or 0.0) for p in kept_for_reserve), 4
-    )
+    available_rate_with_reserve = round(sum(channel_rps(p) for p in kept_for_reserve), 4)
 
     deficit_now = round(max(0.0, required_rate_at_max_mean - available_rate_now), 4)
     deficit_with_reserve = round(max(0.0, required_rate_target_mean - available_rate_with_reserve), 4)
@@ -446,6 +496,8 @@ def calculate_capacity_report(
         "required_rate_at_max_p95": required_rate_at_max_p95,
         "required_rate_target_p95": required_rate_target_p95,
         "total_proxies": total_proxies,
+        "measured_channels": len(measured),
+        "typical_channel_rps": round(typical_rps, 4) if typical_rps else None,
         "healthy_proxies": healthy_count,
         "quarantined_proxies": quarantined_count,
         "capacity_proxy_count": capacity_proxy_count,
@@ -613,6 +665,7 @@ class RuntimeMetricsRegistry:
         quarantined_until: float = 0.0,
         quarantine_reason: str = "",
         quarantine_remaining: float = 0.0,
+        lanes: int = 1,
     ) -> None:
         self._proxy_slice(proxy_id, masked_url)
         self._proxy_meta[proxy_id] = {
@@ -624,6 +677,7 @@ class RuntimeMetricsRegistry:
             "quarantined_until": float(quarantined_until),
             "quarantine_reason": sanitize_proxy_credentials(quarantine_reason),
             "quarantine_remaining": float(quarantine_remaining or 0.0),
+            "lanes": max(1, int(lanes or 1)),
         }
 
     def record_http_request(
@@ -634,13 +688,25 @@ class RuntimeMetricsRegistry:
         latency_seconds: float,
         *,
         is_transport_error: bool = False,
+        size_bytes: int = 0,
+        ttfb_seconds: float | None = None,
     ) -> None:
         sl = self._proxy_slice(proxy_id, masked_url)
         sl.raw_http_total += 1
-        sl.http_latency.observe(latency_seconds)
         if is_transport_error or status_code is None:
-            sl.transport_errors += 1
+            sl.transport_errors += 1  # no answer, so no latency: a zero would pull the channel's p50 down
             return
+        sl.http_latency.observe(latency_seconds)
+        sl.http_s += max(0.0, latency_seconds)
+        size_kb = max(0, int(size_bytes or 0)) / 1024.0
+        sl.kb += size_kb
+        if status_code == 200:
+            sl.pages += 1
+            sl.page_kb += size_kb
+            sl.page_latency.observe(latency_seconds)
+            if ttfb_seconds is not None and 0 < ttfb_seconds <= latency_seconds + 1.0:
+                sl.ttfb_s += ttfb_seconds
+                sl.ttfb_n += 1
         if 200 <= status_code < 400:
             sl.raw_http_2xx_3xx += 1
         elif status_code == 403:
@@ -692,6 +758,35 @@ class RuntimeMetricsRegistry:
                 b.scans_with_new_items += 1
         else:
             b.scans_failed += 1
+
+    def record_channel_use(self, proxy_id: str, masked_url: str, *, wait_seconds: float, busy_seconds: float) -> None:
+        """One fetch through a channel: how long it queued behind another scan, then how long it held the channel."""
+        sl = self._proxy_slice(proxy_id, masked_url)
+        sl.fetches += 1
+        sl.busy_s += max(0.0, busy_seconds)
+        sl.wait_s += max(0.0, wait_seconds)
+        sl.waited += int(wait_seconds >= CHANNEL_WAIT_NOTICE)
+
+    def record_pacing(self, proxy_id: str, masked_url: str, seconds: float) -> None:
+        """A request waited for the channel's token bucket."""
+        if seconds > 0:
+            self._proxy_slice(proxy_id, masked_url).pace_s += seconds
+
+    def record_transport_time(self, proxy_id: str, masked_url: str, seconds: float) -> None:
+        """Time lost on a request that broke (timeout, reset); its error is counted by record_http_request."""
+        if seconds > 0:
+            self._proxy_slice(proxy_id, masked_url).terr_s += seconds
+
+    def sample_workers(self, *, total: int, busy: int, queued: int, oldest_due: float) -> None:
+        """Once a second from the dispatch loop: scan workers in use and due links waiting for one."""
+        b = self._bucket()
+        b.worker_samples += 1
+        b.workers_sum += max(0, int(total))
+        b.workers_busy_sum += max(0, int(busy))
+        b.workers_busy_max = max(b.workers_busy_max, int(busy))
+        b.queue_sum += max(0, int(queued))
+        b.queue_max = max(b.queue_max, int(queued))
+        b.queue_oldest_max = max(b.queue_oldest_max, float(oldest_due or 0.0))
 
     def record_source_interval(self, interval_seconds: float) -> None:
         if interval_seconds > 0:
@@ -823,7 +918,14 @@ class RuntimeMetricsRegistry:
         proxy_id: str = "direct",
         masked_url: str = "direct",
         failure_kind: str | None = None,
+        channels_tried: int = 0,
     ) -> None:
+        bucket = self._bucket()
+        duration = max(0.0, float(elapsed_ms) / 1000.0)
+        bucket.scan_any.observe(duration)
+        bucket.scan_busy_s += duration
+        if channels_tried > 0:
+            bucket.scan_tries[int(channels_tried)] = bucket.scan_tries.get(int(channels_tried), 0) + 1
         if revisit_seconds is not None and revisit_seconds > 0:
             self.record_source_interval(revisit_seconds)
         if due_lag_seconds is not None:
@@ -948,7 +1050,7 @@ class RuntimeMetricsRegistry:
             for kind, count in sl.failures.items():
                 failures[kind] = failures.get(kind, 0) + count
             meta = self._proxy_meta.get(proxy_id) or {}
-            channels[short_channel(proxy_id, meta.get("masked_url"))] = {
+            entry = channels[short_channel(proxy_id, meta.get("masked_url"))] = {
                 "http": sl.raw_http_total,
                 "ok": sl.raw_http_2xx_3xx,
                 "403": sl.raw_http_403,
@@ -962,6 +1064,15 @@ class RuntimeMetricsRegistry:
                 "state": meta.get("state", "healthy"),
                 "rate": meta.get("effective_rate"),
             }
+            # Load fields only when non-zero: twenty channels a minute must not bloat metrics.jsonl.
+            extra = {
+                "fetch": sl.fetches, "busy_s": round(sl.busy_s, 1), "wait_s": round(sl.wait_s, 1), "waited": sl.waited,
+                "pace_s": round(sl.pace_s, 1), "http_s": round(sl.http_s, 1), "terr_s": round(sl.terr_s, 1),
+                "kb": round(sl.kb), "pages": sl.pages, "page_kb": round(sl.page_kb),
+                "ttfb_ms": round(1000 * sl.ttfb_s / sl.ttfb_n) if sl.ttfb_n else 0,
+                "lat_h": sparse_histogram(sl.page_latency),
+            }
+            entry.update({key: value for key, value in extra.items() if value})
         pub_seen = summarize_histograms(b.pub_to_seen.values(), PUB_DELAY_BOUNDS)
         pub_sent = summarize_histograms([b.pub_to_sent], PUB_DELAY_BOUNDS)
         due_lag = summarize_histograms([b.scan_due_lag], SCAN_INTERVAL_BOUNDS)
@@ -1006,6 +1117,26 @@ class RuntimeMetricsRegistry:
             },
             "loop_max_ms": _ms(b.loop_lag_max),
             "stalls": b.loop_stalls,
+            "load": self._load_fields(b),
+        }
+
+    def _load_fields(self, b: MinuteBucket) -> dict[str, Any]:
+        """Plan against fact for the load report: scans the planner wants, how long scans took and waited,
+        how busy the scan workers were. Histograms are sparse so minutes merge exactly."""
+        samples = max(1, b.worker_samples)
+        return {
+            "plan_sps": round(self._planned_scan_rate or 0.0, 3),
+            "scan_busy_s": round(b.scan_busy_s, 1),
+            "scan_h": sparse_histogram(b.scan_any),
+            "due_h": sparse_histogram(b.scan_due_lag),
+            "revisit_h": sparse_histogram(b.source_interval),
+            "tries": {str(tries): count for tries, count in sorted(b.scan_tries.items())},
+            "workers": round(b.workers_sum / samples, 1),
+            "busy": round(b.workers_busy_sum / samples, 2),
+            "busy_max": b.workers_busy_max,
+            "queue": round(b.queue_sum / samples, 2),
+            "queue_max": b.queue_max,
+            "oldest_s": round(b.queue_oldest_max, 1),
         }
 
     def set_planned_scan_rate(self, scans_per_second: float | None) -> None:
@@ -1074,8 +1205,19 @@ class RuntimeMetricsRegistry:
                     failures_60[kind] = failures_60.get(kind, 0) + count
 
             lat_summary = summarize_histograms([s.http_latency for s in slices_60], HTTP_LATENCY_BOUNDS)
+            # What the channel really gives: it serves `lanes` requests at a time, each takes its service time
+            # (answers, broken requests, anti-bot; not rate-limit waits), and never more than its rate limit.
+            work_10 = sum(s.busy_s - s.pace_s for s in slices_10)
+            lanes = int(meta.get("lanes") or 1)
+            service_time = work_10 / raw_10 if raw_10 >= THROUGHPUT_MIN_REQUESTS and work_10 > 0 else None
+            throughput = (
+                round(min(float(meta["effective_rate"]), lanes / service_time), 4) if service_time else None
+            )
 
             results.append({
+                "lanes": lanes,
+                "service_time_seconds": round(service_time, 3) if service_time else None,
+                "throughput_rps": throughput,
                 "proxy_id": proxy_id,
                 "masked_url": meta["masked_url"],
                 "state": meta["state"],
@@ -1154,6 +1296,7 @@ class RuntimeMetricsRegistry:
                         quarantined_until=float(ps.get("quarantined_until") or 0.0),
                         quarantine_reason=str(ps.get("quarantine_reason") or ""),
                         quarantine_remaining=float(ps.get("quarantine_remaining") or 0.0),
+                        lanes=int(ps.get("lanes") or 1),
                     )
         buckets = self._active_buckets(window_minutes)
         cost_summary = summarize_histograms([b.http_cost_per_scan for b in buckets], HTTP_COST_BOUNDS)
@@ -1350,13 +1493,16 @@ class RuntimeMetricsRegistry:
         need = float(cap["required_rate_at_max"] or 0.0)
         have = float(cap["available_rate_now"] or 0.0)
         cap_bad = not is_direct_only and need > 0 and have < need * CRITICAL_CAPACITY_SHARE
+        typical = float(cap.get("typical_channel_rps") or 0.0)
+        more = math.ceil(max(0.0, need * 1.2 - have) / typical) if typical > 0 else 0
         _process_rule(
             "capacity_deficit",
             cap_bad,
             CRITICAL_CAPACITY_MINUTES,
             cap["unique_sources"] > 0 or total_p > 0,
             f"🚨 Сети не хватает уже {CRITICAL_CAPACITY_MINUTES} мин: каналы дают {have:.2f} запр/с из нужных {need:.2f}.\n"
-            "Ссылки проверяются заметно реже, лоты опаздывают. Добавьте прокси: Админ-панель → Сеть и прокси.",
+            "Ссылки проверяются заметно реже, лоты опаздывают. Добавьте прокси: Админ-панель → Сеть и прокси."
+            + (f"\nНужно ещё примерно {more} хороших прокси (один даёт ~{typical:.2f} запр/с)." if more else ""),
             "✅ Мощности сети снова хватает.",
         )
 

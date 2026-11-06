@@ -2163,6 +2163,9 @@ async def cmd_admin_logs_menu(event):
         "Его достаточно прислать разработчику.\n"
         "<b>Готовность к продаже</b> — вердикт за сутки: скорость, надёжность, прокси, ссылки. "
         f"За другой срок: /ready 168 (часы, до {READY_MAX_HOURS}).\n"
+        "<b>Нагрузка</b> — успевает ли бот по плану, где узкое место, сколько ссылок тянут каналы. "
+        "За другой срок: /load 120 (минуты).\n"
+        "<b>/jsonprobe</b> — разовая проверка: отдаёт ли Авито те же лоты лёгким JSON вместо страницы и не банит ли.\n"
         "<b>Сканы радаров</b> — как часто проверяется каждый радар и кто задержал лот: Авито или бот.\n"
         "<b>Почему не пришёл лот</b> — пришлите ссылку на объявление: видел ли его бот и что решил.\n"
         "<b>Подробно на 10 мин</b> — в events.jsonl пишутся все шаги сканов.\n\n"
@@ -2178,6 +2181,7 @@ async def cmd_admin_logs_menu(event):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [ui.btn("Отчёт для отладки", "stats", callback_data="admin_log_get:report", style="primary")],
         [ui.btn("Готовность к продаже", "ok", callback_data="admin_log_get:ready", style="success")],
+        [ui.btn("Нагрузка за час", "net", callback_data="admin_log_get:load")],
         [ui.btn("Сканы радаров", "radar", callback_data="admin_scans_pick:0")],
         [ui.btn("Почему не пришёл лот", "scope", callback_data="admin_lot_prompt")],
         [ui.btn("Выключить подробный режим" if debug_left > 0 else "Подробно на 10 мин", "scope",
@@ -2291,6 +2295,69 @@ async def _send_readiness_report(message: Message, hours: int) -> None:
     )
 
 
+LOAD_MAX_MINUTES = 1440
+
+
+async def _send_load_report(message: Message, minutes: int) -> None:
+    from datetime import datetime
+    from aiogram.types import BufferedInputFile
+    import log_report
+
+    report = await _report_text(("--load", str(minutes)), log_report.build_load, minutes)
+    name = f"avito_load_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+    await message.answer_document(
+        BufferedInputFile(report.encode("utf-8"), filename=name),
+        caption=f"{ui.e('net')} Нагрузка за {minutes} мин.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("jsonprobe"))
+async def cmd_admin_jsonprobe(message: Message):
+    """One-off: does a JSON answer give the same lots as the search page, and does Avito block it.
+    /jsonprobe [search link] [JSON address from the browser]; without a link it takes the admin's first radar."""
+    from datetime import datetime
+    from aiogram.types import BufferedInputFile
+    import json_probe
+
+    if not config.is_admin(message.from_user.id):
+        return
+    links = [part for part in (message.text or "").split()[1:] if "avito.ru" in part]
+    search, user_url = (links + [None, None])[:2]
+    if search is None:
+        radars = [r for r in await database.get_user_searches(message.from_user.id) if r.get("is_active")]
+        search = radars[0]["url"] if radars else None
+    if search is None:
+        await message.answer("Пришлите: /jsonprobe ссылка_поиска [адрес JSON из браузера]")
+        return
+    try:
+        search_url = json_probe.AvitoParser.normalize_url(search)
+    except ValueError:
+        await message.answer("Это не ссылка поиска Авито.")
+        return
+    await message.answer(f"{ui.e('wait')} Проверяю JSON через сервер и 3 лучших прокси, это до двух минут…")
+    try:
+        report = await json_probe.run_probe(search_url, user_url)
+    except asyncio.TimeoutError:
+        await message.answer("Проверка не уложилась в 2,5 минуты: каналы не ответили.")
+        return
+    await message.answer_document(
+        BufferedInputFile(report.encode("utf-8"), filename=f"avito_json_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"),
+        caption=f"{ui.e('net')} Проверка JSON. Пришлите файл разработчику.",
+        parse_mode="HTML",
+    )
+    await database.log_admin_action(message.from_user.id, None, "jsonprobe", search_url[:200])
+
+
+@router.message(Command("load"))
+async def cmd_admin_load(message: Message):
+    if not config.is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    minutes = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 60
+    await _send_load_report(message, max(1, min(minutes, LOAD_MAX_MINUTES)))
+
+
 @router.message(Command("ready"))
 async def cmd_admin_ready(message: Message):
     if not config.is_admin(message.from_user.id):
@@ -2333,6 +2400,9 @@ async def cb_admin_log_get(call: CallbackQuery):
         return
     if target == "ready":
         await _send_readiness_report(call.message, 24)
+        return
+    if target == "load":
+        await _send_load_report(call.message, 60)
         return
 
     import io
@@ -2825,6 +2895,9 @@ async def _render_net(note: str = "") -> tuple[str, InlineKeyboardMarkup]:
     mode = config.NET_MODE
     snaps = pool.snapshots()
     working = [s for s in snaps if s.get("state") in ("healthy", "degraded", "half_open")]
+    from monitoring import MONITORING_STATS
+
+    real_rps = (MONITORING_STATS.get("capacity") or {}).get("available_rps")
     lines = [
         "🌐 <b>Сеть и прокси</b>",
         "",
@@ -2833,7 +2906,8 @@ async def _render_net(note: str = "") -> tuple[str, InlineKeyboardMarkup]:
         *_smart_lines(pool),
         "",
         f"<b>Каналы сканирования</b> · работают {len(working)} из {len(snaps)}, "
-        f"суммарно <code>{sum(float(s.get('effective_rate') or 0) for s in working):.2f}</code> req/s:",
+        f"лимит <code>{sum(float(s.get('effective_rate') or 0) for s in working):.2f}</code> req/s"
+        + (f", реально успевают <code>{float(real_rps):.2f}</code>" if real_rps else "") + ":",
     ]
     lines += [_channel_label(snap) for snap in snaps[:NET_CHANNELS_SHOWN]] or ["⏸ нет активных каналов — сканирование стоит"]
     if len(snaps) > NET_CHANNELS_SHOWN:
@@ -2856,6 +2930,8 @@ async def _render_net(note: str = "") -> tuple[str, InlineKeyboardMarkup]:
         mode_buttons[:2],
         mode_buttons[2:],
         [InlineKeyboardButton(text="🧪 Проверить каналы", callback_data="admin_net_probe")],
+        [InlineKeyboardButton(text=f"⚡ Запросов на прокси одновременно: {config.PROXY_MAX_IN_FLIGHT}",
+                              callback_data="admin_net_lanes")],
         add_row,
         [
             InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_net"),
@@ -2863,6 +2939,51 @@ async def _render_net(note: str = "") -> tuple[str, InlineKeyboardMarkup]:
         ],
     ]
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+LANES_HINT = (
+    "Страница через прокси грузится 2–3 с, поэтому при 1 запросе за раз прокси даёт ~0,35 запр/с. "
+    "При 2 — почти вдвое больше с тех же IP. Лимит частоты и защита от 403 работают на IP как раньше. "
+    "Если 403 заметно вырастут (отчёт «Нагрузка»), верните 1. Сервер всегда делает 1 запрос за раз."
+)
+
+
+@router.callback_query(F.data == "admin_net_lanes")
+async def cb_admin_net_lanes(call: CallbackQuery):
+    """Asks before switching the requests per proxy (lanes): it changes how hard every proxy IP is used."""
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    target = 1 if config.PROXY_MAX_IN_FLIGHT >= 2 else 2
+    text = (
+        "⚡ <b>Сколько запросов одновременно на один прокси?</b>\n\n"
+        f"Сейчас: <b>{config.PROXY_MAX_IN_FLIGHT}</b>\nСтанет: <b>{target}</b>\n\n<i>{LANES_HINT}</i>"
+    )
+    await _show(call, text, InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Да, {target}", callback_data=f"admin_net_lanes_yes:{target}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_net")],
+    ]))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_net_lanes_yes:"))
+async def cb_admin_net_lanes_yes(call: CallbackQuery):
+    from proxy_pool import get_proxy_pool
+
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    value = call.data.split(":", 1)[1]
+    if value not in ("1", "2"):
+        await call.answer("Можно 1 или 2", show_alert=True)
+        return
+    config.PROXY_MAX_IN_FLIGHT = int(value)
+    await database.set_bot_setting("proxy_lanes", value)
+    get_proxy_pool().set_lanes(int(value))
+    await database.log_admin_action(call.from_user.id, None, "proxy_lanes", value)
+    await call.answer(f"Запросов на прокси одновременно: {value}")
+    text, kb = await _render_net()
+    await _show(call, text, kb)
 
 
 def _smart_lines(pool) -> list[str]:
