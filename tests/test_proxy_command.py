@@ -223,7 +223,7 @@ class TestNetworkScreen(ProxyEnvMixin, DispatcherFixture, unittest.IsolatedAsync
                "fail": Counter({"timeout": 6}), "minutes": 60, "paused": 5}
         with patch("log_report.channel_history", return_value=day) as history:
             await self.dispatch_callback(f"admin_net_stat:{proxy_id}:0", config.ADMIN_ID)
-        history.assert_called_once_with("10.1.2.3:8080")
+        history.assert_called_once_with("10.1.2.3:8080", 24, 0.0)  # 24 h, no «start over» mark
         text = self.methods("EditMessageText")[-1].text
         self.assertIn("10.1.2.3:8080", text)
         self.assertIn("Роль: в запасе", text, "smart mode keeps a proxy in reserve while the server copes")
