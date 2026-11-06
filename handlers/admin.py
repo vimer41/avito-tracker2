@@ -2399,7 +2399,7 @@ async def cmd_admin_jsonprobe(message: Message):
     except ValueError:
         await message.answer("Это не ссылка поиска Авито.")
         return
-    await message.answer(f"{ui.e('wait')} Проверяю JSON через сервер и 3 лучших прокси, это до двух минут…")
+    await message.answer(f"{ui.e('wait')} Проверяю JSON через сервер и до 5 лучших прокси, это до двух минут…")
     try:
         report = await json_probe.run_probe(search_url, user_url)
     except asyncio.TimeoutError:

@@ -32,7 +32,7 @@ from parser import AvitoParser, _default_headers, _response_size, _response_ttfb
 from runtime_metrics import short_channel
 
 PROBE_LANE = 9  # a session of its own on every channel: the probe never shares one with a running scan
-PROBE_CHANNELS = 4
+PROBE_CHANNELS = 6
 PROBE_TIMEOUT_S = 150.0
 PAGE_DEADLINE_S = 25.0
 RATE_WAIT_S = 15.0
@@ -46,6 +46,7 @@ ROUTE_ID_RE = re.compile(r'"(?:id|routeId)"\s*:\s*"(routes/[^"\\]{1,120})"')
 API_PATH_RE = re.compile(r'"(/(?:web|api|js)/\d+/[A-Za-z0-9_\-/]{2,80})"')
 LOCATION_RE = re.compile(r'"locationId"\s*:\s*(\d{3,9})')
 CATEGORY_RE = re.compile(r'"categoryId"\s*:\s*(\d{1,6})')
+LOT_LOCATION_RE = re.compile(r'"locationId"\s*:\s*(\d{3,9})|"location"\s*:\s*\{\s*"id"\s*:\s*(\d{3,9})')
 # The mobile site's public client key, as published in open Avito parsers; the probe shows whether it still works.
 MOBILE_API_KEY = "af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir"
 ITEM_FIELDS = {
@@ -99,16 +100,30 @@ class Probe:
 
 # ── What the page itself tells ─────────────────────────────────────────────
 
-def page_hints(html: str) -> dict:
+def lot_location(html: str, page_ids: Iterable[str]) -> tuple[Optional[str], int]:
+    """The city of the page's own lots: the locationId written next to each lot. The page as a whole names other
+    places too (Moscow 637640 led the votes on a Kostroma page, so the API was asked about Moscow)."""
+    votes: Counter = Counter()
+    for lot in page_ids:
+        match = re.search(r'"id"\s*:\s*"?%s"?' % re.escape(str(lot)), html)
+        found = LOT_LOCATION_RE.search(html, match.end(), match.end() + 3000) if match else None
+        if found:
+            votes[found.group(1) or found.group(2)] += 1
+    return votes.most_common(1)[0] if votes else (None, 0)
+
+
+def page_hints(html: str, page_ids: Iterable[str] = ()) -> dict:
     routes = list(dict.fromkeys(ROUTE_ID_RE.findall(html)))
     api_paths = sorted({path for path in API_PATH_RE.findall(html) if not path.startswith(("/web/1/u", "/web/2/ft"))})
     locations = Counter(LOCATION_RE.findall(html))
     categories = Counter(CATEGORY_RE.findall(html))
+    by_lots, lot_votes = lot_location(html, page_ids)
     return {
         "routes": routes[:12],
         "api_paths": api_paths[:20],
-        "location_id": locations.most_common(1)[0][0] if locations else None,
-        "location_votes": locations.most_common(1)[0][1] if locations else 0,
+        "location_id": by_lots or (locations.most_common(1)[0][0] if locations else None),
+        "location_votes": lot_votes if by_lots else (locations.most_common(1)[0][1] if locations else 0),
+        "location_source": "по лотам" if by_lots else "по всей странице, город может быть не тот",
         "category_id": categories.most_common(1)[0][0] if categories else None,
         "react_router": "__reactRouterContext" in html,
         "remix": "__remixContext" in html,
@@ -269,54 +284,92 @@ async def _raw(client, session, channel: str, name: str, url: str, headers: dict
     return result
 
 
-async def probe_channel(client, search_url: str, user_url: Optional[str]) -> tuple[list[Probe], Optional[dict]]:
-    """The page as a scan gets it, then the same page raw and the JSON candidates, all in one session."""
+@dataclass
+class PageResult:
+    client: Any
+    channel: str
+    parser: Any
+    probe: Probe
+    html: Optional[str] = None
+    page_ids: list = field(default_factory=list)
+    canonical: str = ""
+
+
+async def load_page(client, search_url: str) -> PageResult:
+    """Phase 1: the search page as a scan gets it (anti-bot and redirects included)."""
     channel = short_channel(client.proxy_id, client.masked_url)
     parser = AvitoParser(proxy_client=client, lane=PROBE_LANE)
-    results: list[Probe] = []
-    hints: Optional[dict] = None
+    started = time.monotonic()
+    page = Probe(channel, "страница, как в скане")
+    result = PageResult(client, channel, parser, page)
     try:
-        started = time.monotonic()
         html = await parser.fetch_page_async(search_url, deadline=time.monotonic() + PAGE_DEADLINE_S)
-        page = Probe(channel, "страница, как в скане", ms=int((time.monotonic() - started) * 1000))
-        results.append(page)
-        if html is None:
-            failure = parser.last_failure
-            page.error = failure.kind if failure else "unknown"
-            page.blocked = bool(failure and failure.kind in ("forbidden", "rate_limit", "challenge", "cooldown"))
-            return results, None
-        lots = AvitoParser.parse_catalog(html) or []
-        page_ids = [lot.item_id for lot in lots if not lot.is_promotion][:COMPARE_LOTS]
-        page.status, page.items, page.matched, page.of = 200, len(lots), len(page_ids), len(page_ids)
-        page.body_kb = round(len(html.encode("utf-8", "replace")) / 1024, 1)
-        stamps = [stamp for lot in lots if (stamp := _epoch(lot.timestamp)) is not None]
-        page.newest_age_s = int(time.time() - max(stamps)) if stamps else None
-        hints = page_hints(html)
-        session = client.lane_sessions().get(PROBE_LANE)
+    except Exception as exc:  # a probe reports, it never raises
+        page.ms, page.error = int((time.monotonic() - started) * 1000), f"{type(exc).__name__}: {exc}"[:120]
+        return result
+    page.ms = int((time.monotonic() - started) * 1000)
+    if html is None:
+        failure = parser.last_failure
+        page.error = failure.kind if failure else "unknown"
+        page.blocked = bool(failure and failure.kind in ("forbidden", "rate_limit", "challenge", "cooldown"))
+        return result
+    lots = AvitoParser.parse_catalog(html) or []
+    result.page_ids = [lot.item_id for lot in lots if not lot.is_promotion][:COMPARE_LOTS]
+    page.status, page.items, page.matched, page.of = 200, len(lots), len(result.page_ids), len(result.page_ids)
+    page.body_kb = round(len(html.encode("utf-8", "replace")) / 1024, 1)
+    stamps = [stamp for lot in lots if (stamp := _epoch(lot.timestamp)) is not None]
+    page.newest_age_s = int(time.time() - max(stamps)) if stamps else None
+    result.html, result.canonical = html, parser._canonical_cache.get(search_url, search_url)
+    return result
+
+
+def _fresh_session(client):
+    """A session for a channel whose page failed: its JSON answers are still worth seeing."""
+    from curl_cffi import requests as curl_requests
+    from anti_bot.manager import BROWSER_PROFILE
+    from parser import PAGE_CURL_INFOS
+
+    proxies = {"http": client.proxy_url, "https": client.proxy_url} if client.proxy_url else None
+    return curl_requests.AsyncSession(impersonate=BROWSER_PROFILE, headers=_default_headers(), proxies=proxies,
+                                      max_clients=1, curl_infos=PAGE_CURL_INFOS)
+
+
+async def probe_json(page: PageResult, reference: PageResult, found: list[Candidate], stems: list[str]) -> list[Probe]:
+    """Phase 2 on one channel: the page once more raw (only where it loaded) and every JSON candidate,
+    compared with the reference page, even on a channel whose own page was blocked."""
+    client, results = page.client, [page.probe]
+    lane_sessions = getattr(client, "lane_sessions", None)
+    session = lane_sessions().get(PROBE_LANE) if callable(lane_sessions) else None
+    own = None
+    try:
         if session is None:
-            page.error = "сессия канала закрыта"
-            return results, hints
-        canonical = parser._canonical_cache.get(search_url, search_url)
-        page_headers = dict(_default_headers(), Referer=canonical)
-        results.append(await _raw(client, session, channel, "страница, замер", canonical, page_headers, page_ids))
-        stems = query_stems(search_url)
-        for candidate in candidates(canonical, hints, user_url):
+            own = session = _fresh_session(client)
+        if page.html is not None:
+            headers = dict(_default_headers(), Referer=reference.canonical)
+            results.append(await _raw(client, session, page.channel, "страница, замер", page.canonical, headers, page.page_ids))
+        for candidate in found:
             results.append(await _raw(
-                client, session, channel, candidate.name, candidate.url, _json_headers(candidate.url, canonical), page_ids,
-                stems,
+                client, session, page.channel, candidate.name, candidate.url,
+                _json_headers(candidate.url, reference.canonical), reference.page_ids, stems,
             ))
-        return results, hints
+        return results
     finally:
+        if own is not None:
+            try:
+                await own.close()
+            except Exception:
+                pass
         await client.reset_async_session(PROBE_LANE)
         try:
-            parser.close()
+            page.parser.close()
         except Exception:
             pass
 
 
 def pick_channels(pool, count: int = PROBE_CHANNELS) -> list:
-    """The server and the proxies with the best record: a bad proxy would only show its own ban."""
-    usable = [c for c in pool.clients if not getattr(c, "_draining", False) and c.is_available_for_scan()]
+    """The server and the proxies with the best record that are not resting after a block. A channel busy with
+    a scan still counts: the probe has a session of its own."""
+    usable = [c for c in pool.clients if not getattr(c, "_draining", False) and c.state != "quarantined"]
     direct = [c for c in usable if c.is_direct]
     proxies = sorted((c for c in usable if not c.is_direct), key=lambda c: -c.long_health())
     return (direct[:1] + proxies)[:count]
@@ -330,20 +383,28 @@ async def run_probe(search_url: str, user_url: Optional[str] = None, pool=None) 
     channels = pick_channels(pool)
     if not channels:
         return build_report(search_url, user_url, [], None)
-    outcomes = await asyncio.wait_for(
-        asyncio.gather(*(probe_channel(client, search_url, user_url) for client in channels), return_exceptions=True),
-        PROBE_TIMEOUT_S,
-    )
-    per_channel: list[list[Probe]] = []
-    hints = None
-    for client, outcome in zip(channels, outcomes):
-        if isinstance(outcome, BaseException):
-            per_channel.append([Probe(short_channel(client.proxy_id, client.masked_url), "страница, как в скане",
-                                      error=f"{type(outcome).__name__}: {outcome}"[:120])])
-            continue
-        probes, found = outcome
-        per_channel.append(probes)
-        hints = hints or found
+
+    async def both_phases() -> tuple[list[list[Probe]], Optional[dict]]:
+        pages = await asyncio.gather(*(load_page(client, search_url) for client in channels))
+        reference = next((page for page in pages if page.html is not None), None)
+        if reference is None:
+            for page in pages:
+                await page.client.reset_async_session(PROBE_LANE)
+                page.parser.close()
+            return [[page.probe] for page in pages], None
+        hints = page_hints(reference.html, reference.page_ids)
+        found = candidates(reference.canonical, hints, user_url)
+        stems = query_stems(search_url)
+        outcomes = await asyncio.gather(*(probe_json(page, reference, found, stems) for page in pages),
+                                        return_exceptions=True)
+        per_channel = [
+            [page.probe, Probe(page.channel, "проверка JSON", error=f"{type(outcome).__name__}: {outcome}"[:120])]
+            if isinstance(outcome, BaseException) else outcome
+            for page, outcome in zip(pages, outcomes)
+        ]
+        return per_channel, hints
+
+    per_channel, hints = await asyncio.wait_for(both_phases(), PROBE_TIMEOUT_S)
     return build_report(search_url, user_url, per_channel, hints)
 
 
@@ -418,7 +479,7 @@ def build_report(search_url: str, user_url: Optional[str], per_channel: list[lis
         lines += [
             f"маршруты данных: {', '.join(hints['routes']) or 'нет'}",
             f"пути API: {', '.join(hints['api_paths']) or 'нет'}",
-            f"город лотов (locationId): {hints['location_id'] or 'нет'} ({hints['location_votes']} упоминаний)",
+            f"город (locationId): {hints['location_id'] or 'нет'}, {hints.get('location_source', '')} ({hints['location_votes']})",
             f"Remix: {'да' if hints['remix'] else 'нет'} · React Router: {'да' if hints['react_router'] else 'нет'}",
         ]
     else:

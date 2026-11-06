@@ -103,10 +103,32 @@ class TestJsonProbe(unittest.IsolatedAsyncioTestCase):
         self.assertIn('первый лот: {"id":4000000000', report)
         self.assertIn("- мобильный API /api/11/items: ❌ блок или капча", summary)
         self.assertIn("API со страницы /web/1/js/items/list: ⚠️ отвечает, но лоты другие (0 из 5)", summary)
-        self.assertIn("город лотов (locationId): 650400", report)
+        self.assertIn("город (locationId): 650400, по лотам (5)", report)
         self.assertIn("1.2.3.4:5500 · страница, как в скане · 200", report)
         self.assertTrue(all("avito.ru" in url for url in session.urls))
         self.assertEqual(client._lane_users, {}, "the probe takes no scan lane")
+
+    def test_the_city_comes_from_the_lots_not_from_the_rest_of_the_page(self):
+        noise = '<script>{"header": [' + ",".join(['{"locationId":637640}'] * 10) + "]}</script>"
+        html = noise + search_page()
+        self.assertEqual(json_probe.page_hints(html)["location_id"], "637640", "the page as a whole says Moscow")
+        hints = json_probe.page_hints(html, IDS)
+        self.assertEqual((hints["location_id"], hints["location_source"]), ("650400", "по лотам"))
+
+    async def test_json_is_probed_even_where_the_page_was_blocked(self):
+        blocked, good = proxy_pool.ProxyClient(PROXY_URL), proxy_pool.ProxyClient("http://user:pass@5.6.7.8:5500")
+        sessions = {blocked: FakeSession(), good: FakeSession()}
+        patches = [patch.object(json_probe.AvitoParser, "fetch_page_async", new=AsyncMock(side_effect=[None, search_page()]))]
+        for client in (blocked, good):
+            patches += [patch.object(client, "lane_sessions", return_value={json_probe.PROBE_LANE: sessions[client]}),
+                        patch.object(client, "wait_for_rate_slot", new=AsyncMock())]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        report = await json_probe.run_probe("https://www.avito.ru/kazan?q=lamp", pool=SimpleNamespace(clients=[blocked, good]))
+        self.assertIn("1.2.3.4:5500 · данные маршрута routes/search · 200", report)
+        self.assertNotIn("1.2.3.4:5500 · страница, замер", report, "no second page load where the page failed")
+        self.assertIn("5.6.7.8:5500 · страница, замер · 200", report)
 
     async def test_no_channels_says_so(self):
         report = await json_probe.run_probe("https://www.avito.ru/kazan?q=lamp", pool=SimpleNamespace(clients=[]))
