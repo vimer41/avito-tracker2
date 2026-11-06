@@ -2166,7 +2166,6 @@ async def cmd_admin_logs_menu(event):
         f"За другой срок: /ready 168 (часы, до {READY_MAX_HOURS}).\n"
         "<b>Нагрузка</b> — успевает ли бот по плану, где узкое место, сколько ссылок тянут каналы. "
         "За другой срок: /load 120 (минуты).\n"
-        "<b>/jsonprobe</b> — разовая проверка: отдаёт ли Авито те же лоты лёгким JSON вместо страницы и не банит ли.\n"
         "<b>Сканы радаров</b> — как часто проверяется каждый радар и кто задержал лот: Авито или бот.\n"
         "<b>Почему не пришёл лот</b> — пришлите ссылку на объявление: видел ли его бот и что решил.\n"
         "<b>Подробно на 10 мин</b> — в events.jsonl пишутся все шаги сканов.\n\n"
@@ -2374,46 +2373,6 @@ async def _send_load_report(message: Message, minutes: int) -> None:
         caption=f"{ui.e('net')} Нагрузка за {minutes} мин.",
         parse_mode="HTML",
     )
-
-
-@router.message(Command("jsonprobe"))
-async def cmd_admin_jsonprobe(message: Message):
-    """One-off: does a JSON answer give the same lots as the search page, and does Avito block it.
-    /jsonprobe [search link] [JSON address from the browser]; without a link it takes the admin's first radar."""
-    from datetime import datetime
-    from aiogram.types import BufferedInputFile
-    import json_probe
-
-    if not config.is_admin(message.from_user.id):
-        return
-    words = (message.text or "").split()[1:]
-    links = [part for part in words if "avito.ru" in part]
-    with_best = any(part.lower() in ("лучшие", "best") for part in words)
-    search, user_url = (links + [None, None])[:2]
-    if search is None:
-        radars = [r for r in await database.get_user_searches(message.from_user.id) if r.get("is_active")]
-        search = radars[0]["url"] if radars else None
-    if search is None:
-        await message.answer("Пришлите: /jsonprobe ссылка_поиска [адрес JSON из браузера] [лучшие]")
-        return
-    try:
-        search_url = json_probe.AvitoParser.normalize_url(search)
-    except ValueError:
-        await message.answer("Это не ссылка поиска Авито.")
-        return
-    channels = "сервер и лучшие прокси (могут попасть в бан)" if with_best else "сервер и до 3 прокси (3 лучших не трогаю: они сканируют; «лучшие» в конце команды — взять и их)"
-    await message.answer(f"{ui.e('wait')} Проверяю JSON: {channels}. Это до двух минут…")
-    try:
-        report = await json_probe.run_probe(search_url, user_url, spare=0 if with_best else None)
-    except asyncio.TimeoutError:
-        await message.answer("Проверка не уложилась в 2,5 минуты: каналы не ответили.")
-        return
-    await message.answer_document(
-        BufferedInputFile(report.encode("utf-8"), filename=f"avito_json_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"),
-        caption=f"{ui.e('net')} Проверка JSON. Пришлите файл разработчику.",
-        parse_mode="HTML",
-    )
-    await database.log_admin_action(message.from_user.id, None, "jsonprobe", search_url[:200])
 
 
 @router.message(Command("load"))
