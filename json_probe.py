@@ -46,6 +46,7 @@ ROUTE_ID_RE = re.compile(r'"(?:id|routeId)"\s*:\s*"(routes/[^"\\]{1,120})"')
 API_PATH_RE = re.compile(r'"(/(?:web|api|js)/\d+/[A-Za-z0-9_\-/]{2,80})"')
 LOCATION_RE = re.compile(r'"locationId"\s*:\s*(\d{3,9})')
 CATEGORY_RE = re.compile(r'"categoryId"\s*:\s*(\d{1,6})')
+CITY_ID_RE = re.compile(r'"id"\s*:\s*(\d{4,9})(?!\d)')
 LOT_LOCATION_RE = re.compile(r'"locationId"\s*:\s*(\d{3,9})|"location"\s*:\s*\{\s*"id"\s*:\s*(\d{3,9})')
 # The mobile site's public client key, as published in open Avito parsers; the probe shows whether it still works.
 MOBILE_API_KEY = "af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir"
@@ -60,6 +61,7 @@ ITEM_FIELDS = {
     "реклама": ("isPromotion", "vas", "isVip", "isHighlighted"),
 }
 TIME_KEYS = ("sortTimeStamp", "time", "timestamp")
+LOT_DUMP_SKIP = ("images", "galleryItems", "analyticParams", "imageAlt", "imagesCount")
 
 
 @dataclass
@@ -87,6 +89,8 @@ class Probe:
     item_keys: list = field(default_factory=list)
     newest_age_s: Optional[int] = None
     title_hits: int = 0  # lots whose title has a word of the query: is the query applied at all
+    organic: int = 0  # page lots without promotion
+    last_stamp: Optional[int] = None  # the API's «lots newer than» marker (result.lastStamp)
     result_keys: list = field(default_factory=list)
     time_paths: list = field(default_factory=list)
     first_item: str = ""
@@ -112,18 +116,42 @@ def lot_location(html: str, page_ids: Iterable[str]) -> tuple[Optional[str], int
     return votes.most_common(1)[0] if votes else (None, 0)
 
 
-def page_hints(html: str, page_ids: Iterable[str] = ()) -> dict:
+def city_location(html: str, search_url: str) -> tuple[Optional[str], int]:
+    """The id written next to the city's own address ("/yaroslavl") on the page: breadcrumbs and the location
+    picker carry it. Used when the page has no lots to ask (a rare query in a small city)."""
+    slug = urlsplit(search_url).path.strip("/").split("/")[0] if search_url else ""
+    if not slug:
+        return None, 0
+    votes: Counter = Counter()
+    for match in re.finditer(r'"/%s"' % re.escape(slug), html):
+        window = html[max(0, match.start() - 400): match.end() + 400]
+        ids = [(abs(found.start() - 400), found.group(1)) for found in CITY_ID_RE.finditer(window)]
+        if ids:
+            votes[min(ids)[1]] += 1
+    return votes.most_common(1)[0] if votes else (None, 0)
+
+
+def page_hints(html: str, page_ids: Iterable[str] = (), search_url: str = "") -> dict:
     routes = list(dict.fromkeys(ROUTE_ID_RE.findall(html)))
     api_paths = sorted({path for path in API_PATH_RE.findall(html) if not path.startswith(("/web/1/u", "/web/2/ft"))})
     locations = Counter(LOCATION_RE.findall(html))
     categories = Counter(CATEGORY_RE.findall(html))
     by_lots, lot_votes = lot_location(html, page_ids)
+    by_city, city_votes = (None, 0) if by_lots else city_location(html, search_url)
+    if by_lots:
+        location, votes, source = by_lots, lot_votes, "по лотам"
+    elif by_city:
+        location, votes, source = by_city, city_votes, f"по адресу города /{urlsplit(search_url).path.strip('/').split('/')[0]}"
+    else:
+        location = locations.most_common(1)[0][0] if locations else None
+        votes = locations.most_common(1)[0][1] if locations else 0
+        source = "по всей странице, город может быть не тот"
     return {
         "routes": routes[:12],
         "api_paths": api_paths[:20],
-        "location_id": by_lots or (locations.most_common(1)[0][0] if locations else None),
-        "location_votes": lot_votes if by_lots else (locations.most_common(1)[0][1] if locations else 0),
-        "location_source": "по лотам" if by_lots else "по всей странице, город может быть не тот",
+        "location_id": location,
+        "location_votes": votes,
+        "location_source": source,
         "category_id": categories.most_common(1)[0][0] if categories else None,
         "react_router": "__reactRouterContext" in html,
         "remix": "__remixContext" in html,
@@ -156,8 +184,7 @@ def candidates(search_url: str, hints: dict, user_url: Optional[str], query_url:
         if hints.get("category_id"):
             with_category = dict(params, categoryId=hints["category_id"])
             found.append(Candidate("мобильный API 11 + категория", "https://m.avito.ru/api/11/items?" + urlencode(with_category)))
-        if query.get("q"):
-            found.append(Candidate("мобильный API /api/9/items", "https://m.avito.ru/api/9/items?" + urlencode(params)))
+        # /api/9/items answered 400 on every channel on 06.11: dropped.
     item_paths = [path for path in hints["api_paths"] if "item" in path or "search" in path]
     if item_paths:
         found.append(Candidate(f"API со страницы {item_paths[0]}", f"https://www.avito.ru{item_paths[0]}?{parts.query}"))
@@ -239,7 +266,9 @@ def describe_json(data: Any, stems: list[str]) -> dict:
         "title_hits": sum(1 for title in titles if stems and any(stem in title for stem in stems)),
         "result_keys": list(result)[:25] if isinstance(result, dict) else [],
         "time_paths": _time_paths(items[0]) if items else [],
-        "first_item": orjson.dumps(items[0]).decode("utf-8", "replace")[:700] if items else "",
+        "first_item": (orjson.dumps({k: v for k, v in items[0].items() if k not in LOT_DUMP_SKIP})
+                       .decode("utf-8", "replace")[:900] if items else ""),
+        "last_stamp": result.get("lastStamp") if isinstance(result, dict) and isinstance(result.get("lastStamp"), int) else None,
     }
 
 
@@ -296,6 +325,7 @@ async def _raw(client, session, channel: str, name: str, url: str, headers: dict
     result.items, result.fields, result.item_keys = described["items"], described["fields"], described["keys"]
     result.title_hits, result.result_keys = described["title_hits"], described["result_keys"]
     result.time_paths, result.first_item = described["time_paths"], described["first_item"]
+    result.last_stamp = described["last_stamp"]
     result.newest_age_s = int(time.time() - described["newest"]) if described["newest"] else None
     return result
 
@@ -330,8 +360,9 @@ async def load_page(client, search_url: str) -> PageResult:
         page.blocked = bool(failure and failure.kind in ("forbidden", "rate_limit", "challenge", "cooldown"))
         return result
     lots = AvitoParser.parse_catalog(html) or []
-    result.page_ids = [lot.item_id for lot in lots if not lot.is_promotion][:COMPARE_LOTS]
+    result.page_ids = [lot.item_id for lot in lots][:COMPARE_LOTS]
     page.status, page.items, page.matched, page.of = 200, len(lots), len(result.page_ids), len(result.page_ids)
+    page.organic = sum(1 for lot in lots if not lot.is_promotion)
     page.body_kb = round(len(html.encode("utf-8", "replace")) / 1024, 1)
     stamps = [stamp for lot in lots if (stamp := _epoch(lot.timestamp)) is not None]
     page.newest_age_s = int(time.time() - max(stamps)) if stamps else None
@@ -363,11 +394,18 @@ async def probe_json(page: PageResult, reference: PageResult, found: list[Candid
         if page.html is not None:
             headers = dict(_default_headers(), Referer=reference.canonical)
             results.append(await _raw(client, session, page.channel, "страница, замер", page.canonical, headers, page.page_ids))
+        stamp_checked = False
         for candidate in found:
-            results.append(await _raw(
-                client, session, page.channel, candidate.name, candidate.url,
-                _json_headers(candidate.url, reference.canonical), reference.page_ids, stems,
-            ))
+            headers = _json_headers(candidate.url, reference.canonical)
+            probe = await _raw(client, session, page.channel, candidate.name, candidate.url, headers, reference.page_ids, stems)
+            results.append(probe)
+            if not stamp_checked and candidate.name.startswith("мобильный API") and probe.answered and probe.last_stamp:
+                stamp_checked = True  # once per channel: with lastStamp the API may need no lot times at all
+                for label, stamp in (("новые за час", probe.last_stamp - 3600), ("новые после ответа", probe.last_stamp)):
+                    results.append(await _raw(
+                        client, session, page.channel, f"{candidate.name}: {label} (lastStamp)",
+                        _with_param(candidate.url, "lastStamp", str(stamp)), headers, reference.page_ids, stems,
+                    ))
         return results
     finally:
         if own is not None:
@@ -408,7 +446,7 @@ async def run_probe(search_url: str, user_url: Optional[str] = None, pool=None) 
                 await page.client.reset_async_session(PROBE_LANE)
                 page.parser.close()
             return [[page.probe] for page in pages], None
-        hints = page_hints(reference.html, reference.page_ids)
+        hints = page_hints(reference.html, reference.page_ids, reference.canonical or search_url)
         found = candidates(reference.canonical, hints, user_url, query_url=search_url)
         hints["candidates"] = [candidate.name for candidate in found]
         hints["no_candidates"] = "" if found else why_no_candidates(hints, search_url)
@@ -440,7 +478,9 @@ def _verdict(probes: list[Probe]) -> str:
         statuses = Counter(str(p.status) if p.status else (p.error.split(":")[0] or "нет ответа") for p in probes)
         return f"❌ не отдаёт ({', '.join(f'{key}×{count}' for key, count in statuses.most_common(3))})"
     best = max(answered, key=lambda p: p.matched)
-    share = best.matched / best.of if best.of else 0.0
+    if not best.of:
+        return "✅ отвечает; сравнить не с чем: на странице нет лотов"
+    share = best.matched / best.of
     if share < 0.5:
         return f"⚠️ отвечает, но лоты другие ({best.matched} из {best.of})"
     if len(answered) < len(probes):
@@ -479,7 +519,7 @@ def _row(p: Probe) -> str:
     return (
         f"{p.channel} · {p.name} · {p.status or '—'}{' блок' if p.blocked else ''} · {value(p.ms, ' мс')} · "
         f"{value(p.ttfb_ms, ' мс')} · {value(p.kb)} · {value(p.body_kb)} · {p.matched}/{p.of} · "
-        f"{'JSON, ' + str(p.items) + ' лотов' if p.json_ok else (f'{p.items} лотов, обычных {p.of}' if p.name == 'страница, как в скане' and p.status == 200 else (p.content_type or '—'))}"
+        f"{'JSON, ' + str(p.items) + ' лотов' if p.json_ok else (f'{p.items} лотов, обычных {p.organic}' if p.name == 'страница, как в скане' and p.status == 200 else (p.content_type or '—'))}"
         f"{' · свежий лот ' + str(p.newest_age_s // 60) + ' мин назад' if p.newest_age_s is not None else ''}"
         f"{' · ' + p.error if p.error else ''}"
     )

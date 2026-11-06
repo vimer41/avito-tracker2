@@ -45,6 +45,12 @@ class FakeSession:
             return answer(200, mobile_json(IDS))
         if ".data" in url:
             return answer(404, "not found", "text/plain")
+        if "m.avito.ru" in url and "lastStamp=" in url:
+            return answer(200, json.dumps({"status": "ok", "result": {"items": [], "lastStamp": 1793987000}}))
+        if "m.avito.ru" in url and "categoryId=" in url:
+            data = json.loads(mobile_json(IDS))
+            data["result"]["lastStamp"] = 1793987000
+            return answer(200, json.dumps(data))
         if "m.avito.ru" in url:
             return answer(403, "<div class='firewall-container'>доступ ограничен</div>", "text/html")
         if "/web/1/js/items" in url:
@@ -67,7 +73,7 @@ class TestJsonProbe(unittest.IsolatedAsyncioTestCase):
         self.assertIn("locationId=650400", mobile)
         self.assertIn("query=lamp", mobile)
         self.assertIn("categoryId=99", next(c.url for c in found if c.name == "мобильный API 11 + категория"))
-        self.assertTrue(any("/api/9/items" in c.url for c in found))
+        self.assertFalse(any("/api/9/items" in c.url for c in found), "API 9 answered 400 everywhere")
         self.assertLessEqual(len(found), json_probe.CANDIDATES_MAX)
 
     def test_query_words_and_time_fields_are_shown(self):
@@ -102,6 +108,14 @@ class TestJsonProbe(unittest.IsolatedAsyncioTestCase):
         self.assertIn("поля времени у лота: time=", report)
         self.assertIn('первый лот: {"id":4000000000', report)
         self.assertIn("- мобильный API /api/11/items: ❌ блок или капча", summary)
+        self.assertIn("- мобильный API 11 + категория: ✅ те же лоты (5 из 5) на всех каналах", summary)
+        self.assertIn("1.2.3.4:5500 · мобильный API 11 + категория: новые за час (lastStamp) · 200", report)
+        self.assertIn("мобильный API 11 + категория: новые после ответа (lastStamp) · 200", report)
+        self.assertIn("lastStamp=1793983400", " ".join(session.urls), "an hour before the answer's stamp")
+        self.assertIn('первый лот: {"id":4000000000', report)
+        first_lots = [line for line in report.splitlines() if line.startswith("первый лот:")]
+        self.assertTrue(first_lots)
+        self.assertFalse(any('"images"' in line for line in first_lots), "the lot is shown without photos")
         self.assertIn("API со страницы /web/1/js/items/list: ⚠️ отвечает, но лоты другие (0 из 5)", summary)
         self.assertIn("город (locationId): 650400, по лотам (5)", report)
         self.assertIn("варианты JSON: данные маршрута routes/search, мобильный API /api/11/items", report)
@@ -118,6 +132,12 @@ class TestJsonProbe(unittest.IsolatedAsyncioTestCase):
         without_words = json_probe.candidates("https://www.avito.ru/moskva/telefony?s=104", hints, None,
                                               query_url="https://www.avito.ru/moskva/telefony?s=104")
         self.assertEqual([c.name for c in without_words if "мобильный" in c.name], ["мобильный API 11 + категория"])
+
+    def test_without_lots_the_city_comes_from_its_own_address(self):
+        html = ('<script>{"header":[{"locationId":637640},{"locationId":637640}],'
+                '"crumbs":[{"id":622650,"name":"Ярославль","url":"/yaroslavl"}]}</script>')
+        hints = json_probe.page_hints(html, [], "https://www.avito.ru/yaroslavl/muzykalnye_instrumenty?q=x")
+        self.assertEqual((hints["location_id"], hints["location_source"]), ("622650", "по адресу города /yaroslavl"))
 
     def test_the_city_comes_from_the_lots_not_from_the_rest_of_the_page(self):
         noise = '<script>{"header": [' + ",".join(['{"locationId":637640}'] * 10) + "]}</script>"
