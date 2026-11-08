@@ -1523,6 +1523,78 @@ class RuntimeMetricsRegistry:
 
         return messages
 
+    def _human_verdict(self, snap, scans_all: int, scans_bad: int, buckets_10, quarantined) -> list[str]:
+        """The top of the monitoring screen in plain words: is it fine, how often links are checked, what the
+        failures cost, where the lot delay comes from and, when something is wrong, what to do."""
+        sched, cap, sla, pipe = snap["scheduler"], snap["capacity"], snap["delivery_sla"], snap["scan_pipeline"]
+        proxies, outbox = snap["proxies"], snap["outbox"]
+        if sched["unique_sources"] and scans_all == 0:
+            return ["🔴 <b>Не работает</b>: за час не было ни одного скана.",
+                    "Что сделать: «Сеть и прокси» → «Проверить каналы»; если все каналы красные — добавьте прокси."]
+        if scans_all == 0:
+            return ["⚪️ <b>Данных пока нет</b>: ссылок или сканов ещё не было."]
+
+        target = float(config.TARIFF_SCAN_INTERVAL.get("pro", 20))
+        interval = pipe["source_interval_seconds"]
+        mean = interval.get("mean") if interval.get("sample_count") else None
+        p95 = interval.get("p95") if interval.get("sample_count") else None
+        err = scans_bad / scans_all
+        req_10 = sum(p["raw_http_total_10m"] for p in proxies)
+        blocks_10 = sum(p["raw_http_403_429_10m"] for p in proxies)
+        block_share = blocks_10 / req_10 if req_10 else 0.0
+        deliver = sla["deliver_at_to_sent_seconds"]
+        slow_send = bool(deliver["sample_count"] and deliver["p95"] is not None
+                         and deliver["p95"] > float(config.DELIVERY_SLA_ALERT_SECONDS))
+        queue_grows = outbox["pending_depth"] > config.OUTBOX_ALERT_DEPTH
+        no_net = cap["available_rate_now"] <= 0
+
+        bad = err > 0.15 or (p95 is not None and p95 > target * 3) or no_net or queue_grows
+        slow = err > 0.05 or (p95 is not None and p95 > target * 1.5) or cap["deficit_now"] > 0 or slow_send
+        head = ("🔴 <b>Работает плохо</b>" if bad else
+                "🟡 <b>Работает, но с задержками</b>" if slow else "🟢 <b>Всё работает нормально</b>")
+        lines = [head]
+
+        if mean is not None:
+            line = f"Ссылки проверяются в среднем раз в {_dur(mean)}"
+            if p95 is not None and p95 > mean * 1.3:
+                line += f"; самые долгие перерывы — до {_dur(p95)}"
+            lines.append(line + ".")
+        if err <= 0.05:
+            lines.append(f"Неудачных сканов {_pct(scans_bad, scans_all)} — это норма: их догоняет следующий скан.")
+        elif err <= 0.15:
+            lines.append(f"Неудачных сканов {_pct(scans_bad, scans_all)} — часть лотов приходит на 20–40 с позже.")
+        else:
+            lines.append(f"Неудачных сканов {_pct(scans_bad, scans_all)} — много: лоты заметно опаздывают.")
+        if block_share >= 0.2 and (bad or slow):
+            paused = f", на паузе {len(quarantined)} из {len(proxies)} каналов" if quarantined else ""
+            lines.append(f"Причина — Авито блокирует прокси: {block_share * 100:.0f}% ответов за 10 мин{paused}.")
+        if cap["deficit_now"] > 0:
+            lines.append("Прокси не хватает на все ссылки: бот растягивает интервалы проверки.")
+        if no_net:
+            lines.append("Рабочих каналов нет — сканирование стоит.")
+
+        pub = sla["by_tariff"]
+        pub_total = sum(pub[t]["pub_to_seen_seconds"]["sample_count"] for t in TARIFF_KEYS)
+        queued = sla["queued_to_sent_seconds"]
+        if pub_total:
+            pub_mean = sum((pub[t]["pub_to_seen_seconds"]["mean"] or 0.0) * pub[t]["pub_to_seen_seconds"]["sample_count"]
+                           for t in TARIFF_KEYS) / pub_total
+            send = f", бот отправляет за ~{_dur(queued['mean'])}" if queued.get("sample_count") else ""
+            lines.append(f"Лоты приходят через ~{_dur(pub_mean)} после публикации: почти всё это время их держит "
+                         f"сам Авито{send}.")
+        if slow_send or queue_grows:
+            lines.append("Telegram отправляет медленно: уведомления копятся в очереди.")
+
+        if bad or slow:
+            todo = []
+            if block_share >= 0.2 or cap["deficit_now"] > 0 or no_net:
+                todo.append("добавьте свежие прокси из других подсетей")
+            if quarantined:
+                todo.append("нажмите «Проверить каналы»")
+            if todo:
+                lines.append("Что сделать: " + ", ".join(todo) + ".")
+        return lines
+
     def format_stats_messages(self, max_len: int = 3800) -> list[str]:
         snap = self.snapshot(window_minutes=60)
         sched = snap["scheduler"]
@@ -1542,28 +1614,7 @@ class RuntimeMetricsRegistry:
         blocks_10 = sum(p["raw_http_403_429_10m"] for p in proxies)
         quarantined = [p for p in proxies if p["state"] == "quarantined"]
 
-        # Plain-language verdict first, so a glance answers "is everything fine?".
-        problems: list[str] = []
-        if scans_all >= 20 and scans_bad / scans_all > 0.10:
-            problems.append(f"много неудачных сканов: {_pct(scans_bad, scans_all)}")
-        if cap["deficit_now"] > 0:
-            problems.append(f"не хватает скорости сети: {_dec(cap['deficit_now'], 2)} запр/с")
-        if quarantined:
-            problems.append(f"на паузе каналов: {len(quarantined)} из {len(proxies)}")
-        if outbox["pending_depth"] > config.OUTBOX_ALERT_DEPTH:
-            problems.append(f"очередь уведомлений растёт: {outbox['pending_depth']}")
-        deliver = sla["deliver_at_to_sent_seconds"]
-        if deliver["sample_count"] and deliver["p95"] is not None and deliver["p95"] > float(config.DELIVERY_SLA_ALERT_SECONDS):
-            problems.append(f"уведомления уходят медленно: до {_dur(deliver['p95'])}")
-        if sched["unique_sources"] and scans_all == 0:
-            problems.append("за час не было ни одного скана")
-
-        if problems:
-            verdict = ["🔴 <b>Есть проблемы</b>"] + [f"• {p}" for p in problems]
-        elif scans_all == 0:
-            verdict = ["⚪️ <b>Данных пока нет</b> — сканов ещё не было"]
-        else:
-            verdict = ["🟢 <b>Всё работает нормально</b>"]
+        verdict = self._human_verdict(snap, scans_all, scans_bad, buckets_10, quarantined)
 
         if cap["available_rate_now"] > 0:
             need, have = cap["required_rate_target"], cap["available_rate_now"]
@@ -1575,8 +1626,10 @@ class RuntimeMetricsRegistry:
         interval = pipe["source_interval_seconds"]
         lines = [
             f"📊 <b>Мониторинг</b> · час · бот работает {_dur(self._wall_clock() - self._started_at)}",
+            "",
             *verdict,
             "",
+            "<b>Подробно</b>",
             f"🔎 Ссылок <b>{sched['unique_sources']}</b>"
             + (f" · опаздывают {sched['overdue_sources']}" if sched["overdue_sources"] else "")
             + (f" · проверка ~{_dur(interval['mean'])}" if interval.get("sample_count") else ""),
