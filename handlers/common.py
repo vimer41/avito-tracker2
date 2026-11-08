@@ -49,13 +49,26 @@ def get_doc_keyboard(name: str, page: int) -> InlineKeyboardMarkup:
 
 def get_main_keyboard(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
     """Нижняя клавиатура: кнопки присылают свой текст, поэтому эмодзи в них обычные."""
-    label = {key: ui.MENU[key][0] for key in ui.MENU}
-    kb = [
-        [KeyboardButton(text=label["add"]), KeyboardButton(text=label["radars"])],
-        [KeyboardButton(text=label["tariffs"]), KeyboardButton(text=label["profile"])],
-        [KeyboardButton(text=label["help"]), KeyboardButton(text=label["support"])],
-    ]
-    if user_id and config.is_admin(user_id):
+    label = {key: ui.menu_label(key) for key in ui.MENU}
+    if ui.clean():
+        # The main action alone on top in blue, the rest two to a row; monochrome icons, the label stays plain
+        # text because a reply button sends its label back.
+        def key(name: str, icon: str, style: Optional[str] = None) -> KeyboardButton:
+            return KeyboardButton(text=label[name], icon_custom_emoji_id=ui.custom_id(icon), style=style)
+
+        kb = [
+            [key("add", "add", "primary")],
+            [key("radars", "radars"), key("profile", "profile")],
+            [key("tariffs", "tariffs"), key("help", "help")],
+            [key("support", "support")] + ([key("admin", "admin")] if user_id and config.is_admin(user_id) else []),
+        ]
+    else:
+        kb = [
+            [KeyboardButton(text=label["add"]), KeyboardButton(text=label["radars"])],
+            [KeyboardButton(text=label["tariffs"]), KeyboardButton(text=label["profile"])],
+            [KeyboardButton(text=label["help"]), KeyboardButton(text=label["support"])],
+        ]
+    if user_id and config.is_admin(user_id) and not ui.clean():
         kb.append([KeyboardButton(text=label["admin"])])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, input_field_placeholder="Пришлите ссылку на поиск Авито")
 
@@ -139,6 +152,20 @@ def access_status(user: dict, user_id: int) -> str:
     return "Подписка не активна"
 
 
+def short_access(user: dict, user_id: int) -> str:
+    """«сейчас Полный до 28.11» for the clean tariff screen header."""
+    if config.is_admin(user_id):
+        return "администратор"
+    sub_until = user.get("subscription_until")
+    until = re.search(r"\d{2}\.\d{2}", database.format_subscription_date(sub_until) or "") if sub_until else None
+    till = f" до {until.group(0)}" if until else ""
+    if sub_until and user.get("trial_used") and not user.get("is_allowed"):
+        return f"сейчас пробный период{till}"
+    if user.get("is_allowed"):
+        return f"сейчас {config.plan_title(user.get('tariff_plan'))}{till}"
+    return "подписка не активна"
+
+
 def can_take_trial(user: dict, user_id: int) -> bool:
     return not config.is_admin(user_id) and not user.get("subscription_until") and not user.get("trial_used")
 
@@ -194,7 +221,36 @@ async def on_bot_unblocked(update: ChatMemberUpdated):
 @router.callback_query(F.data == "open_help_menu")
 @router.message(Command("help"))
 async def cmd_help(event):
-    text = (
+    if ui.clean():
+        tariffs = "\n".join(
+            f"{plan_icon(plan)} {config.plan_title(plan)} — {config.rub_price(plan)} ₽ · "
+            f"{radars_word(config.plan_radars(plan))} · {config.plan_interval(plan)} с"
+            + (" · лоты в группу" if plan in config.GROUP_DELIVERY_PLANS else "")
+            for plan in config.PAID_PLANS
+        )
+        text = (
+            f"{ui.e('help')} <b>Как пользоваться</b>\n\n"
+            f"{ui.e('radar')} <b>Радар</b>\n"
+            "Пришлите ссылку на поиск Авито с нужными фильтрами — бот будет присылать каждое новое объявление. "
+            "Уже выложенные лоты не приходят, только новые. "
+            f"После паузы радар пришлёт лоты за последние {config.RESUME_MAX_AGE_MINUTES} минут.\n\n"
+            f"{ui.e('shield')} <b>Фильтры</b>\n"
+            "Стоп-слова — лоты с этими словами не придут\n"
+            "Чёрный список — скрыть все объявления продавца\n"
+            "Область поиска — только заголовок или вместе с описанием\n"
+            "Цена, обязательные слова, только с доставкой, без продвинутых\n"
+            "Сообщение продавцу — кнопка под лотом копирует ваш текст\n\n"
+            f"{ui.e('tariffs')} <b>Тарифы</b>\n"
+            f"{tariffs}\n"
+            f"Пробный период — {radars_word(config.TRIAL_RADARS)} на {config.TRIAL_TEXT} за подписку на канал\n\n"
+            f"{ui.e('time')} <b>Когда приходит лот</b>\n"
+            "<blockquote expandable>Бот проверяет ссылку с частотой вашего тарифа и присылает лот сразу, как найдёт. "
+            "Авито сначала проверяет объявление на модерации, поэтому в лоте может стоять «3 минуты назад» — "
+            "это время публикации, а не появления в поиске. При сбоях на Авито или в сети бывает дольше. "
+            "Лоты старше лимита радара не приходят, по умолчанию 5 минут.</blockquote>"
+        )
+    else:
+      text = (
         f"{ui.e('help')} <b>Как пользоваться</b>\n\n"
         f"{ui.e('radar')} <b>1. Добавьте радар</b>\n"
         "Откройте <code>avito.ru</code>, задайте запрос и фильтры: город, цену, состояние. "
@@ -250,15 +306,23 @@ async def cmd_profile(event):
     from scheduler import get_last_scan_info
     blocked_count = len(await database.get_user_blocked_sellers_list(user_id))
 
-    text = (
-        f"{ui.e('profile')} <b>Профиль</b>\n\n"
-        f"<b>Доступ:</b> {access_status(user, user_id)}\n"
-        f"<b>Радары:</b> {searches_count} из {max_radars}, работают {active_count}\n"
-        f"<b>Проверка:</b> раз в {scan_interval} с\n"
-        f"<b>Чёрный список:</b> {blocked_count}\n"
-        f"<b>Последний скан:</b> {get_last_scan_info()}\n"
-        f"<b>ID:</b> <code>{user_id}</code>"
-    )
+    if ui.clean():
+        text = (
+            f"{ui.e('profile')} <b>Профиль</b>\n\n"
+            f"Доступ: {access_status(user, user_id)}\n"
+            f"Радары: {searches_count} из {max_radars}, работают {active_count}\n"
+            f"Проверка: раз в {scan_interval} с"
+        )
+    else:
+        text = (
+            f"{ui.e('profile')} <b>Профиль</b>\n\n"
+            f"<b>Доступ:</b> {access_status(user, user_id)}\n"
+            f"<b>Радары:</b> {searches_count} из {max_radars}, работают {active_count}\n"
+            f"<b>Проверка:</b> раз в {scan_interval} с\n"
+            f"<b>Чёрный список:</b> {blocked_count}\n"
+            f"<b>Последний скан:</b> {get_last_scan_info()}\n"
+            f"<b>ID:</b> <code>{user_id}</code>"
+        )
 
     rows = []
     if can_take_trial(user, user_id):
@@ -380,28 +444,48 @@ async def cmd_subscription_menu(event):
     user = await database.get_or_create_user(user_id)
     current = (user.get("tariff_plan") or "").lower() if user.get("is_allowed") else ""
 
-    text = (
-        f"{ui.e('tariffs')} <b>Тарифы</b>\n"
-        f"Сейчас: <b>{access_status(user, user_id)}</b>\n\n"
-        f"{plan_card('lite')}\n\n"
-        f"{plan_card('standart')}\n\n"
-        f"{plan_card('pro')}\n\n"
-        "На всех тарифах: стоп-слова, фильтр цены, чёрный список продавцов, ночной режим.\n\n"
-        "<blockquote>Чем чаще проверка, тем раньше вы увидите лот и успеете написать первым.</blockquote>\n"
-        + (f"Оплата разовая на 1 или 3 месяца, без автосписаний. За 3 месяца{period_discount_text(3)}. "
-           if 3 in config.SALE_PERIOD_MONTHS else "Оплата разовая на месяц, без автосписаний. ")
-        + "Оплаченные дни добавляются к текущему сроку."
-    )
+    if ui.clean():
+        # Two lines per tariff: name and price, then what it gives; one shared line for the rest.
+        cards = "\n\n".join(
+            f"{plan_icon(plan)} <b>{config.plan_title(plan)}</b> — {config.rub_price(plan)} ₽/мес\n"
+            f"{radars_word(config.plan_radars(plan))} · проверка раз в {config.plan_interval(plan)} с"
+            + (" · лоты в группу" if plan in config.GROUP_DELIVERY_PLANS else "")
+            for plan in config.PAID_PLANS
+        )
+        text = (
+            f"{ui.e('tariffs')} <b>Тарифы</b> · {short_access(user, user_id)}\n\n"
+            f"{cards}\n\n"
+            "<blockquote>Во всех тарифах: стоп-слова, фильтры, чёрный список, ночной режим. "
+            "Оплата разовая, без автосписаний.</blockquote>"
+        )
+    else:
+        text = (
+            f"{ui.e('tariffs')} <b>Тарифы</b>\n"
+            f"Сейчас: <b>{access_status(user, user_id)}</b>\n\n"
+            f"{plan_card('lite')}\n\n"
+            f"{plan_card('standart')}\n\n"
+            f"{plan_card('pro')}\n\n"
+            "На всех тарифах: стоп-слова, фильтр цены, чёрный список продавцов, ночной режим.\n\n"
+            "<blockquote>Чем чаще проверка, тем раньше вы увидите лот и успеете написать первым.</blockquote>\n"
+            + (f"Оплата разовая на 1 или 3 месяца, без автосписаний. За 3 месяца{period_discount_text(3)}. "
+               if 3 in config.SALE_PERIOD_MONTHS else "Оплата разовая на месяц, без автосписаний. ")
+            + "Оплаченные дни добавляются к текущему сроку."
+        )
 
     rows = []
     if can_take_trial(user, user_id):
         rows.append([ui.btn(f"Пробный период {config.TRIAL_TEXT}", "trial", callback_data="activate_trial_btn")])
     for plan in config.PAID_PLANS:
-        mark = " · ваш" if plan == current else ""
-        rows.append([ui.btn(
-            f"{config.plan_title(plan)} — {config.rub_price(plan)} ₽{mark}", plan,
-            callback_data=f"buy_tariff:{plan}", style="primary" if plan == "standart" and not current else None,
-        )])
+        if ui.clean():
+            # Your tariff is the blue one with a tick; without a tariff the middle one is suggested.
+            mine = plan == current
+            label = f"{'✓ ' if mine else ''}{config.plan_title(plan)} · {config.rub_price(plan)} ₽"
+            style = "primary" if mine or (plan == "standart" and not current) else None
+        else:
+            mark = " · ваш" if plan == current else ""
+            label = f"{config.plan_title(plan)} — {config.rub_price(plan)} ₽{mark}"
+            style = "primary" if plan == "standart" and not current else None
+        rows.append([ui.btn(label, plan, callback_data=f"buy_tariff:{plan}", style=style)])
     rows.append([
         ui.btn("Условия", "docs", callback_data="payment_terms"),
         ui.btn("Вопрос по оплате", "support", callback_data="payment_support"),

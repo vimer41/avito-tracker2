@@ -20,6 +20,8 @@ from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
+import config
+
 logger = logging.getLogger(__name__)
 
 SETTING_IDS = "ui_emoji"
@@ -91,13 +93,27 @@ MENU: dict[str, tuple[str, set[str]]] = {
     "admin": ("👑 Админ-панель", {"👑 Админка"}),
 }
 CANCEL_TEXTS = {"❌ Отмена", "Отмена"}
+# Bottom menu labels of the clean theme; menu_texts() accepts them under any theme, so old keyboards keep working.
+MENU_CLEAN: dict[str, str] = {
+    "add": "Добавить радар", "radars": "Мои радары", "tariffs": "Тарифы", "profile": "Профиль",
+    "help": "Инструкция", "docs": "Документы", "support": "Поддержка", "admin": "Админка",
+}
+
+
+def clean() -> bool:
+    """The clean theme: monochrome icons instead of colour emoji, the button colour carries the meaning."""
+    return config.UI_THEME == "clean"
+
+
+def menu_label(key: str) -> str:
+    return MENU_CLEAN[key] if clean() else MENU[key][0]
 
 
 def menu_texts(*keys: str) -> set[str]:
     out: set[str] = set()
     for key in keys:
         label, aliases = MENU[key]
-        out |= {label, *aliases}
+        out |= {label, *aliases, MENU_CLEAN[key]}
     return out
 
 
@@ -124,6 +140,30 @@ DEFAULT_IDS: dict[str, str] = {
     "users": "5372926953978341366", "net": "5399898266265475100", "stats": "5431577498364158238",
     "db": "5431736674147114227", "logs": "5433982607035474385", "palette": "5431456208487716895",
 }
+
+# The clean theme's own monochrome pack (tools/make_icon_pack.py, Tabler outline icons): adaptive custom emoji,
+# painted in the text colour by Telegram, so white on a dark button.
+CLEAN_PACK = "avito_radar_icons_by_DIMADIMASIKSSSbot"
+CLEAN_IDS: dict[str, str] = {
+    "logo": "5440580544385563268", "hello": "5443129933893249057", "radar": "5443116155638165457",
+    "radars": "5442712540381490678", "add": "5442722659324440092", "tariffs": "5440825722593651193",
+    "profile": "5443115219335293391", "help": "5440683473276807521", "docs": "5442960544678065378",
+    "support": "5440838740639526523", "home": "5442806531445796460", "trial": "5440878507741720245",
+    "lite": "5442899199660174973", "standart": "5443067695522167168", "pro": "5443147062222829092",
+    "on": "5443045275792882768", "pause": "5442862280121300179", "play": "5442617681733792807",
+    "shield": "5443023255495551803", "ban": "5440732341414701771", "link": "5443014197409525630",
+    "trash": "5442883776432615325", "refresh": "5442605140429288767", "ok": "5442830398579061649",
+    "warn": "5442803378939801834", "cancel": "5442748523617498340", "wait": "5442811346104133972",
+    "new": "5442899199660174973", "price": "5440533037752311161", "place": "5443048827730833363",
+    "time": "5443066514406159431", "box": "5440419465932088986", "views": "5443082921181229039",
+    "note": "5443056008916152185", "card": "5443133000499900201", "bank": "5443088839646164096",
+    "star": "5443080958381174053", "coin": "5440433841187630855", "lock": "5442727542702263331",
+    "scope": "5440456415535739749", "write": "5442683862884857149", "mail": "5443146177459564482",
+    "admin": "5440497368048903622", "users": "5442698680522026406", "net": "5442814700473593080",
+    "stats": "5440819954452576036", "db": "5443161798255620490", "logs": "5440897667590827311",
+    "palette": "5443082023533065616",
+}
+
 
 ENABLED = True
 IDS: dict[str, str] = {}          # effective: defaults + admin overrides, minus slots set to plain
@@ -153,18 +193,27 @@ def plain(name: str) -> str:
 
 
 def custom_id(name: str) -> Optional[str]:
+    if clean():
+        return CLEAN_IDS.get(name) if ENABLED else None
     return IDS.get(name) if ENABLED else None
 
 
 def e(name: str) -> str:
-    """Emoji for HTML text: animated when the slot is filled, plain otherwise."""
+    """Emoji for HTML text: animated when the slot is filled, plain otherwise.
+    The clean theme shows only its own monochrome icon, never a colour emoji."""
     char = SLOTS[name][0]
     cid = custom_id(name)
+    if clean() and not cid:
+        return ""
     return f'<tg-emoji emoji-id="{cid}">{char}</tg-emoji>' if cid else char
 
 
 def btn(text: str, icon: Optional[str] = None, *, style: Optional[str] = None, **kwargs) -> InlineKeyboardButton:
-    """Inline button with an icon slot: animated icon when filled, plain emoji in the text otherwise."""
+    """Inline button with an icon slot: animated icon when filled, plain emoji in the text otherwise.
+    The clean theme uses its own monochrome icon and never puts a colour emoji into the text."""
+    if clean():
+        return InlineKeyboardButton(text=text, icon_custom_emoji_id=custom_id(icon) if icon else None,
+                                    style=style, **kwargs)
     cid = custom_id(icon) if icon else None
     if icon and not cid:
         text = f"{SLOTS[icon][0]} {text}"
@@ -176,7 +225,7 @@ def kb(*rows: Iterable[InlineKeyboardButton]) -> InlineKeyboardMarkup:
 
 
 def home_btn() -> InlineKeyboardButton:
-    return btn("Главное меню", "home", callback_data="start_approved")
+    return btn("Меню" if clean() else "Главное меню", "home", callback_data="start_approved")
 
 
 async def show(event, text: str, markup=None, *, answer: bool = True, **kwargs) -> None:
@@ -272,7 +321,7 @@ def _strip_markup(markup):
         new_row = []
         for b in row:
             if b.icon_custom_emoji_id:
-                char = _CHAR_BY_ID.get(b.icon_custom_emoji_id, "")
+                char = "" if clean() else _CHAR_BY_ID.get(b.icon_custom_emoji_id, "")
                 b = b.model_copy(update={"icon_custom_emoji_id": None, "text": f"{char} {b.text}".strip()})
                 changed = True
             new_row.append(b)
@@ -293,8 +342,65 @@ def strip_method(method):
     return method.model_copy(update=update) if update else None
 
 
+_LINE_LEAD = re.compile(r"(?m)^[ \t]+")
+# Colour emoji written straight into texts and labels (🧠 Умный, 🔥 Полный…). Status marks stay: in admin lists
+# 🟢🟡🔴 and ✅❌⚠️ carry meaning, and ✓ (U+2713) is the clean theme's own tick.
+_KEEP = "🟢🟡🔴🟠⚪⚫🔵🟣✅❌⚠🚫✓"
+_EMOJI = re.compile(
+    "(?:[\U0001F000-\U0001FAFF\u2300-\u23FF\u24C2\u25A0-\u27BF\u2B00-\u2BFF\u3030\u303D\u3297\u3299]"
+    "(?:\uFE0F|\u20E3|[\U0001F3FB-\U0001F3FF])*(?:\u200D\S(?:\uFE0F)?)*)"
+)
+_TG_EMOJI = re.compile(r"(<tg-emoji[^>]*>.*?</tg-emoji>)", re.S)
+# «<b>Статус:</b>» at a line start, after an optional icon tag.
+_BOLD_LABEL = re.compile(r"(?m)^((?:<tg-emoji[^>]*>.*?</tg-emoji>\s*)?)<b>([^<\n]{1,40}):</b>")
+
+
+def drop_colour_emoji(text: str) -> str:
+    """The text without colour emoji (status marks kept); custom-emoji tags are left as they are."""
+    def strip(part: str) -> str:
+        return _EMOJI.sub(lambda m: m.group(0) if m.group(0)[0] in _KEEP else "", part)
+
+    parts = _TG_EMOJI.split(text)
+    out = "".join(part if i % 2 else strip(part) for i, part in enumerate(parts))
+    return re.sub(r"[ \t]{2,}", " ", _LINE_LEAD.sub("", out))
+
+
+def _clean_markup(markup):
+    if not isinstance(markup, InlineKeyboardMarkup):
+        return markup, False
+    changed, rows = False, []
+    for row in markup.inline_keyboard:
+        new_row = []
+        for b in row:
+            text = drop_colour_emoji(b.text).strip() or b.text
+            if text != b.text:
+                b, changed = b.model_copy(update={"text": text}), True
+            new_row.append(b)
+        rows.append(new_row)
+    return InlineKeyboardMarkup(inline_keyboard=rows), changed
+
+
+def clean_method(method):
+    """Clean theme: no colour emoji in texts, captions, inline button labels and popups, and no space left where
+    an empty emoji slot was. Messages with <pre> blocks (logs, stack traces) keep their text as is."""
+    update = {}
+    for field in ("text", "caption"):
+        value = getattr(method, field, None)
+        if isinstance(value, str) and "<pre" not in value:
+            # Field labels read as plain text («Статус: Работает»), the bold is kept for titles and values.
+            fixed = _BOLD_LABEL.sub(r"\1\2:", drop_colour_emoji(value))
+            if fixed != value:
+                update[field] = fixed
+    markup, changed = _clean_markup(getattr(method, "reply_markup", None))
+    if changed:
+        update["reply_markup"] = markup
+    return method.model_copy(update=update) if update else method
+
+
 class PremiumEmojiFallback(BaseRequestMiddleware):
     async def __call__(self, make_request, bot, method):
+        if clean():
+            method = clean_method(method)
         try:
             return await make_request(bot, method)
         except TelegramBadRequest as exc:

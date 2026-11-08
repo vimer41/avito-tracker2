@@ -72,6 +72,9 @@ def positive_int_setting(name: str, default: str, environ: Mapping[str, str] | N
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+# Bot look: "clean" (own monochrome icons, button colour = meaning; default since 2026-11-08) or "emoji"
+# (the former colour emoji on buttons and in texts).
+UI_THEME = (os.getenv("UI_THEME", "clean").strip().lower() or "clean")
 MAX_SEARCHES_PER_USER = positive_int_setting("MAX_SEARCHES_PER_USER", "50")
 # Admins may paste up to this many search links in one message.
 BULK_RADAR_MAX = positive_int_setting("BULK_RADAR_MAX", "50")

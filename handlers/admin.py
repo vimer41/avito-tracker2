@@ -1394,7 +1394,10 @@ def _net_summary(pool) -> str:
     clients = pool.clients
     if not clients:
         return "⏸ <b>на паузе</b> (нет каналов)"
-    return f"{NET_MODE_TITLES.get(config.NET_MODE, config.NET_MODE)} · каналов: <b>{len(clients)}</b>"
+    title = NET_MODE_TITLES.get(config.NET_MODE, config.NET_MODE)
+    if ui.clean():
+        return f"{ui.drop_colour_emoji(title).strip().lower()} · каналов {len(clients)}"
+    return f"{title} · каналов: <b>{len(clients)}</b>"
 
 
 @router.message(F.text.in_(ui.menu_texts("admin")))
@@ -1417,9 +1420,9 @@ async def cmd_admin_home(event):
         f"{ui.e('radar')} Радары: <b>{stats['active_searches']}</b> активных из <b>{stats['total_searches']}</b>\n"
         f"{ui.e('box')} Обработано лотов: <b>{stats['total_seen']}</b>\n"
         f"{ui.e('net')} Сеть: {_net_summary(get_proxy_pool())}\n"
-        f"{ui.e('time')} Последняя проверка: <b>{get_last_scan_info()}</b>\n"
-        f"{ui.e('palette')} Премиум-эмодзи: <b>{len(ui.IDS)}</b> из {len(ui.SLOTS)}"
-        + ("" if ui.ENABLED else " (выключены)")
+        f"{ui.e('time')} Последняя проверка: <b>{get_last_scan_info()}</b>"
+        + ("" if ui.clean() else f"\n{ui.e('palette')} Премиум-эмодзи: <b>{len(ui.IDS)}</b> из {len(ui.SLOTS)}"
+           + ("" if ui.ENABLED else " (выключены)"))
     )
     kb = ui.kb(
         [ui.btn("Пользователи", "users", callback_data="admin_page:0"),

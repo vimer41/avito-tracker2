@@ -14,6 +14,8 @@ NATIVE_THREAD_LIMITS = {
     "MKL_NUM_THREADS": "1",
 }
 os.environ.update(NATIVE_THREAD_LIMITS)
+# Older tests assert the emoji theme's texts; theme tests patch config.UI_THEME themselves.
+os.environ.setdefault("UI_THEME", "emoji")
 
 _ORIG_TEMPDIR_CLEANUP = tempfile.TemporaryDirectory.cleanup
 

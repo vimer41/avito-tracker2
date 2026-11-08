@@ -178,15 +178,30 @@ async def bulk_add_radars(message: Message, state: FSMContext, urls: List[str]) 
 @router.callback_query(F.data == "add_search_prompt")
 async def btn_add_search(event, state: FSMContext):
     await state.set_state(SearchStates.waiting_for_url)
-    text = (
-        f"{ui.e('radar')} <b>Новый радар</b>\n\n"
-        "Пришлите ссылку на поиск Авито:\n"
-        "1. Откройте <b>avito.ru</b> и найдите нужный товар.\n"
-        "2. Выставьте фильтры: город, цена, состояние.\n"
-        "3. Скопируйте ссылку из адресной строки и отправьте сюда.\n\n"
-        "<blockquote>Пример: <code>https://www.avito.ru/moskva/telefony?q=iphone</code></blockquote>"
-    )
-    if config.is_admin(event.from_user.id):
+    if ui.clean():
+        text = (
+            f"{ui.e('radar')} <b>Новый радар</b>\n\n"
+            "Пришлите ссылку на поиск Авито — бот будет проверять её и присылать каждое новое объявление.\n\n"
+            "<b>Как получить ссылку</b>\n"
+            "1. Найдите товар на avito.ru\n"
+            "2. Задайте город, цену и другие фильтры\n"
+            "3. Скопируйте адрес страницы и отправьте сюда\n\n"
+            "<blockquote><code>https://www.avito.ru/moskva/telefony?q=iphone</code></blockquote>\n"
+            "Фильтры сохраняются в ссылке. Сортировку менять не нужно: бот сам смотрит самые новые объявления."
+        )
+        if config.is_admin(event.from_user.id):
+            text += (f"\n\n{ui.e('admin')} До {int(config.BULK_RADAR_MAX)} ссылок за раз, по одной на строку — "
+                     "каждая станет отдельным радаром.")
+    else:
+        text = (
+            f"{ui.e('radar')} <b>Новый радар</b>\n\n"
+            "Пришлите ссылку на поиск Авито:\n"
+            "1. Откройте <b>avito.ru</b> и найдите нужный товар.\n"
+            "2. Выставьте фильтры: город, цена, состояние.\n"
+            "3. Скопируйте ссылку из адресной строки и отправьте сюда.\n\n"
+            "<blockquote>Пример: <code>https://www.avito.ru/moskva/telefony?q=iphone</code></blockquote>"
+        )
+    if config.is_admin(event.from_user.id) and not ui.clean():
         text += (
             f"\n{ui.e('admin')} Можно прислать до {int(config.BULK_RADAR_MAX)} ссылок, "
             "по одной на строку: каждая станет отдельным радаром."
@@ -548,7 +563,11 @@ async def show_searches(event, state: Optional[FSMContext] = None):
                             callback_data=f"open_search:{s['id']}")])
     add_row = [ui.btn("Обновить", "refresh", callback_data="list_searches")]
     if len(searches) < max_radars:
-        add_row.insert(0, ui.btn("Добавить", "add", callback_data="add_search_prompt"))
+        if ui.clean():
+            # The main action of the screen: alone, blue, above the list.
+            rows.insert(0, [ui.btn("Добавить радар", "add", callback_data="add_search_prompt", style="primary")])
+        else:
+            add_row.insert(0, ui.btn("Добавить", "add", callback_data="add_search_prompt"))
     rows.append(add_row)
     if config.is_admin(user_id) and len(searches) > 1:
         rows.append([ui.btn("Удалить несколько", "trash", callback_data="bulk_del:new"),
