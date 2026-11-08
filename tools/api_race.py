@@ -203,6 +203,10 @@ class Race:
         self.by_proxy: dict[str, dict] = {}                   # label -> {source: {try, ok, block, reasons}}
         self.web_parsers: dict[str, AvitoParser] = {}
         self.api_sessions: dict[str, object] = {}
+        self.api_warmers: dict[str, AvitoParser] = {}         # the API's own page fetchers, for anti-bot cookies
+        self.api_warm: dict[str, bool] = {}
+        self.warm_ms: list[int] = []
+        self.warmups = 0
         self.lots: dict[str, dict] = {}
         self.baseline = {"web": False, "api": False}
         self.paused_until = {"web": 0.0, "api": 0.0}
@@ -251,6 +255,35 @@ class Race:
                 kwargs["proxies"] = {"http": proxy, "https": proxy}
             self.api_sessions[key] = curl_requests.Session(**kwargs)
         return self.api_sessions[key]
+
+    def warm_api(self, proxy: Optional[str], info: dict) -> bool:
+        """Avito answers 439 «pass the check» to a session without its anti-bot cookies. The API session gets them
+        the way the first races did: the bot's own page fetch on this proxy (it solves the check), then the cookies
+        and headers move to the API session. The page parser is the API's own, never the site source's."""
+        key = proxy_label(proxy)
+        parser = self.api_warmers.get(key) or AvitoParser(proxy)
+        self.api_warmers[key] = parser
+        started = time.monotonic()
+        try:
+            page = parser.fetch_page(self.web_url)
+        except Exception as exc:
+            page = None
+            info["kind"] = f"прогрев: {type(exc).__name__}"
+        info["warm_ms"] = int((time.monotonic() - started) * 1000)
+        self.warm_ms.append(info["warm_ms"])
+        if not page:
+            fail = getattr(parser, "last_failure", None)
+            if "kind" not in info:
+                status = getattr(fail, "status", None)
+                info["kind"] = f"прогрев не прошёл: {getattr(fail, 'kind', '?')}" + (f" {status}" if status else "")
+            return False
+        session = self.api_session(proxy)
+        for cookie in parser.session.cookies.jar:
+            session.cookies.jar.set_cookie(cookie)
+        session.headers.update({k: v for k, v in parser.session.headers.items() if k.lower() != "cookie"})
+        self.api_warm[key] = True
+        self.warmups += 1
+        return True
 
     def switch_proxy(self, source: str, rest: bool):
         """Move the source to the next proxy that is not resting for it and, when there is a choice, not the one
@@ -358,7 +391,7 @@ class Race:
             if found is not None:
                 stats["ok"] += 1
                 self.fails_in_row[source] = 0
-                self.latency_ms[source].append(info["ms"])
+                self.latency_ms[source].append(info["ms"] - info.get("warm_ms", 0))
                 self.counts[source].append(len(found))
                 if info.get("kb"):
                     self.kb[source].append(info["kb"])
@@ -367,8 +400,9 @@ class Race:
                 self.reasons[source][kind] += 1
                 stats["reasons"][kind] += 1
                 if info.get("blocked"):
-                    stats["block"] += 1
-                    self.blocks[source] += 1
+                    if not info.get("warm_fail"):
+                        stats["block"] += 1
+                        self.blocks[source] += 1
                     self.switch_proxy(source, rest=True)
                 else:
                     self.fails_in_row[source] += 1
@@ -412,6 +446,9 @@ class Race:
                 self.web_stats["sample"] = stats["sample"]
             return found
 
+        if not self.api_warm.get(proxy_label(proxy)) and not self.warm_api(proxy, info):
+            info["blocked"] = info["warm_fail"] = True  # move on, but it is the page that failed, not the API
+            return None
         headers = {"Accept": "application/json", "Referer": "https://m.avito.ru/"}
         try:
             resp = self.api_session(proxy).get(self.api_url, headers=headers, timeout=20, allow_redirects=False)
@@ -426,6 +463,7 @@ class Race:
         if resp.status_code in BLOCK_STATUSES or AvitoParser._is_firewall(resp):
             info["kind"] = f"блок {resp.status_code}"
             info["blocked"] = True
+            self.api_warm[proxy_label(proxy)] = False  # next time on this proxy: fresh cookies first
             print(f"api [{proxy_label(proxy)}]: блок {resp.status_code}")
             return None
         if resp.status_code != 200:
@@ -714,6 +752,9 @@ class Race:
                 f"p90 {p90(lat):.0f} мс, размер медиана {med(self.kb[src], ' КБ')}")
             reasons = ", ".join(f"{k} — {v}" for k, v in self.reasons[src].most_common(8))
             add(f"   почему не ответил: {reasons or 'всегда отвечал'}")
+        add(f"Прогрев API (страница сайта на том же прокси ради антибот-куки): удачных {self.warmups}, "
+            f"попыток {len(self.warm_ms)}, время медиана {med(self.warm_ms, ' мс')}. Время прогрева не входит "
+            "в время ответа API, но в бою API без него не работает.")
         add("")
         add("== ПОЛЯ ДЛЯ УВЕДОМЛЕНИЯ (только то, что дал сам источник, новые лоты) ==")
         for src in SOURCES:
