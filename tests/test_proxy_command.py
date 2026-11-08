@@ -161,7 +161,7 @@ class TestProxyCommand(ProxyEnvMixin, unittest.IsolatedAsyncioTestCase):
             await admin.cmd_admin_race(message)
             await asyncio.sleep(0)
         env = spawn.await_args.kwargs["env"]
-        self.assertEqual(env["RACE_PROXY"], PROXY_URL)
+        self.assertEqual(env["RACE_PROXIES"], PROXY_URL)
         self.assertEqual(env["RACE_MINUTES"], "15")
         self.assertEqual(env["RACE_NO_UPDATES"], "1")
         self.assertTrue(spawn.await_args.args[2].endswith("api_race.py"))

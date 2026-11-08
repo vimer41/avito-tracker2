@@ -2392,17 +2392,20 @@ _RACE: dict = {}  # the running /race: {"proc", "task", "label", "until"}
 RACE_DEFAULT_MINUTES, RACE_MAX_MINUTES = 10, 30
 
 
-def _race_proxy(arg: str | None):
-    """The proxy for /race: the one whose address contains `arg`, else a good one that is not among the 3 best
-    (a race doubles the requests through its IP, the best channels must keep scanning)."""
+def _race_proxies(arg: str | None) -> list[str]:
+    """Proxies for /race in the order the race tries them: the one whose address contains `arg` first, then the
+    healthy ones outside the 3 best, then the 3 best last (they keep scanning; the race only falls back on them)."""
     from proxy_pool import get_proxy_pool
 
     proxies = [c for c in get_proxy_pool().clients if not c.is_direct and c.proxy_url]
-    if arg:
-        return next((c for c in proxies if arg in _proxy_host(c.proxy_url)), None)
     ranked = sorted(proxies, key=lambda c: c.long_health(), reverse=True)
-    spare = ranked[3:] if len(ranked) > 3 else ranked[-1:]
-    return next((c for c in spare if c.state != "quarantined"), spare[0] if spare else None)
+    ordered = ranked[3:] + ranked[:3] if len(ranked) > 3 else ranked
+    if arg:
+        chosen = [c for c in ordered if arg in _proxy_host(c.proxy_url)]
+        if not chosen:
+            return []
+        ordered = chosen + [c for c in ordered if c not in chosen]
+    return [c.proxy_url for c in ordered]
 
 
 async def _race_watch(message: Message, proc, log_path) -> None:
@@ -2451,23 +2454,22 @@ async def cmd_admin_race(message: Message):
 
     minutes = next((int(a) for a in args if a.isdigit()), RACE_DEFAULT_MINUTES)
     minutes = max(1, min(minutes, RACE_MAX_MINUTES))
-    client = _race_proxy(next((a for a in args if not a.isdigit()), None))
-    if client is None:
-        await message.answer("Нет подходящего прокси. Добавьте прокси или укажите часть адреса: /race 30 45.15.237")
+    proxies = _race_proxies(next((a for a in args if not a.isdigit()), None))
+    if not proxies:
+        await message.answer("Нет подходящего прокси. Добавьте прокси или укажите часть адреса: /race 10 45.15.237")
         return
 
     root = Path(__file__).resolve().parent.parent
     log_path = root / "logs" / "api_race.log"
     log_path.parent.mkdir(exist_ok=True)
-    label = _proxy_host(client.proxy_url)
+    label = f"{len(proxies)} прокси, первый {_proxy_host(proxies[0])}"
     env = {
         **os.environ,
         "RACE_BOT_TOKEN": config.BOT_TOKEN,
         "RACE_CHAT_ID": str(message.chat.id),
-        "RACE_PROXY": client.proxy_url,
+        "RACE_PROXIES": "\n".join(proxies),
         "RACE_MINUTES": str(minutes),
         "RACE_NO_UPDATES": "1",
-        "RACE_KEEP_PROXY": "1",
         "RACE_LABEL": label,
         "PYTHONIOENCODING": "utf-8",
     }

@@ -6,23 +6,25 @@ Locally, on a PC with a Russian (or Belarusian) exit IP:
     venv\\Scripts\\python.exe tools\\api_race.py            # the race
     venv\\Scripts\\python.exe tools\\api_race.py --check    # one request to each source
 
-On prod the admin command /race starts it as a child process through one of the bot's proxies; it then sends to the
-admin chat through the bot itself and never calls getUpdates (RACE_NO_UPDATES=1), so the bot's polling is untouched.
+On prod the admin command /race starts it as a child process with the bot's proxies; it then sends to the admin chat
+through the bot itself and never calls getUpdates (RACE_NO_UPDATES=1), so the bot's polling is untouched.
 SIGTERM (/race stop) ends the race early and still sends the report.
+
+The site and the API each keep their own proxy and their own session, so a block on one never pauses the other.
+A source that gets blocked (or fails twice in a row) moves to the next proxy at once; the blocked proxy rests
+PROXY_REST_S for that source. The report has a per-proxy table, so «it is just this proxy» can be told apart from
+«Avito guards the API».
 
 Settings come from race.env (git-ignored, next to bot.py) or the same RACE_* environment variables:
     RACE_BOT_TOKEN     bot that receives the report
     RACE_CHAT_ID       optional locally: found by itself after you send /start to the test bot
-    RACE_PROXY         optional: http://user:pass@ip:port for Avito; empty = direct
+    RACE_PROXIES       optional: proxies one per line (http://user:pass@ip:port); the first ones are tried first
+    RACE_PROXY         optional: one proxy (old setting); empty with no RACE_PROXIES = direct
     RACE_WEB_URL       optional: search page, newest first (s=104)
     RACE_API_QUERY     optional: words for the mobile API (default «iphone»)
     RACE_INTERVAL      optional: seconds between rounds (default 15)
     RACE_MINUTES       optional: stop after this many minutes and send the report
     RACE_LOT_MESSAGES  optional: 1 = a message per lot as it is seen (off by default, the report has every lot)
-
-Every round asks both sources one after the other (the order alternates). The report (logs/race_report_*.txt, sent
-as a file) has the verdict, the fair comparison, reliability, failure reasons, completeness, the lot fields the bot
-needs, a per-lot table, a per-round timeline and one raw lot from each source.
 """
 
 from __future__ import annotations
@@ -56,9 +58,9 @@ PHONES_CATEGORY_ID = "84"
 DEFAULT_WEB_URL = "https://www.avito.ru/moskva/telefony/mobilnye_telefony/apple-ASgBAgICAkS0wA3OqzmwwQ2I_Dc?s=104"
 FRESH_S = 15 * 60          # a lot older than this at first sight is not new, only a resort of the list
 SETTLE_S = 10 * 60         # after this, a lot one source never showed counts as «only that source»
-BLOCK_PAUSE_S = 90
-WEB_FAIL_PAUSE_S = 30
+PROXY_REST_S = 5 * 60      # a proxy that blocked a source is not used for that source for this long
 SUMMARY_EVERY_S = 30 * 60
+BLOCK_STATUSES = (302, 403, 429, 439)
 SOURCES = ("web", "api")
 NAMES = {"web": "сайт", "api": "API"}
 CSV_PATH = ROOT / "logs" / "api_race.csv"
@@ -74,6 +76,12 @@ def load_env(path: Path) -> dict:
                 env[key.strip()] = value.strip()
     env.update({key: value for key, value in os.environ.items() if key.startswith("RACE_")})
     return env
+
+
+def proxy_label(proxy: Optional[str]) -> str:
+    if not proxy:
+        return "напрямую"
+    return proxy.rsplit("@", 1)[-1].split("://", 1)[-1]
 
 
 def to_seconds(value) -> Optional[float]:
@@ -123,6 +131,7 @@ def parse_api(data) -> tuple[dict[str, dict], dict]:
         price = value.get("price")
         if isinstance(price, dict):
             price = price.get("current") or price.get("value") or price.get("title") or ""
+        seller = value.get("sellerInfo") if isinstance(value.get("sellerInfo"), dict) else {}
         found[str(ident)] = {
             "label": label or "",
             "title": str(value.get("title") or ""),
@@ -130,7 +139,8 @@ def parse_api(data) -> tuple[dict[str, dict], dict]:
             "pub": to_seconds(value.get("time") or value.get("sortTimeStamp")),
             "url": f"https://www.avito.ru/{ident}" if not uri.startswith("http") else uri,
             "image": _has_image(value),
-            "address": bool(value.get("address") or value.get("location") or value.get("geo")),
+            "address": bool(value.get("address") or value.get("location") or value.get("geo")
+                            or seller.get("logoImageAlt")),
         }
     return found, stats
 
@@ -174,26 +184,34 @@ class Race:
     def __init__(self, env: dict):
         self.token = env.get("RACE_BOT_TOKEN", "")
         self.chat_id = env.get("RACE_CHAT_ID", "")
-        self.proxy = env.get("RACE_PROXY", "")
+        listed = [line.strip() for line in (env.get("RACE_PROXIES") or "").replace(",", "\n").splitlines() if line.strip()]
+        self.proxies: list[Optional[str]] = listed or ([env["RACE_PROXY"]] if env.get("RACE_PROXY") else [None])
+        self.proxy = self.proxies[0] or ""  # kept for --check and old callers
         self.web_url = env.get("RACE_WEB_URL") or DEFAULT_WEB_URL
         self.api_query = env.get("RACE_API_QUERY", "iphone")
         self.api_url = api_url(self.api_query)
         self.interval = float(env.get("RACE_INTERVAL") or 15)
         self.duration_s = float(env.get("RACE_MINUTES") or 0) * 60
         self.no_updates = env.get("RACE_NO_UPDATES") == "1"   # prod: the bot itself polls this token
-        self.keep_proxy = env.get("RACE_KEEP_PROXY") == "1"   # prod: the server IP is banned, never fall back to it
         self.lot_messages = env.get("RACE_LOT_MESSAGES") == "1"
         self.label = env.get("RACE_LABEL", "")
+        # Per source: the proxy in use, failures in a row on it, and when each proxy may be used again.
+        self.current = {"web": 0, "api": min(1, len(self.proxies) - 1)}
+        self.fails_in_row = {"web": 0, "api": 0}
+        self.rest_until = {"web": {}, "api": {}}
+        self.switches = {"web": 0, "api": 0}
+        self.by_proxy: dict[str, dict] = {}                   # label -> {source: {try, ok, block, reasons}}
+        self.web_parsers: dict[str, AvitoParser] = {}
+        self.api_sessions: dict[str, object] = {}
         self.lots: dict[str, dict] = {}
         self.baseline = {"web": False, "api": False}
         self.paused_until = {"web": 0.0, "api": 0.0}
-        self.errors = {"web": 0, "api": 0}                    # failures in a row
+        self.errors = {"web": 0, "api": 0}
         self.answers = {"web": 0, "api": 0}                   # rounds where the source returned a list
         self.blocks = {"web": 0, "api": 0}                    # 302/403/429/439 or a firewall page
         self.reasons = {"web": Counter(), "api": Counter()}   # why a round gave no list
         self.latency_ms = {"web": [], "api": []}              # successful answers only
         self.kb = {"web": [], "api": []}
-        self.requests = {"web": [], "api": []}                # HTTP requests per page fetch (redirects, challenges)
         self.counts = {"web": [], "api": []}
         self.overlap: list[dict] = []                         # rounds where both answered
         self.api_stats = {"types": Counter(), "keys": Counter(), "sample": None, "items": 0}
@@ -204,16 +222,62 @@ class Race:
         self.update_offset = 0
         self.started = time.time()
         self.last_summary = time.time()
-        self.avito = None
-        self.avito_proxy = False
-        self.lock = threading.Lock()
+        self.locks = {"web": threading.Lock(), "api": threading.Lock()}
         self.last_seen = {"web": time.time(), "api": time.time()}
         self.stop_event: Optional[asyncio.Event] = None
         self.stop_reason = ""
         self.tg = curl_requests.AsyncSession(impersonate=BROWSER_PROFILE)
 
-    def new_avito_session(self, use_proxy: bool) -> AvitoParser:
-        return AvitoParser(self.proxy if use_proxy and self.proxy else None)
+    # ── Proxies ───────────────────────────────────────────────────────────
+    def proxy_of(self, source: str) -> Optional[str]:
+        return self.proxies[self.current[source]]
+
+    def proxy_stats(self, proxy: Optional[str], source: str) -> dict:
+        row = self.by_proxy.setdefault(proxy_label(proxy), {s: {"try": 0, "ok": 0, "block": 0, "reasons": Counter()}
+                                                            for s in SOURCES})
+        return row[source]
+
+    def web_parser(self, proxy: Optional[str]) -> AvitoParser:
+        key = proxy_label(proxy)
+        if key not in self.web_parsers:
+            self.web_parsers[key] = AvitoParser(proxy)
+        return self.web_parsers[key]
+
+    def api_session(self, proxy: Optional[str]):
+        key = proxy_label(proxy)
+        if key not in self.api_sessions:
+            kwargs = {"impersonate": BROWSER_PROFILE}
+            if proxy:
+                kwargs["proxies"] = {"http": proxy, "https": proxy}
+            self.api_sessions[key] = curl_requests.Session(**kwargs)
+        return self.api_sessions[key]
+
+    def switch_proxy(self, source: str, rest: bool):
+        """Move the source to the next proxy that is not resting for it and, when there is a choice, not the one
+        the other source uses. When every proxy rests, the source waits for the first one to come back."""
+        now = time.time()
+        if rest:
+            self.rest_until[source][self.current[source]] = now + PROXY_REST_S
+        self.fails_in_row[source] = 0
+        total = len(self.proxies)
+        if total == 1:
+            if rest:
+                self.paused_until[source] = now + PROXY_REST_S
+            return
+        other = self.current["api" if source == "web" else "web"]
+        start = self.current[source]
+        for step in range(1, total + 1):
+            idx = (start + step) % total
+            if self.rest_until[source].get(idx, 0) > now or (idx == other and total > 2):
+                continue
+            if idx != start:
+                self.switches[source] += 1
+                print(f"{source}: переключаюсь на {proxy_label(self.proxies[idx])}")
+            self.current[source] = idx
+            return
+        first_back = min(self.rest_until[source].values(), default=now)
+        self.paused_until[source] = first_back
+        print(f"{source}: все прокси отдыхают, жду {first_back - now:.0f} с")
 
     # ── Telegram ──────────────────────────────────────────────────────────
     async def tg_call(self, method: str, **payload):
@@ -271,111 +335,109 @@ class Race:
     # ── Avito ─────────────────────────────────────────────────────────────
     async def fetch(self, source: str) -> Optional[dict[str, dict]]:
         if time.time() < self.paused_until[source]:
-            self.cur[source] = {"ok": False, "kind": "пауза после блока", "ms": 0}
-            self.reasons[source]["пауза после блока"] += 1
+            self.cur[source] = {"ok": False, "kind": "все прокси отдыхают", "ms": 0, "proxy": "—"}
+            self.reasons[source]["все прокси отдыхают"] += 1
             return None
         return await asyncio.to_thread(self._fetch_sync, source)
 
     def _fetch_sync(self, source: str) -> Optional[dict[str, dict]]:
-        """The page goes through the bot's own fetch (anti-bot cookies, PoW, redirects); the API request reuses
-        that session's cookies. One request at a time: the session is not thread-safe."""
-        with self.lock:
+        """Each source has its own lock, proxy and session: the two requests of a round never wait for each other."""
+        with self.locks[source]:
+            proxy = self.proxy_of(source)
+            stats = self.proxy_stats(proxy, source)
             started = time.monotonic()
-            info: dict = {"ok": False}
+            info: dict = {"ok": False, "proxy": proxy_label(proxy)}
             try:
-                found = self._fetch_locked(source, info)
+                found = self._fetch_locked(source, proxy, info)
             except Exception as exc:  # a bug here must cost one round, not the race
                 found, info["kind"] = None, f"сбой {type(exc).__name__}: {str(exc)[:80]}"
             info["ms"] = int((time.monotonic() - started) * 1000)
             info["ok"] = found is not None
             self.last_seen[source] = time.time()
+            stats["try"] += 1
             if found is not None:
+                stats["ok"] += 1
+                self.fails_in_row[source] = 0
                 self.latency_ms[source].append(info["ms"])
                 self.counts[source].append(len(found))
                 if info.get("kb"):
                     self.kb[source].append(info["kb"])
             else:
-                self.reasons[source][info.get("kind") or "?"] += 1
+                kind = info.get("kind") or "?"
+                self.reasons[source][kind] += 1
+                stats["reasons"][kind] += 1
+                if info.get("blocked"):
+                    stats["block"] += 1
+                    self.blocks[source] += 1
+                    self.switch_proxy(source, rest=True)
+                else:
+                    self.fails_in_row[source] += 1
+                    if self.fails_in_row[source] >= 2:
+                        self.switch_proxy(source, rest=False)
             self.cur[source] = info
             return found
 
-    def _fetch_locked(self, source: str, info: dict) -> Optional[dict[str, dict]]:
+    def _fetch_locked(self, source: str, proxy: Optional[str], info: dict) -> Optional[dict[str, dict]]:
         if source == "web":
+            parser = self.web_parser(proxy)
             fail = None
             try:
-                page = self.avito.fetch_page(self.web_url)
+                page = parser.fetch_page(self.web_url)
             except Exception as exc:
                 page = None
                 info["kind"] = f"исключение {type(exc).__name__}: {str(exc)[:80]}"
             else:
-                fail = getattr(self.avito, "last_failure", None)
-            self.requests["web"].append(int(getattr(self.avito, "last_http_requests", 0) or 0))
+                fail = getattr(parser, "last_failure", None)
             if not page:
                 status = getattr(fail, "status", None)
                 kind = str(getattr(fail, "kind", "") or "")
                 if fail is not None:
                     info["kind"] = (kind or "?") + (f" {status}" if status else "")
-                    info["status"] = status
                     detail = str(getattr(fail, "detail", "") or "")
                     if detail:
                         info["body"] = detail[:160]
-                self.errors["web"] += 1
-                # Only a block pauses the site: a timeout or a broken connection is retried next round, otherwise
-                # the site loses rounds the API keeps and the comparison tilts towards the API.
-                if status in (302, 403, 429, 439) or any(word in kind for word in ("block", "forbidden", "captcha")):
-                    self.blocks["web"] += 1
-                    self.paused_until["web"] = time.time() + WEB_FAIL_PAUSE_S
-                print(f"web: страница не загрузилась ({info.get('kind')})")
-                self.maybe_drop_proxy("web")
+                # A cooldown is the parser remembering a block on this proxy: for the race it is a block too.
+                info["blocked"] = status in BLOCK_STATUSES or any(
+                    word in kind for word in ("block", "forbidden", "captcha", "challenge", "cooldown"))
+                print(f"web [{proxy_label(proxy)}]: страница не загрузилась ({info.get('kind')})")
                 return None
-            info["status"] = 200
             info["kb"] = round(len(page.encode("utf-8", errors="ignore")) / 1024)
             found, stats = parse_web(page)
             if found is None:
                 info["kind"] = "нет каталога на странице"
-                print("web: на странице нет каталога (заглушка или логин)")
+                info["blocked"] = True  # a stub instead of the catalog is how Avito hides a soft block
                 return None
             self.web_stats["promo"].append(stats["promo"])
             if self.web_stats["sample"] is None:
                 self.web_stats["sample"] = stats["sample"]
-            self.errors["web"] = 0
             return found
 
         headers = {"Accept": "application/json", "Referer": "https://m.avito.ru/"}
         try:
-            resp = self.avito.session.get(self.api_url, headers=headers, timeout=20, allow_redirects=False)
+            resp = self.api_session(proxy).get(self.api_url, headers=headers, timeout=20, allow_redirects=False)
         except Exception as exc:
-            self.errors["api"] += 1
             text = str(exc)
             info["kind"] = ("таймаут" if "timed out" in text.lower() or "timeout" in text.lower()
                             else f"сеть {type(exc).__name__}")
             info["body"] = text[:160]
-            print(f"api: {type(exc).__name__}: {text[:120]}")
-            self.maybe_drop_proxy("api")
+            print(f"api [{proxy_label(proxy)}]: {type(exc).__name__}: {text[:120]}")
             return None
-        info["status"] = resp.status_code
         info["kb"] = round(len(resp.content or b"") / 1024)
-        if AvitoParser._is_firewall(resp):
-            self.errors["api"] += 1
-            self.blocks["api"] += 1
+        if resp.status_code in BLOCK_STATUSES or AvitoParser._is_firewall(resp):
             info["kind"] = f"блок {resp.status_code}"
-            self.paused_until["api"] = time.time() + BLOCK_PAUSE_S
-            print(f"api: блок {resp.status_code}, пауза {BLOCK_PAUSE_S} с")
-            self.maybe_drop_proxy("api")
+            info["blocked"] = True
+            print(f"api [{proxy_label(proxy)}]: блок {resp.status_code}")
             return None
         if resp.status_code != 200:
-            self.errors["api"] += 1
             info["kind"] = f"HTTP {resp.status_code}"
             info["body"] = resp.text[:160]
-            print(f"api: HTTP {resp.status_code} {resp.text[:160]!r}")
+            print(f"api [{proxy_label(proxy)}]: HTTP {resp.status_code} {resp.text[:160]!r}")
             return None
         try:
             data = resp.json()
         except Exception:
-            self.errors["api"] += 1
             info["kind"] = "не JSON"
             info["body"] = resp.text[:160]
-            print(f"api: не JSON {resp.text[:160]!r}")
             return None
         found, stats = parse_api(data)
         self.api_stats["types"].update(stats["types"])
@@ -384,24 +446,22 @@ class Race:
         if self.api_stats["sample"] is None:
             self.api_stats["sample"] = stats["sample"]
         if stats["items"] == 0:
-            info["body"] = resp.text[:160]  # an empty list is an answer, but the report shows what came
-        self.errors["api"] = 0
+            info["body"] = resp.text[:160]
         return found
-
-    def maybe_drop_proxy(self, source: str):
-        """A blocked or dead proxy is dropped once for the whole race: both sources go direct from then on."""
-        if self.keep_proxy:
-            return
-        if self.proxy and self.avito_proxy and "--check" not in sys.argv and self.errors[source] >= 2:
-            print("прокси не работает — дальше напрямую")
-            self.avito_proxy = False
-            self.avito = self.new_avito_session(False)
-            self.paused_until = {"web": 0.0, "api": 0.0}
 
     # ── Lots ──────────────────────────────────────────────────────────────
     def _new_lot(self, info: dict, done: bool, base: bool, stale: bool = False) -> dict:
-        return {**info, "web": None, "api": None, "web_r": None, "api_r": None, "msg": None,
-                "done": done, "base": base, "stale": stale}
+        return {"title": info.get("title", ""), "price": info.get("price", ""), "url": info.get("url", ""),
+                "pub": info.get("pub"), "label": info.get("label", ""), "web": None, "api": None,
+                "web_r": None, "api_r": None, "msg": None, "done": done, "base": base, "stale": stale}
+
+    def _remember_fields(self, lot: dict, source: str, info: dict):
+        """What this very source gave for the lot: the field check must not borrow the other source's data."""
+        lot[f"{source}_fields"] = {key: bool(info.get(key)) for key in ("price", "pub", "image", "address")}
+        if not lot.get("pub") and info.get("pub"):
+            lot["pub"] = info["pub"]
+        if info.get("label"):
+            lot["label"] = info["label"]
 
     async def note(self, source: str, found: dict[str, dict], seen_at: float, round_no: int):
         if not self.baseline[source]:
@@ -421,11 +481,7 @@ class Race:
             if lot[source] is not None:
                 continue
             lot[source], lot[f"{source}_r"] = seen_at, round_no
-            for key in ("pub", "image", "address", "price"):
-                if not lot.get(key) and info.get(key):
-                    lot[key] = info[key]
-            if info.get("label"):
-                lot["label"] = info["label"]
+            self._remember_fields(lot, source, info)
             if lot["done"]:
                 continue
             if lot[other] is None:
@@ -500,13 +556,39 @@ class Race:
                 res["rows"].append((ident, lot, f"только {NAMES[src]} (у соперника потом {later_ok} ответов)", src))
         return res
 
+    def field_share(self, source: str, key: str) -> Optional[float]:
+        rows = [lot[f"{source}_fields"] for lot in self.lots.values() if lot.get(f"{source}_fields")]
+        return sum(1 for f in rows if f.get(key)) / len(rows) if rows else None
+
+    def proxy_verdict(self) -> list[str]:
+        """Is it one bad proxy or Avito guarding the API? Count proxies where the site worked and the API did not."""
+        site_ok = [label for label, row in self.by_proxy.items() if row["web"]["ok"]]
+        api_tried = [label for label, row in self.by_proxy.items() if row["api"]["try"]]
+        api_ok = [label for label in api_tried if self.by_proxy[label]["api"]["ok"]]
+        api_dead_where_site_ok = [label for label in api_tried if label in site_ok
+                                  and not self.by_proxy[label]["api"]["ok"]]
+        api_blocked = [label for label in api_tried if self.by_proxy[label]["api"]["block"]
+                       and not self.by_proxy[label]["api"]["ok"]]
+        lines = [f"Прокси: API пробовали на {len(api_tried)}, ответил хоть раз на {len(api_ok)}, "
+                 f"заблокирован на {len(api_blocked)}; сайт ответил хоть раз на {len(site_ok)}"]
+        if not site_ok and not api_ok:
+            lines.append("Ни сайт, ни API не ответили ни на одном прокси — дело в прокси или сети, а не в API")
+        elif len(api_tried) >= 3 and not api_ok and len(api_blocked) >= 2:
+            lines.append(f"API заблокирован на всех {len(api_tried)} прокси, а сайт работал на {len(site_ok)} — "
+                         "дело не в конкретном прокси, Авито закрывает API")
+        elif api_dead_where_site_ok:
+            lines.append(f"На {len(api_dead_where_site_ok)} прокси сайт работал, а API нет — API охраняют строже")
+        elif api_ok and len(api_blocked):
+            lines.append(f"API блокировали на {len(api_blocked)} прокси, но на {len(api_ok)} он работал — "
+                         "часть прокси просто плохие")
+        return lines
+
     def verdict(self, res: dict) -> list[str]:
         n = max(1, self.rounds)
         ok = {s: self.answers[s] / n for s in SOURCES}
         fair_api, fair_web = res["fair"]["api"], res["fair"]["web"]
         fair_total = len(fair_api) + len(fair_web)
-        api_lots = [lot for lot in self.lots.values() if lot.get("api") and not lot.get("base")]
-        api_pub_share = (sum(1 for lot in api_lots if lot.get("pub")) / len(api_lots)) if api_lots else None
+        api_pub_share = self.field_share("api", "pub")
         enough = ok["web"] >= 0.7 and ok["api"] >= 0.7 and fair_total >= 10
         api_share = len(fair_api) / fair_total if fair_total else 0.0
         api_leads = [s for s, _ in fair_api]
@@ -520,10 +602,13 @@ class Race:
         if ok["api"] < ok["web"] - 0.1:
             problems.append(f"API отвечает реже сайта ({pct(self.answers['api'], n)} против {pct(self.answers['web'], n)})")
         if api_pub_share is not None and api_pub_share < 0.9:
-            problems.append(f"у {100 - api_pub_share * 100:.0f}% лотов API нет своего времени публикации")
+            problems.append(f"у {100 - api_pub_share * 100:.0f}% лотов API нет своего времени публикации "
+                            "(только надпись «N минут назад»)")
+        if self.api_stats["types"] and set(self.api_stats["types"]) <= {"item", "None"} and any(self.web_stats["promo"]):
+            problems.append("в API нет пометки рекламы: рекламные лоты уйдут как новые")
 
         if not enough:
-            head = "⚪️ МАЛО ДАННЫХ — окончательный вывод делать нельзя"
+            head = "⚪️ МАЛО ДАННЫХ — окончательный вывод по скорости делать нельзя"
         elif faster and not problems:
             head = "🟢 ПЕРЕХОДИТЬ СТОИТ: API быстрее, не пропускает лоты и отвечает не хуже сайта"
         elif faster:
@@ -536,10 +621,10 @@ class Race:
                          + (f", отрыв API медиана {statistics.median(api_leads):.0f} с" if api_leads else ""))
         if not enough:
             if ok["web"] < 0.7 or ok["api"] < 0.7:
-                lines.append(f"Ответов: сайт {pct(self.answers['web'], n)}, API {pct(self.answers['api'], n)} "
-                             "(нужно ≥70% у обоих) — смените прокси")
+                lines.append(f"Ответов: сайт {pct(self.answers['web'], n)}, API {pct(self.answers['api'], n)} (нужно ≥70% у обоих)")
             if fair_total < 10:
-                lines.append(f"Честно сравнимых лотов {fair_total} (нужно ≥10) — гонку дольше или поиск оживлённее")
+                lines.append(f"Честно сравнимых лотов {fair_total} (нужно ≥10)")
+        lines += self.proxy_verdict()
         lines += [f"⚠️ {p}" for p in problems]
         return lines
 
@@ -549,17 +634,18 @@ class Race:
         minutes = (time.time() - self.started) / 60
         took = f"{minutes:.0f} мин" if minutes < 120 else f"{minutes / 60:.1f} ч"
         fair_api, fair_web = res["fair"]["api"], res["fair"]["web"]
-        lines = [f"📊 <b>Итоги за {took}</b> ({self.rounds} раундов по {self.interval:.0f} с)"]
+        lines = [f"📊 <b>Итоги за {took}</b> ({self.rounds} раундов по {self.interval:.0f} с, прокси {len(self.proxies)})"]
         lines += [html.escape(line) for line in self.verdict(res)]
         lines += [
             "",
             f"Честно: API раньше {len(fair_api)}, сайт раньше {len(fair_web)}",
-            f"Неясно: API {len(res['unclear']['api'])}, сайт {len(res['unclear']['web'])}, в одном раунде {res['same']}",
             f"Ответили: сайт {self.answers['web']} из {n}, API {self.answers['api']} из {n}",
-            f"Блоков: сайт {self.blocks['web']}, API {self.blocks['api']}",
+            f"Блоков: сайт {self.blocks['web']}, API {self.blocks['api']} · смен прокси: сайт {self.switches['web']}, "
+            f"API {self.switches['api']}",
             "Подробности — в файле, перешлите его целиком.",
         ]
-        return "\n".join(lines)
+        text = "\n".join(lines)
+        return text if len(text) <= 1000 else text[:990] + "…"
 
     def report(self) -> str:
         res = self.classify()
@@ -567,11 +653,12 @@ class Race:
         now = time.time()
         out: list[str] = []
         add = out.append
-        add("ГОНКА: САЙТ ПРОТИВ МОБИЛЬНОГО API")
+        add("ГОНКА: САЙТ ПРОТИВ МОБИЛЬНОГО API (свой прокси у каждого, смена прокси при блоке)")
         add(f"Начало {time.strftime('%d.%m %H:%M:%S', time.localtime(self.started))}, длительность "
             f"{(now - self.started) / 60:.1f} мин, раундов {self.rounds}, интервал {self.interval:.0f} с"
             + (f", остановлено: {self.stop_reason}" if self.stop_reason else ""))
-        add(f"Канал: {self.label or ('прокси' if self.proxy else 'напрямую')}")
+        add(f"Прокси в запасе: {len(self.proxies)}; заблокированный прокси отдыхает {PROXY_REST_S // 60} мин для того "
+            "источника, где его заблокировали")
         add(f"Сайт: {self.web_url}")
         add(f"API:  {self.api_url.replace(MOBILE_API_KEY, 'KEY')}")
         add("Фильтры не идентичны (сайт — бренд Apple в телефонах, API — категория телефоны + «"
@@ -579,6 +666,14 @@ class Race:
         add("")
         add("== ВЕРДИКТ ==")
         out.extend(self.verdict(res))
+        add("")
+        add("== ПРОКСИ ==")
+        add("прокси | сайт: ответил/попыток, блоков | API: ответил/попыток, блоков | причины")
+        for label, row in sorted(self.by_proxy.items(), key=lambda kv: -(kv[1]["web"]["try"] + kv[1]["api"]["try"])):
+            w, a = row["web"], row["api"]
+            why = "; ".join(f"{NAMES[s]}: " + ", ".join(f"{k} {v}" for k, v in row[s]["reasons"].most_common(3))
+                            for s in SOURCES if row[s]["reasons"])
+            add(f"{label} | {w['ok']}/{w['try']}, {w['block']} | {a['ok']}/{a['try']}, {a['block']} | {why}")
         add("")
         add("== СКОРОСТЬ (новые лоты, которые показали оба) ==")
         add("Честно = в раунде, где победитель впервые показал лот, проигравший тоже ответил, но лота у него не было.")
@@ -594,7 +689,7 @@ class Race:
         add(f"В одном раунде: {res['same']}")
         ages = {s: [lot[s] - lot["pub"] for _, lot, _, _ in res["rows"] if lot.get(s) and lot.get("pub")]
                 for s in SOURCES}
-        add(f"От публикации до появления, медиана: сайт {med(ages['web'])}, API {med(ages['api'])}; "
+        add(f"От публикации (время с сайта) до появления, медиана: сайт {med(ages['web'])}, API {med(ages['api'])}; "
             f"p90: сайт {p90(ages['web']):.0f} с, API {p90(ages['api']):.0f} с")
         add("")
         add("== ПОЛНОТА ==")
@@ -615,21 +710,17 @@ class Race:
         for src in SOURCES:
             lat = self.latency_ms[src]
             add(f"{NAMES[src]}: ответил {self.answers[src]} из {n} раундов ({pct(self.answers[src], n)}), "
-                f"блоков {self.blocks[src]}, время ответа медиана {med(lat, ' мс')}, p90 {p90(lat):.0f} мс, "
-                f"размер медиана {med(self.kb[src], ' КБ')}"
-                + (f", HTTP-запросов на страницу медиана {med(self.requests[src], '')}" if self.requests[src] else ""))
+                f"блоков {self.blocks[src]}, смен прокси {self.switches[src]}, время ответа медиана {med(lat, ' мс')}, "
+                f"p90 {p90(lat):.0f} мс, размер медиана {med(self.kb[src], ' КБ')}")
             reasons = ", ".join(f"{k} — {v}" for k, v in self.reasons[src].most_common(8))
             add(f"   почему не ответил: {reasons or 'всегда отвечал'}")
         add("")
-        add("== ПОЛЯ ДЛЯ УВЕДОМЛЕНИЯ (новые лоты) ==")
+        add("== ПОЛЯ ДЛЯ УВЕДОМЛЕНИЯ (только то, что дал сам источник, новые лоты) ==")
         for src in SOURCES:
-            seen = [lot for lot in self.lots.values() if lot.get(src) and not lot.get("base")]
-            if seen:
-                total = len(seen)
-                add(f"{NAMES[src]}: лотов {total}, с ценой {pct(sum(1 for x in seen if x.get('price')), total)}, "
-                    f"со временем публикации {pct(sum(1 for x in seen if x.get('pub')), total)}, "
-                    f"с фото {pct(sum(1 for x in seen if x.get('image')), total)}, "
-                    f"с адресом {pct(sum(1 for x in seen if x.get('address')), total)}")
+            shares = {key: self.field_share(src, key) for key in ("price", "pub", "image", "address")}
+            if shares["price"] is not None:
+                add(f"{NAMES[src]}: с ценой {shares['price'] * 100:.0f}%, со временем публикации {shares['pub'] * 100:.0f}%, "
+                    f"с фото {shares['image'] * 100:.0f}%, с адресом {shares['address'] * 100:.0f}%")
         if self.api_stats["items"]:
             keys = ", ".join(f"{k} {v * 100 // self.api_stats['items']}%"
                              for k, v in self.api_stats["keys"].most_common(40))
@@ -652,14 +743,15 @@ class Race:
         add(f"Старых лотов, поднятых в выдаче (не считались): {sum(1 for lot in self.lots.values() if lot.get('stale'))}")
         add("")
         add("== РАУНДЫ ==")
-        add("№ | время | первым спрашивали | сайт: итог мс КБ лотов | API: итог мс КБ лотов")
+        add("№ | время | первым спрашивали | сайт: итог мс КБ лотов [прокси] | API: итог мс КБ лотов [прокси]")
         for row in self.timeline:
             def part(src):
                 info = row.get(src) or {}
+                via = f" [{info.get('proxy', '?')}]"
                 if info.get("ok"):
-                    return f"ok {info.get('ms', 0)} {info.get('kb', '')} {info.get('count', '')}"
+                    return f"ok {info.get('ms', 0)} {info.get('kb', '')} {info.get('count', '')}{via}"
                 body = f" «{info['body'][:70]}»" if info.get("body") else ""
-                return f"× {info.get('kind', '?')} {info.get('ms', 0)}{body}"
+                return f"× {info.get('kind', '?')} {info.get('ms', 0)}{via}{body}"
             add(f"{row['n']} | {time.strftime('%H:%M:%S', time.localtime(row['t']))} | {NAMES[row['order']]} | "
                 f"{part('web')} | {part('api')}")
         add("")
@@ -705,27 +797,25 @@ class Race:
             asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, self.request_stop)
         except (NotImplementedError, AttributeError, RuntimeError):
             pass  # Windows: Ctrl+C is handled in main()
-        self.avito_proxy = bool(self.proxy)
-        self.avito = self.new_avito_session(self.avito_proxy)
-        print(f"Сайт: {self.web_url}\nAPI:  {self.api_url}\nПрокси: {'да' if self.proxy else 'нет'}")
+        print(f"Сайт: {self.web_url}\nAPI:  {self.api_url}\nПрокси: {len(self.proxies)}")
         while not self.chat_id:
             print("Напиши /start тестовому боту…")
             await self.poll_updates(wait=25)
         if self.update_offset == 0:
             await self.poll_updates()
         minutes = f" на {self.duration_s / 60:.0f} мин" if self.duration_s else ""
-        via = f" через {html.escape(self.label)}" if self.label else ""
-        await self.send(f"🏁 Гонка запущена{minutes}{via}: сайт против мобильного API. "
-                        "В конце придёт файл-отчёт с вердиктом.")
+        via = f" · прокси в запасе: {len(self.proxies)}" if self.proxies[0] else " · напрямую"
+        await self.send(f"🏁 Гонка запущена{minutes}{via}: сайт против мобильного API, у каждого свой прокси, "
+                        "при блоке — смена. В конце придёт файл-отчёт с вердиктом.")
         self.started = self.last_summary = time.time()  # the clock starts after /start, not while waiting for it
         while not self.stop_event.is_set():
             tick = time.monotonic()
-            # One session, so the two requests go one after the other; the order alternates so neither source
-            # is always second, and each source's lots are stamped with the time its own answer came back.
+            # Own sessions and proxies: both requests go out at the same moment, neither waits for the other.
             order = ("web", "api") if self.rounds % 2 == 0 else ("api", "web")
             self.cur = {}
             round_t = time.time()
-            results = {source: await self.fetch(source) for source in order}
+            fetched = await asyncio.gather(*(self.fetch(source) for source in order))
+            results = dict(zip(order, fetched))
             self.rounds += 1
             row = {"n": self.rounds, "t": round_t, "order": order[0]}
             for source in SOURCES:
@@ -742,8 +832,8 @@ class Race:
                 self.note_overlap(results["web"], results["api"])
             self.settle(time.time())
             web, api = results["web"], results["api"]
-            print(f"{time.strftime('%H:%M:%S')} раунд {self.rounds}: сайт {len(web) if web is not None else '×'}, "
-                  f"API {len(api) if api is not None else '×'}")
+            print(f"{time.strftime('%H:%M:%S')} раунд {self.rounds}: сайт {len(web) if web is not None else '×'} "
+                  f"[{row['web'].get('proxy')}], API {len(api) if api is not None else '×'} [{row['api'].get('proxy')}]")
             if self.duration_s and time.time() - self.started >= self.duration_s:
                 break
             if not self.no_updates and time.time() - self.last_summary >= SUMMARY_EVERY_S:
@@ -759,13 +849,11 @@ class Race:
 
 
 async def check(race: "Race"):
-    """--check: one request to each source, no Telegram. Shows whether the API answers at all."""
-    for use_proxy in ([True, False] if race.proxy else [False]):
-        race.avito_proxy = use_proxy
-        race.avito = race.new_avito_session(use_proxy)
-        race.paused_until = {"web": 0.0, "api": 0.0}  # a block on the proxy must not skip the direct try
-        race.errors = {"web": 0, "api": 0}
-        print(f"\n=== {'через прокси' if use_proxy else 'напрямую'} ===")
+    """--check: one request to each source through each proxy (at most 5), no Telegram."""
+    for idx, proxy in enumerate(race.proxies[:5]):
+        race.current = {"web": idx, "api": idx}
+        race.paused_until = {"web": 0.0, "api": 0.0}
+        print(f"\n=== {proxy_label(proxy)} ===")
         for source in ("api", "web"):
             found = await race.fetch(source)
             info = race.cur.get(source) or {}
@@ -778,8 +866,6 @@ async def check(race: "Race"):
             print(f"{name}: OK, {len(found)} лотов за {info.get('ms', 0)} мс, {info.get('kb', '?')} КБ{newest}")
             for ident, lot in list(found.items())[:3]:
                 print(f"   {ident} · {lot['title'][:45]} · {lot['price']} {lot.get('label', '')}")
-        if not race.errors["api"] and not race.errors["web"]:
-            break
 
 
 def main():
