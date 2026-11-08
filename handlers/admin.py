@@ -2388,6 +2388,93 @@ async def cmd_admin_load(message: Message):
     await _send_load_report(message, max(1, min(minutes, LOAD_MAX_MINUTES)))
 
 
+_RACE: dict = {}  # the running /race: {"proc", "task", "label", "until"}
+RACE_DEFAULT_MINUTES, RACE_MAX_MINUTES = 30, 180
+
+
+def _race_proxy(arg: str | None):
+    """The proxy for /race: the one whose address contains `arg`, else a good one that is not among the 3 best
+    (a race doubles the requests through its IP, the best channels must keep scanning)."""
+    from proxy_pool import get_proxy_pool
+
+    proxies = [c for c in get_proxy_pool().clients if not c.is_direct and c.proxy_url]
+    if arg:
+        return next((c for c in proxies if arg in _proxy_host(c.proxy_url)), None)
+    ranked = sorted(proxies, key=lambda c: c.long_health(), reverse=True)
+    spare = ranked[3:] if len(ranked) > 3 else ranked[-1:]
+    return next((c for c in spare if c.state != "quarantined"), spare[0] if spare else None)
+
+
+async def _race_watch(message: Message, proc, log_path) -> None:
+    code = await proc.wait()
+    _RACE.clear()
+    if code not in (0, -9, -15):
+        try:
+            tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
+        except OSError:
+            tail = []
+        await message.answer(
+            f"⚠️ Гонка остановилась с ошибкой (код {code}).\n<pre>{html.escape(chr(10).join(tail))[:3000]}</pre>",
+            parse_mode="HTML",
+        )
+
+
+@router.message(Command("race"))
+async def cmd_admin_race(message: Message):
+    """/race [минуты] [часть адреса прокси] — сайт против мобильного API через прокси бота; /race stop — остановить."""
+    import os
+    import sys
+    from pathlib import Path
+
+    if not config.is_admin(message.from_user.id):
+        return
+    args = (message.text or "").split()[1:]
+    proc = _RACE.get("proc")
+    if args and args[0].lower() in ("stop", "стоп"):
+        if proc is None or proc.returncode is not None:
+            await message.answer("Гонка не запущена.")
+            return
+        proc.terminate()
+        await message.answer("⏹ Гонка остановлена. Строки — в logs/api_race.csv на сервере.")
+        return
+    if proc is not None and proc.returncode is None:
+        left = max(0, int((_RACE["until"] - time.time()) / 60))
+        await message.answer(f"Гонка уже идёт через {html.escape(_RACE['label'])}, осталось ~{left} мин. /race stop — остановить.")
+        return
+
+    minutes = next((int(a) for a in args if a.isdigit()), RACE_DEFAULT_MINUTES)
+    minutes = max(1, min(minutes, RACE_MAX_MINUTES))
+    client = _race_proxy(next((a for a in args if not a.isdigit()), None))
+    if client is None:
+        await message.answer("Нет подходящего прокси. Добавьте прокси или укажите часть адреса: /race 30 45.15.237")
+        return
+
+    root = Path(__file__).resolve().parent.parent
+    log_path = root / "logs" / "api_race.log"
+    log_path.parent.mkdir(exist_ok=True)
+    label = _proxy_host(client.proxy_url)
+    env = {
+        **os.environ,
+        "RACE_BOT_TOKEN": config.BOT_TOKEN,
+        "RACE_CHAT_ID": str(message.chat.id),
+        "RACE_PROXY": client.proxy_url,
+        "RACE_MINUTES": str(minutes),
+        "RACE_NO_UPDATES": "1",
+        "RACE_KEEP_PROXY": "1",
+        "RACE_LABEL": label,
+        "PYTHONIOENCODING": "utf-8",
+    }
+    with log_path.open("ab") as log_file:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-u", str(root / "tools" / "api_race.py"),
+            cwd=str(root), env=env, stdout=log_file, stderr=asyncio.subprocess.STDOUT,
+        )
+    _RACE.update(proc=proc, label=label, until=time.time() + minutes * 60)
+    _RACE["task"] = asyncio.create_task(_race_watch(message, proc, log_path))
+    await database.log_admin_action(message.from_user.id, None, "race", f"{minutes} мин через {label}")
+    logger.info("Admin %s started /race for %s min via %s", message.from_user.id, minutes, label)
+
+
 @router.message(Command("ready"))
 async def cmd_admin_ready(message: Message):
     if not config.is_admin(message.from_user.id):

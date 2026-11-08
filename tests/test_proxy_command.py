@@ -1,5 +1,6 @@
 """Proxy management from the bot: add any number of proxies, drop same-IP duplicates, probe, persist, hot-swap."""
 
+import asyncio
 import tempfile
 import time
 import unittest
@@ -150,6 +151,21 @@ class TestProxyCommand(ProxyEnvMixin, unittest.IsolatedAsyncioTestCase):
         call.message = Mock(answer=AsyncMock())
         await admin.cb_admin_net_samenet(call)
         self.assertEqual(await database.get_proxy_urls(), [PROXY_URL])
+
+    async def test_race_runs_through_a_pool_proxy_without_polling_telegram(self):
+        await admin._save_proxy_list([PROXY_URL])
+        message, _ = make_message("/race 15")
+        message.chat = Mock(id=config.ADMIN_ID)
+        proc = Mock(returncode=None, wait=AsyncMock(return_value=0))
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as spawn:
+            await admin.cmd_admin_race(message)
+            await asyncio.sleep(0)
+        env = spawn.await_args.kwargs["env"]
+        self.assertEqual(env["RACE_PROXY"], PROXY_URL)
+        self.assertEqual(env["RACE_MINUTES"], "15")
+        self.assertEqual(env["RACE_NO_UPDATES"], "1")
+        self.assertTrue(spawn.await_args.args[2].endswith("api_race.py"))
+        admin._RACE.clear()
 
     async def test_proxy_exiting_from_the_server_ip_is_rejected(self):
         message, status = make_message(f"/proxy {PROXY_RAW}")
