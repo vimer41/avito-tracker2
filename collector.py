@@ -67,13 +67,14 @@ async def collect_source(
     can_fast_skip: bool = False,
     last_top_ids: tuple[str, ...] = (),
     read_next_page: Optional[Callable[[list[AvitoItem]], Awaitable[bool]]] = None,
+    deadline_seconds: Optional[float] = None,
 ) -> Optional[SourceCollection]:
     """
     read_next_page, when given, is asked after each page whether the next one is worth fetching
     (a broad radar flooded with new lots); without it every page up to max_pages is read.
     """
     started = time.monotonic()
-    deadline = started + config.AVITO_FETCH_TIMEOUT
+    deadline = started + float(deadline_seconds or config.AVITO_FETCH_TIMEOUT)
     page_limit = max(1, int(max_pages if max_pages is not None else config.AVITO_MAX_PAGES_PER_SCAN))
     items_by_id = {}
     discovery_times = {}

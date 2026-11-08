@@ -83,8 +83,17 @@ async def exit_ips_for(proxy_urls: list[Optional[str]], concurrency: int = 5) ->
     return dict(zip(proxy_urls, values))
 
 
-async def probe_channel(proxy_url: Optional[str], target_url: Optional[str] = None, attempts: int = 3) -> ProbeResult:
-    """Run `attempts` back-to-back single-page scans through a throwaway client for this channel."""
+async def probe_channel(
+    proxy_url: Optional[str],
+    target_url: Optional[str] = None,
+    attempts: int = 3,
+    *,
+    deadline_seconds: Optional[float] = None,
+    stop_on_failure: bool = False,
+) -> ProbeResult:
+    """Run `attempts` back-to-back single-page scans through a throwaway client for this channel.
+    deadline_seconds gives each scan longer than a live one; stop_on_failure ends at the first failed scan
+    (a blocked throwaway client would only answer «cooldown» to the next one)."""
     target = AvitoParser.normalize_url(target_url or DEFAULT_PROBE_URL)
     client = ProxyClient(proxy_url)
     parser = AvitoParser(proxy_client=client)
@@ -92,7 +101,7 @@ async def probe_channel(proxy_url: Optional[str], target_url: Optional[str] = No
     try:
         for _ in range(max(1, attempts)):
             started = time.monotonic()
-            collection = await collect_source(parser, target, max_pages=1)
+            collection = await collect_source(parser, target, max_pages=1, deadline_seconds=deadline_seconds)
             elapsed_ms = int((time.monotonic() - started) * 1000)
             if collection is not None:
                 result.attempts.append(ProbeAttempt(True, elapsed_ms, items=len(collection.items)))
@@ -104,6 +113,8 @@ async def probe_channel(proxy_url: Optional[str], target_url: Optional[str] = No
                 failure=failure.kind if failure else "unknown",
                 status=failure.status if failure else None,
             ))
+            if stop_on_failure:
+                break
     finally:
         parser.close()
         await client.close()

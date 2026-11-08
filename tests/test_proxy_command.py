@@ -167,6 +167,31 @@ class TestProxyCommand(ProxyEnvMixin, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(spawn.await_args.args[2].endswith("api_race.py"))
         admin._RACE.clear()
 
+    async def test_timed_out_proxy_can_be_added_anyway_but_broken_one_cannot(self):
+        broken = "http://user:secret@10.7.7.7:8080"
+        message, status = make_message(f"/proxy {PROXY_RAW}\n{broken}")
+
+        def result_for(url, *args, **kwargs):
+            kind = "timeout" if url == PROXY_URL else "proxy_auth"
+            return ProbeResult(proxy_id="p", masked_url="m", target_url="t",
+                               attempts=[ProbeAttempt(False, 40000, failure=kind)])
+
+        probe_mock = AsyncMock(side_effect=result_for)
+        with patch.object(proxy_check, "exit_ips_for", new=exit_ips({PROXY_URL: "10.1.2.3", broken: "10.7.7.7"})), \
+                patch.object(proxy_check, "probe_channel", new=probe_mock):
+            await admin.cmd_admin_proxy(message)
+        self.assertEqual(probe_mock.await_args.kwargs["deadline_seconds"], admin.NEW_PROXY_PROBE_SECONDS)
+        self.assertTrue(probe_mock.await_args.kwargs["stop_on_failure"])
+        self.assertEqual(await database.get_proxy_urls(), [])
+        kb = status.edit_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(kb.inline_keyboard[0][0].callback_data, "admin_net_force_yes")
+        self.assertIn("(1)", kb.inline_keyboard[0][0].text)  # only the timed-out one, not the broken one
+
+        call = Mock(data="admin_net_force_yes", from_user=Mock(id=config.ADMIN_ID), answer=AsyncMock())
+        call.message = Mock(answer=AsyncMock())
+        await admin.cb_admin_net_force(call)
+        self.assertEqual(await database.get_proxy_urls(), [PROXY_URL])
+
     async def test_proxy_exiting_from_the_server_ip_is_rejected(self):
         message, status = make_message(f"/proxy {PROXY_RAW}")
         with patch.object(proxy_check, "exit_ips_for", new=exit_ips({PROXY_URL: "203.0.113.1"})), \

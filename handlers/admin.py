@@ -2,6 +2,7 @@ import asyncio
 import html
 import json
 import logging
+import math
 import time
 from aiogram import Router, F, Bot
 from aiogram.filters import Command
@@ -3006,15 +3007,17 @@ async def _probe_target_url() -> str | None:
     return searches[0]["url"] if searches else None
 
 
-async def _probe_many(urls: list, attempts: int) -> dict:
+async def _probe_many(urls: list, attempts: int, *, concurrency: int = PROBE_CONCURRENCY,
+                      deadline_seconds: float | None = None, stop_on_failure: bool = False) -> dict:
     from proxy_check import probe_channel
 
     target = await _probe_target_url()
-    gate = asyncio.Semaphore(PROBE_CONCURRENCY)
+    gate = asyncio.Semaphore(max(1, concurrency))
 
     async def one(url):
         async with gate:
-            return await probe_channel(url, target, attempts=attempts)
+            return await probe_channel(url, target, attempts=attempts, deadline_seconds=deadline_seconds,
+                                       stop_on_failure=stop_on_failure)
 
     results = await asyncio.gather(*(one(url) for url in urls))
     return dict(zip(urls, results))
@@ -3220,7 +3223,8 @@ async def _add_proxies(message: Message, raw: str) -> None:
         await message.answer(text, reply_markup=kb, parse_mode="HTML")
         return
 
-    status = await message.answer(f"⏳ Проверяю прокси: {len(candidates)} шт. Это займёт до минуты…")
+    minutes = max(1, math.ceil(len(candidates) * NEW_PROXY_PROBE_SECONDS / 60))
+    status = await message.answer(f"⏳ Проверяю прокси по одному: {len(candidates)} шт. Это займёт до {minutes} мин…")
     pool = get_proxy_pool()
     existing = [client.proxy_url for client in pool.clients if client.proxy_url]
     exit_ips = await exit_ips_for([None, *existing, *candidates])
@@ -3237,17 +3241,27 @@ async def _add_proxies(message: Message, raw: str) -> None:
             taken[ip] = _proxy_host(url)
         unique.append(url)
 
-    results = await _probe_many(unique, attempts=3 if len(unique) == 1 else 2) if unique else {}
+    # One at a time and with time to spare: a new IP meets Avito's check on its first request, and four probes
+    # at once queued behind live scans for the one solver ran out of time (08.11: 9 of 12 «таймаут»).
+    results = await _probe_many(
+        unique, attempts=3 if len(unique) == 1 else 2, concurrency=1,
+        deadline_seconds=NEW_PROXY_PROBE_SECONDS, stop_on_failure=True,
+    ) if unique else {}
     # Neighbours in one subnet are usually banned together by Avito: one working proxy per subnet goes in
     # at once, the rest wait for the admin's «да».
     nets = {_subnet(exit_ips.get(u)): _proxy_host(u) for u in [None, *existing] if exit_ips.get(u)}
-    accepted, held = [], []
+    accepted, held, soft = [], [], []
     for url in unique:
         result = results[url]
         ip = exit_ips.get(url)
         ip_note = f" · IP {ip}" if ip else ""
         if not result.successes:
-            report.append(f"🚫 {html.escape(_proxy_host(url))}{ip_note} — {_probe_summary(result)}, не добавлен")
+            if _probe_failed_hard(result):
+                report.append(f"🚫 {html.escape(_proxy_host(url))}{ip_note} — {_probe_summary(result)}, не добавлен")
+            else:
+                soft.append((url, ip))
+                report.append(f"🚫 {html.escape(_proxy_host(url))}{ip_note} — {_probe_summary(result)}, не добавлен "
+                              "(можно добавить всё равно)")
             continue
         net = _subnet(ip)
         if net and net in nets:
@@ -3270,14 +3284,70 @@ async def _add_proxies(message: Message, raw: str) -> None:
             f"\n⚠️ <b>Из тех же подсетей: {len(held)}.</b> Авито часто банит соседние IP пачкой — если забанят один, "
             "лягут и эти. Вы уверены, что хотите добавить прокси из одних подсетей?"
         )
+    if soft:
+        _PENDING_FORCE[message.from_user.id] = (time.time(), soft)
+        report.append(
+            f"\n⚠️ <b>Не прошли проверку, но не мёртвые: {len(soft)}.</b> Таймаут или блок Авито бывают у нового IP "
+            "в первые минуты. Можно добавить их всё равно — бот сам будет проверять их в работе."
+        )
     text, kb = await _render_net("\n".join(report))
+    extra = []
     if held:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"✅ Да, добавить ещё {len(held)}", callback_data="admin_net_samenet_yes")],
-            [InlineKeyboardButton(text="✖️ Нет, не добавлять", callback_data="admin_net_samenet_no")],
-            *kb.inline_keyboard,
-        ])
+        extra += [[InlineKeyboardButton(text=f"✅ Да, добавить ещё {len(held)}", callback_data="admin_net_samenet_yes")],
+                  [InlineKeyboardButton(text="✖️ Нет, не добавлять", callback_data="admin_net_samenet_no")]]
+    if soft:
+        extra += [[InlineKeyboardButton(text=f"➕ Добавить всё равно ({len(soft)})", callback_data="admin_net_force_yes")],
+                  [InlineKeyboardButton(text="✖️ Не добавлять", callback_data="admin_net_force_no")]]
+    if extra:
+        kb = InlineKeyboardMarkup(inline_keyboard=[*extra, *kb.inline_keyboard])
     await status.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+NEW_PROXY_PROBE_SECONDS = 40
+# admin id -> (when, [(proxy url, exit ip)]) that failed the probe only by timeout or an Avito block.
+_PENDING_FORCE: dict[int, tuple[float, list[tuple[str, str | None]]]] = {}
+
+
+def _probe_failed_hard(result) -> bool:
+    """The proxy itself is broken (wrong password, the seller forbids Avito, refused, no DNS): never add it.
+    A timeout or an Avito block on a new IP is not proof of a dead proxy."""
+    return any(str(a.failure or "").startswith("proxy_") for a in result.attempts)
+
+
+@router.callback_query(F.data.in_({"admin_net_force_yes", "admin_net_force_no"}))
+async def cb_admin_net_force(call: CallbackQuery):
+    from proxy_check import EXIT_IPS
+    from proxy_pool import compute_proxy_id
+
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    when, pending = _PENDING_FORCE.pop(call.from_user.id, (0.0, []))
+    pending = [(u, ip) for u, ip in pending if u not in config.PROXY_URLS]
+    if call.data.endswith("_no"):
+        await call.answer("Не добавлены")
+        text, kb = await _render_net(f"Не добавлены: {len(pending)}.")
+    elif not pending or time.time() - when > SAME_NET_TTL:
+        await call.answer("Список устарел — пришлите прокси заново", show_alert=True)
+        text, kb = await _render_net()
+    else:
+        # The one-proxy-per-subnet rule still holds for proxies added without a passed probe.
+        nets = {_subnet(EXIT_IPS.get(compute_proxy_id(u))) for u in config.PROXY_URLS} - {None}
+        add, skipped = [], []
+        for url, ip in pending:
+            net = _subnet(ip)
+            if net and net in nets:
+                skipped.append(url)
+                continue
+            if net:
+                nets.add(net)
+            add.append(url)
+        await call.answer()
+        note = await _commit_proxies(add, call.from_user.id) if add else "Ничего не добавлено."
+        if skipped:
+            note += f"\nПропущены, подсеть уже занята: {', '.join(html.escape(_proxy_host(u)) for u in skipped)}."
+        text, kb = await _render_net(note)
+    await _show(call, text, kb)
 
 
 # admin id -> (when, working proxies from an already used subnet) waiting for «Да, добавить».
