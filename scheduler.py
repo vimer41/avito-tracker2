@@ -887,6 +887,10 @@ def log_new_lots(radar_id: int, items: list, collection: SourceCollection, previ
         )
 
 
+def tariff_interval(tariff: str) -> float:
+    return float(config.TARIFF_SCAN_INTERVAL.get(tariff, config.TARIFF_SCAN_INTERVAL["base"]))
+
+
 async def process_collected_group_fanout(
     clean_url: str,
     radars_for_url: List[dict],
@@ -917,6 +921,12 @@ async def process_collected_group_fanout(
         return prio
 
     sorted_radars = sorted(radars_for_url, key=get_radar_priority)
+    # The URL is scanned at its fastest tariff, so a slower tariff on it would get lots just as fast. Each radar's
+    # lot waits the gap between its own interval and that fastest one: Базовый (40 с) next to Полный (20 с) +20 с.
+    fastest_interval = min(
+        (tariff_interval(database.classify_user_tariff(r)[0]) for r in radars_for_url),
+        default=tariff_interval("base"),
+    )
     calibrated_radars: List[dict] = []
     deliverable_radar_ids = await database.get_deliverable_search_ids([int(r["id"]) for r in sorted_radars])
 
@@ -1011,6 +1021,7 @@ async def process_collected_group_fanout(
         max_age_min = 5 if (not max_age_raw or int(max_age_raw) <= 0) else min(30, int(max_age_raw))
 
         tariff, priority, delay_sec = database.classify_user_tariff(radar)
+        tariff_hold = max(0.0, tariff_interval(tariff) - fastest_interval)
         is_downtime_catchup = (
             previous_processed_at > 0
             and (now_epoch - previous_processed_at) > (max_age_min * 60)
@@ -1154,7 +1165,8 @@ async def process_collected_group_fanout(
                     "raw_price": it.raw_price or 0,
                     "tariff": tariff,
                     "priority": priority,
-                    "delay_seconds": delay_sec,
+                    # A catch-up lot is already late: it is not held back on top of that.
+                    "delay_seconds": delay_sec + (0.0 if item_is_catchup else tariff_hold),
                     "t_seen": disc_at,
                     "t_pub": it.timestamp,
                     "t_pub_reliable": bool(getattr(it, "t_pub_reliable", False)),
