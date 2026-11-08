@@ -862,6 +862,8 @@ class AvitoParser:
                             reason="rate_limit" if response.status_code == 429 else "forbidden",
                         )
                         await client.reset_async_session(self._lane)
+                        if await client.maybe_fresh_session():
+                            self._cookies_saved_at = time.monotonic()  # the jar of this scan must not bring them back
                         self.last_failure = FetchFailure(
                             "rate_limit" if response.status_code == 429 else "forbidden",
                             retry_after=cooldown,

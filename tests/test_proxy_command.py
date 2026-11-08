@@ -403,7 +403,7 @@ class TestChannelSelectionAndLimiter(unittest.TestCase):
 
     def test_free_channel_takes_the_scan_instead_of_waiting_for_busy_good_ones(self):
         with patch.object(config, "NET_MODE", "proxy"):
-            pool, weak = self._block_wave_pool(weak_ok=4)  # health 40 %: dragged down by a block wave
+            pool, weak = self._block_wave_pool(weak_ok=7)  # health 70 %: dragged down by a block wave
             self.assertTrue(pool.has_free_lane())
             lease = pool.acquire_client()
         self.assertIs(lease.client, weak)
@@ -411,8 +411,39 @@ class TestChannelSelectionAndLimiter(unittest.TestCase):
 
     def test_nearly_dead_free_channel_does_not_jump_ahead(self):
         with patch.object(config, "NET_MODE", "proxy"):
-            pool, weak = self._block_wave_pool(weak_ok=1)  # health 10 %: it would only answer 403
+            pool, weak = self._block_wave_pool(weak_ok=4)  # health 40 %: it would mostly answer 403
             self.assertFalse(pool.has_free_lane())
+
+    def test_blocked_server_does_not_take_scans_from_busy_proxies(self):
+        with patch.object(config, "PROXY_URLS", [PROXY_URL]):
+            pool = proxy_pool.ProxyPool(proxy_pool_file="", fallback_proxy_url="", allow_direct=True)
+        server = next(c for c in pool.clients if c.is_direct)
+        proxy = next(c for c in pool.clients if not c.is_direct)
+        now = time.monotonic()
+        for index in range(10):  # the server answers 403 on 7 of 10, like on 08.11
+            server.record_raw_http_response(200 if index < 3 else 403, 0.5)
+        server.last_acquired_at = proxy.last_acquired_at = now
+        proxy.in_flight = proxy.max_in_flight
+        self.assertFalse(pool.has_free_lane())
+
+    def test_three_blocks_in_a_row_start_the_channel_from_scratch(self):
+        client = proxy_pool.ProxyClient(PROXY_URL)
+        with tempfile.TemporaryDirectory() as tmp:
+            client.cookie_file = Path(tmp) / "cookies.json"
+            client.cookie_file.write_text("{}", encoding="utf-8")
+            client._async_sessions = {0: Mock(close=AsyncMock()), 1: Mock(close=AsyncMock())}
+            for _ in range(2):
+                client.record_raw_http_response(403, 0.5)
+            self.assertFalse(asyncio.run(client.maybe_fresh_session()))
+            client.record_raw_http_response(403, 0.5)
+            self.assertTrue(asyncio.run(client.maybe_fresh_session()))
+            self.assertFalse(client.cookie_file.exists())
+            self.assertEqual(client._async_sessions, {})
+            for _ in range(3):  # within SESSION_REFRESH_GAP it does not repeat
+                client.record_raw_http_response(403, 0.5)
+            self.assertFalse(asyncio.run(client.maybe_fresh_session()))
+            client.record_raw_http_response(200, 0.5)
+            self.assertEqual(client.consecutive_blocks, 0)
 
 
 class TestProbeChannel(unittest.IsolatedAsyncioTestCase):

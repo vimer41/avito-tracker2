@@ -184,6 +184,9 @@ class ProxyClient:
         self.quarantined_until: float = 0.0
         self.quarantine_reason: str = ""
         self.block_streak: int = 0
+        self.consecutive_blocks: int = 0          # 403/429/439 in a row, the server included
+        self.fresh_session_at: float = -math.inf
+        self.fresh_sessions: int = 0
         self.transport_failure_streak: int = 0
         self.recovery_success_streak: int = 0
         # Rate limiter memory: answers counted so far, and that count at the last cut, so a cut is judged
@@ -327,6 +330,24 @@ class ProxyClient:
             self._async_sessions[lane] = session
             self._session_generation += 1
         return session
+
+    async def maybe_fresh_session(self) -> bool:
+        """After SESSION_REFRESH_BLOCKS blocks in a row: delete this channel's saved cookies and close every lane's
+        session, so the next request starts like after a bot restart. True when it happened."""
+        now = self._monotonic()
+        if self.consecutive_blocks < int(config.SESSION_REFRESH_BLOCKS) \
+                or now - self.fresh_session_at < float(config.SESSION_REFRESH_GAP):
+            return False
+        streak, self.consecutive_blocks, self.fresh_session_at = self.consecutive_blocks, 0, now
+        self.fresh_sessions += 1
+        try:
+            self.cookie_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        await self.reset_async_session(None)
+        log_event(log, logging.INFO, "proxy.fresh", f"Канал {self.masked_url}: {streak} блоков подряд — "
+                  "куки удалены, сессии с нуля", channel=self.proxy_id, blocks=streak, n=self.fresh_sessions)
+        return True
 
     async def reset_async_session(self, lane: int | None = 0) -> None:
         """Drops one lane's session (None: every lane); another lane's request in flight is not touched."""
@@ -509,6 +530,7 @@ class ProxyClient:
 
         self._answers_total += 1
         if 200 <= status_code < 400:
+            self.consecutive_blocks = 0
             self.transport_failure_streak = 0
             self.recovery_success_streak += 1
             _, block_ratio = self._recent_block_ratio()
@@ -522,6 +544,7 @@ class ProxyClient:
             return
 
         if status_code in (403, 429, 439):
+            self.consecutive_blocks += 1
             # A single block is Avito's background noise: the window ratio decides, not the streak.
             # It does break the clean run that recovery waits for.
             self.recovery_success_streak = 0

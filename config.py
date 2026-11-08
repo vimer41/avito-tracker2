@@ -143,8 +143,14 @@ PROXY_GOOD_HEALTH = positive_float_setting("PROXY_GOOD_HEALTH", "0.7")
 PROXY_PREFERRED_RATE = positive_float_setting("PROXY_PREFERRED_RATE", "0.5")
 PROXY_HOT_PENALTY = positive_float_setting("PROXY_HOT_PENALTY", "0.5")
 # A free channel takes a scan before a busy one when at least this share of its recent answers succeeded:
-# below it the channel mostly answers 403 and the scan would only lose a round trip.
-PROXY_SPILL_MIN_HEALTH = positive_float_setting("PROXY_SPILL_MIN_HEALTH", "0.3")
+# below it the channel mostly answers 403 and the scan would only lose a round trip. 0.3 (08.11 evening) let
+# the server, blocked on 70 % of answers, take more scans than any proxy.
+PROXY_SPILL_MIN_HEALTH = positive_float_setting("PROXY_SPILL_MIN_HEALTH", "0.6")
+# After this many 403/429 in a row a channel starts from scratch: saved cookies deleted, every lane's session
+# closed. On 08.11 a bot restart lifted the success share from ~55 % to 95 % for ~20 min, and a plain
+# session reset after a 403 reloads the same cookies from the file. At most once per SESSION_REFRESH_GAP s.
+SESSION_REFRESH_BLOCKS = positive_int_setting("SESSION_REFRESH_BLOCKS", "3")
+SESSION_REFRESH_GAP = positive_float_setting("SESSION_REFRESH_GAP", "120")
 # An unproven channel still gets one request per PROXY_PROBE_INTERVAL s, or per PROXY_PROBE_RETRY s right
 # after a success, so that a proxy back from an outage is proven again within a minute.
 PROXY_PROBE_INTERVAL = positive_float_setting("PROXY_PROBE_INTERVAL", "60")
