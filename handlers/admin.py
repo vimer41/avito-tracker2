@@ -2434,8 +2434,15 @@ async def cmd_admin_race(message: Message):
         if proc is None or proc.returncode is not None:
             await message.answer("Гонка не запущена.")
             return
-        proc.terminate()
-        await message.answer("⏹ Гонка остановлена. Строки — в logs/api_race.csv на сервере.")
+        proc.terminate()  # the race finishes the request in flight and sends the report
+        await message.answer("⏹ Останавливаю гонку — отчёт придёт в течение минуты.")
+
+        async def _kill_if_stuck():
+            await asyncio.sleep(90)
+            if proc.returncode is None:
+                proc.kill()
+
+        asyncio.create_task(_kill_if_stuck())
         return
     if proc is not None and proc.returncode is None:
         left = max(0, int((_RACE["until"] - time.time()) / 60))
