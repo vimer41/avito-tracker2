@@ -48,7 +48,22 @@ class CleanThemeTests(unittest.TestCase):
 
     def test_colour_emoji_go_status_marks_stay(self):
         self.assertEqual(ui.drop_colour_emoji("🧠 Умный · 🔥 <b>Полный</b>"), "Умный · <b>Полный</b>")
-        self.assertEqual(ui.drop_colour_emoji("🟢 Сервер, ✅ готово, ✓ ваш"), "🟢 Сервер, ✅ готово, ✓ ваш")
+        self.assertEqual(ui.drop_colour_emoji("🟢 Сервер, ✓ ваш, ☑ выбран"), "🟢 Сервер, ✓ ваш, ☑ выбран")
+
+    def test_old_screens_get_icons_for_their_emoji(self):
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Умный", callback_data="a"),
+            InlineKeyboardButton(text="🗑", callback_data="b"),
+            InlineKeyboardButton(text="🏠 Главное меню", callback_data="c"),
+        ]])
+        with patch.object(config, "UI_THEME", "clean"), patch.object(ui, "ENABLED", True):
+            sent = ui.clean_method(SendMessage(chat_id=1, text="🌐 <b>Сеть</b>", reply_markup=markup))
+        self.assertEqual(sent.text, f'<tg-emoji emoji-id="{ui.CLEAN_IDS["net"]}">🌐</tg-emoji> <b>Сеть</b>')
+        row = sent.reply_markup.inline_keyboard[0]
+        self.assertEqual([b.text for b in row], ["✓ Умный", "Удалить", "Меню"])
+        self.assertEqual(row[1].icon_custom_emoji_id, ui.CLEAN_IDS["trash"])
+        self.assertEqual(row[2].icon_custom_emoji_id, ui.CLEAN_IDS["home"])
         tag = '<tg-emoji emoji-id="1">🔥</tg-emoji> Полный'
         self.assertEqual(ui.drop_colour_emoji(tag), tag)
 

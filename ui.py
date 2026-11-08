@@ -343,26 +343,82 @@ def strip_method(method):
 
 
 _LINE_LEAD = re.compile(r"(?m)^[ \t]+")
-# Colour emoji written straight into texts and labels (🧠 Умный, 🔥 Полный…). Status marks stay: in admin lists
-# 🟢🟡🔴 and ✅❌⚠️ carry meaning, and ✓ (U+2713) is the clean theme's own tick.
-_KEEP = "🟢🟡🔴🟠⚪⚫🔵🟣✅❌⚠🚫✓"
+# Status marks that keep their colour: in admin lists 🟢🟡🔴 tell a working channel from a blocked one, ❌ marks an
+# error, and ✓ ✗ ☑ ☐ ● ○ are text symbols of checklists.
+_KEEP = "🟢🟡🔴🟠⚪⚫🔵🟣❌✓✗☑☐●○"
 _EMOJI = re.compile(
-    "(?:[\U0001F000-\U0001FAFF\u2300-\u23FF\u24C2\u25A0-\u27BF\u2B00-\u2BFF\u3030\u303D\u3297\u3299]"
-    "(?:\uFE0F|\u20E3|[\U0001F3FB-\U0001F3FF])*(?:\u200D\S(?:\uFE0F)?)*)"
+    "(?:[\U0001F000-\U0001FAFF⌀-⏿Ⓜ■-➿⬀-⯿〰〽㊗㊙]"
+    "(?:️|⃣|[\U0001F3FB-\U0001F3FF])*(?:‍\S(?:️)?)*)"
 )
 _TG_EMOJI = re.compile(r"(<tg-emoji[^>]*>.*?</tg-emoji>)", re.S)
 # «<b>Статус:</b>» at a line start, after an optional icon tag.
 _BOLD_LABEL = re.compile(r"(?m)^((?:<tg-emoji[^>]*>.*?</tg-emoji>\s*)?)<b>([^<\n]{1,40}):</b>")
+# Emoji written straight into older screens that have an icon of their own in the clean pack.
+_EXTRA_SLOTS = {
+    "⚠": "warn", "🚨": "warn", "💥": "warn", "✅": "ok", "🎉": "ok", "🗑": "trash", "📦": "box", "⏸": "pause",
+    "⏹": "pause", "🛑": "ban", "⛔": "ban", "🚫": "ban", "🚷": "ban", "📅": "time", "🗓": "time", "🕒": "time",
+    "🕰": "time", "⌛": "wait", "🌐": "net", "🔌": "net", "📡": "radar", "📄": "docs", "📜": "docs",
+    "🧾": "note", "💳": "tariffs", "▶": "play", "⏯": "play", "📣": "mail", "📬": "mail", "📩": "mail",
+    "🆔": "profile", "🏷": "price", "🧪": "stats", "📈": "stats", "🛡": "lock", "🔑": "lock", "💾": "db",
+    "🗜": "db", "♻": "refresh", "🔁": "refresh", "🔎": "scope", "📂": "radars", "📋": "radars",
+    # network modes: every mode button gets an icon, not just «Прокси» (🛰 = logo)
+    "🧠": "radar", "🔀": "refresh", "🖥": "db", "🤖": "net",
+}
+_HOME_LABELS = {"Меню", "Главное меню", "« Меню", "« Главное меню", "В меню"}
 
 
-def drop_colour_emoji(text: str) -> str:
-    """The text without colour emoji (status marks kept); custom-emoji tags are left as they are."""
-    def strip(part: str) -> str:
-        return _EMOJI.sub(lambda m: m.group(0) if m.group(0)[0] in _KEEP else "", part)
+def _bare(char: str) -> str:
+    return char.replace("️", "").replace("⃣", "")
+
+
+_SLOT_BY_CHAR: dict[str, str] = {}
+for _slot, (_char, _desc) in SLOTS.items():
+    _SLOT_BY_CHAR.setdefault(_bare(_char), _slot)
+for _char, _slot in _EXTRA_SLOTS.items():
+    _SLOT_BY_CHAR.setdefault(_bare(_char), _slot)
+
+
+def slot_for(char: str) -> Optional[str]:
+    return _SLOT_BY_CHAR.get(_bare(char))
+
+
+def drop_colour_emoji(text: str, *, icons: bool = False) -> str:
+    """The text without colour emoji. With icons, an emoji that has a clean-pack icon becomes that icon (HTML only);
+    status marks stay, custom-emoji tags are left as they are."""
+    def swap(match) -> str:
+        char = match.group(0)
+        if char[0] in _KEEP:
+            return char
+        slot = slot_for(char)
+        cid = custom_id(slot) if icons and slot else None
+        return f'<tg-emoji emoji-id="{cid}">{char}</tg-emoji>' if cid else ""
 
     parts = _TG_EMOJI.split(text)
-    out = "".join(part if i % 2 else strip(part) for i, part in enumerate(parts))
+    out = "".join(part if i % 2 else _EMOJI.sub(swap, part) for i, part in enumerate(parts))
+    out = re.sub(r"«<tg-emoji[^>]*>[^<]*</tg-emoji>\s*", "«", out)  # «Проверить каналы», not «[icon] Проверить…»
+    out = re.sub(r"<(b|i)>[ \t]+", r"<\1>", out)  # «<b> Авто</b>» left by a removed emoji
     return re.sub(r"[ \t]{2,}", " ", _LINE_LEAD.sub("", out))
+
+
+def _clean_button(b):
+    """A button of an older screen: its leading emoji becomes the icon, ✅ (the chosen option) becomes ✓."""
+    text = b.text.replace("✅", "✓").replace("✔️", "✓").replace("✔", "✓")
+    icon = b.icon_custom_emoji_id
+    if not icon:
+        for match in _EMOJI.finditer(text):
+            slot = slot_for(match.group(0))
+            if slot and custom_id(slot):
+                icon = custom_id(slot)
+                break
+    label = drop_colour_emoji(text).strip()
+    if label in _HOME_LABELS:
+        label, icon = "Меню", icon or custom_id("home")
+    if not label:  # an icon-only button («🗑»): a word instead of the bare picture
+        slot = next((slot_for(m.group(0)) for m in _EMOJI.finditer(text) if slot_for(m.group(0))), None)
+        label = SLOTS[slot][1].split(",")[0].capitalize() if slot else b.text
+    if label == b.text and icon == b.icon_custom_emoji_id:
+        return b, False
+    return b.model_copy(update={"text": label, "icon_custom_emoji_id": icon}), True
 
 
 def _clean_markup(markup):
@@ -372,23 +428,26 @@ def _clean_markup(markup):
     for row in markup.inline_keyboard:
         new_row = []
         for b in row:
-            text = drop_colour_emoji(b.text).strip() or b.text
-            if text != b.text:
-                b, changed = b.model_copy(update={"text": text}), True
+            b, did = _clean_button(b)
+            changed |= did
             new_row.append(b)
         rows.append(new_row)
     return InlineKeyboardMarkup(inline_keyboard=rows), changed
 
 
 def clean_method(method):
-    """Clean theme: no colour emoji in texts, captions, inline button labels and popups, and no space left where
-    an empty emoji slot was. Messages with <pre> blocks (logs, stack traces) keep their text as is."""
+    """Clean theme for every outgoing call: emoji in texts and buttons become clean-pack icons or go, field labels
+    lose their bold, no space is left where an empty slot was. Popups (no parse mode) get plain text only;
+    messages with <pre> blocks (logs, stack traces) keep their text as is."""
     update = {}
+    html_ok = getattr(method, "parse_mode", None) is not None
     for field in ("text", "caption"):
         value = getattr(method, field, None)
         if isinstance(value, str) and "<pre" not in value:
-            # Field labels read as plain text («Статус: Работает»), the bold is kept for titles and values.
-            fixed = _BOLD_LABEL.sub(r"\1\2:", drop_colour_emoji(value))
+            fixed = drop_colour_emoji(value, icons=html_ok)
+            if html_ok:
+                # Field labels read as plain text («Статус: Работает»), the bold is kept for titles and values.
+                fixed = _BOLD_LABEL.sub(r"\1\2:", fixed)
             if fixed != value:
                 update[field] = fixed
     markup, changed = _clean_markup(getattr(method, "reply_markup", None))
