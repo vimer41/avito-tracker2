@@ -60,6 +60,8 @@ FRESH_S = 15 * 60          # a lot older than this at first sight is not new, on
 SETTLE_S = 10 * 60         # after this, a lot one source never showed counts as «only that source»
 PROXY_REST_S = 5 * 60      # a proxy that blocked a source is not used for that source for this long
 SUMMARY_EVERY_S = 30 * 60
+MIN_FAIR_LOTS = 6          # a 5-minute race on the iPhone search brings ~8–10 new lots
+PREWARM_TRIES = 6          # proxies the API may try before the clock starts
 BLOCK_STATUSES = (302, 403, 429, 439)
 SOURCES = ("web", "api")
 NAMES = {"web": "сайт", "api": "API"}
@@ -311,6 +313,22 @@ class Race:
         first_back = min(self.rest_until[source].values(), default=now)
         self.paused_until[source] = first_back
         print(f"{source}: все прокси отдыхают, жду {first_back - now:.0f} с")
+
+    def prewarm_api(self) -> bool:
+        """Walk the API over proxies until one passes Avito's check, before the race clock starts."""
+        for _ in range(min(PREWARM_TRIES, len(self.proxies))):
+            proxy = self.proxy_of("api")
+            info: dict = {}
+            with self.locks["api"]:
+                if self.warm_api(proxy, info):
+                    return True
+            stats = self.proxy_stats(proxy, "api")
+            stats["try"] += 1
+            stats["reasons"][info.get("kind") or "прогрев не прошёл"] += 1
+            self.switch_proxy("api", rest=True)
+            if time.time() < self.paused_until["api"]:
+                return False
+        return False
 
     # ── Telegram ──────────────────────────────────────────────────────────
     async def tg_call(self, method: str, **payload):
@@ -627,7 +645,7 @@ class Race:
         fair_api, fair_web = res["fair"]["api"], res["fair"]["web"]
         fair_total = len(fair_api) + len(fair_web)
         api_pub_share = self.field_share("api", "pub")
-        enough = ok["web"] >= 0.7 and ok["api"] >= 0.7 and fair_total >= 10
+        enough = ok["web"] >= 0.7 and ok["api"] >= 0.7 and fair_total >= MIN_FAIR_LOTS
         api_share = len(fair_api) / fair_total if fair_total else 0.0
         api_leads = [s for s, _ in fair_api]
         faster = bool(fair_total and api_share >= 0.7 and api_leads
@@ -661,7 +679,7 @@ class Race:
             if ok["web"] < 0.7 or ok["api"] < 0.7:
                 lines.append(f"Ответов: сайт {pct(self.answers['web'], n)}, API {pct(self.answers['api'], n)} (нужно ≥70% у обоих)")
             if fair_total < 10:
-                lines.append(f"Честно сравнимых лотов {fair_total} (нужно ≥10)")
+                lines.append(f"Честно сравнимых лотов {fair_total} (нужно ≥{MIN_FAIR_LOTS})")
         lines += self.proxy_verdict()
         lines += [f"⚠️ {p}" for p in problems]
         return lines
@@ -848,6 +866,10 @@ class Race:
         via = f" · прокси в запасе: {len(self.proxies)}" if self.proxies[0] else " · напрямую"
         await self.send(f"🏁 Гонка запущена{minutes}{via}: сайт против мобильного API, у каждого свой прокси, "
                         "при блоке — смена. В конце придёт файл-отчёт с вердиктом.")
+        # The API gets its anti-bot cookies before the clock starts, so the first rounds are not spent on that.
+        prewarmed = await asyncio.to_thread(self.prewarm_api)
+        print(f"api: прогрев перед стартом {'удался' if prewarmed else 'не удался'} "
+              f"[{proxy_label(self.proxy_of('api'))}]")
         self.started = self.last_summary = time.time()  # the clock starts after /start, not while waiting for it
         while not self.stop_event.is_set():
             tick = time.monotonic()

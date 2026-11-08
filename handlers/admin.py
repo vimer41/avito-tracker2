@@ -2389,17 +2389,19 @@ async def cmd_admin_load(message: Message):
 
 
 _RACE: dict = {}  # the running /race: {"proc", "task", "label", "until"}
-RACE_DEFAULT_MINUTES, RACE_MAX_MINUTES = 10, 30
+RACE_DEFAULT_MINUTES, RACE_MAX_MINUTES = 5, 30
+RACE_INTERVAL_SECONDS = 10
 
 
 def _race_proxies(arg: str | None) -> list[str]:
     """Proxies for /race in the order the race tries them: the one whose address contains `arg` first, then the
-    healthy ones outside the 3 best, then the 3 best last (they keep scanning; the race only falls back on them)."""
+    healthiest, the ones the bot has resting after a block last. The best go first on purpose: on 08.11 only 3 of
+    18 worked, and putting them last made both sources burn rounds on dead proxies. A 5-minute race is ~0.1 req/s
+    per source, nothing next to scanning."""
     from proxy_pool import get_proxy_pool
 
     proxies = [c for c in get_proxy_pool().clients if not c.is_direct and c.proxy_url]
-    ranked = sorted(proxies, key=lambda c: c.long_health(), reverse=True)
-    ordered = ranked[3:] + ranked[:3] if len(ranked) > 3 else ranked
+    ordered = sorted(proxies, key=lambda c: (c.state == "quarantined", -c.long_health()))
     if arg:
         chosen = [c for c in ordered if arg in _proxy_host(c.proxy_url)]
         if not chosen:
@@ -2424,7 +2426,7 @@ async def _race_watch(message: Message, proc, log_path) -> None:
 
 @router.message(Command("race"))
 async def cmd_admin_race(message: Message):
-    """/race [минуты, по умолчанию 10, до 30] [часть адреса прокси] — сайт против мобильного API через прокси бота; /race stop — остановить."""
+    """/race [минуты, по умолчанию 5, до 30] [часть адреса прокси] — сайт против мобильного API через прокси бота; /race stop — остановить."""
     import os
     import sys
     from pathlib import Path
@@ -2469,6 +2471,7 @@ async def cmd_admin_race(message: Message):
         "RACE_CHAT_ID": str(message.chat.id),
         "RACE_PROXIES": "\n".join(proxies),
         "RACE_MINUTES": str(minutes),
+        "RACE_INTERVAL": str(RACE_INTERVAL_SECONDS),
         "RACE_NO_UPDATES": "1",
         "RACE_LABEL": label,
         "PYTHONIOENCODING": "utf-8",
