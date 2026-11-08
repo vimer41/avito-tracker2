@@ -2389,7 +2389,7 @@ async def cmd_admin_load(message: Message):
 
 
 _RACE: dict = {}  # the running /race: {"proc", "task", "label", "until"}
-RACE_DEFAULT_MINUTES, RACE_MAX_MINUTES = 30, 180
+RACE_DEFAULT_MINUTES, RACE_MAX_MINUTES = 10, 30
 
 
 def _race_proxy(arg: str | None):
@@ -2421,7 +2421,7 @@ async def _race_watch(message: Message, proc, log_path) -> None:
 
 @router.message(Command("race"))
 async def cmd_admin_race(message: Message):
-    """/race [минуты] [часть адреса прокси] — сайт против мобильного API через прокси бота; /race stop — остановить."""
+    """/race [минуты, по умолчанию 10, до 30] [часть адреса прокси] — сайт против мобильного API через прокси бота; /race stop — остановить."""
     import os
     import sys
     from pathlib import Path

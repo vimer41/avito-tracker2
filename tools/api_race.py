@@ -133,6 +133,8 @@ class Race:
         self.baseline = {"web": False, "api": False}
         self.paused_until = {"web": 0.0, "api": 0.0}
         self.errors = {"web": 0, "api": 0}
+        self.answers = {"web": 0, "api": 0}   # rounds where the source returned a list
+        self.blocks = {"web": 0, "api": 0}    # 403/429/302-to-firewall answers
         self.rounds = 0
         self.update_offset = 0
         self.started = time.time()
@@ -204,6 +206,8 @@ class Race:
                 failure = f"{getattr(fail, 'kind', '?')} {getattr(fail, 'status', '') or ''}".strip()
             if not page:
                 self.errors["web"] += 1
+                if getattr(getattr(self.avito, "last_failure", None), "status", None) in (302, 403, 429, 439):
+                    self.blocks["web"] += 1
                 self.paused_until["web"] = time.time() + WEB_FAIL_PAUSE_S
                 print(f"web: страница не загрузилась ({failure}), пауза {WEB_FAIL_PAUSE_S} с")
                 self.maybe_drop_proxy("web")
@@ -224,6 +228,7 @@ class Race:
             return None
         if AvitoParser._is_firewall(resp):
             self.errors["api"] += 1
+            self.blocks["api"] += 1
             self.paused_until["api"] = time.time() + BLOCK_PAUSE_S
             print(f"api: блок {resp.status_code}, пауза {BLOCK_PAUSE_S} с")
             self.maybe_drop_proxy("api")
@@ -314,12 +319,13 @@ class Race:
         only_web = sum(1 for lot in rows if lot["web"] and not lot["api"])
         web_age = [lot["web"] - lot["pub"] for lot in rows if lot["web"] and lot.get("pub")]
         api_age = [lot["api"] - lot["pub"] for lot in rows if lot["api"] and lot.get("pub")]
-        hours = (time.time() - self.started) / 3600
+        minutes = (time.time() - self.started) / 60
+        took = f"{minutes:.0f} мин" if minutes < 120 else f"{minutes / 60:.1f} ч"
 
         def med(values):
             return f"{statistics.median(values):.0f} с" if values else "—"
 
-        lines = [f"📊 <b>Итоги за {hours:.1f} ч</b> ({self.rounds} раундов по {self.interval:.0f} с)"]
+        lines = [f"📊 <b>Итоги за {took}</b> ({self.rounds} раундов по {self.interval:.0f} с)"]
         if leads:
             api_first = sum(1 for lead in leads if lead > 0)
             lines += [
@@ -332,7 +338,8 @@ class Race:
         lines += [
             f"От публикации до появления, медиана: сайт {med(web_age)}, API {med(api_age)}",
             f"Только в API: {only_api}, только на сайте: {only_web}",
-            f"Ошибок подряд сейчас: сайт {self.errors['web']}, API {self.errors['api']}",
+            f"Ответили: сайт {self.answers['web']} из {self.rounds} раундов, API {self.answers['api']} из {self.rounds}",
+            f"Блоков Авито: сайт {self.blocks['web']}, API {self.blocks['api']}",
         ]
         return "\n".join(lines)
 
@@ -364,6 +371,7 @@ class Race:
             self.rounds += 1
             for source in order:
                 if results[source] is not None:
+                    self.answers[source] += 1
                     await self.note(source, results[source], self.last_seen[source])
             self.settle(seen_at)
             print(f"{time.strftime('%H:%M:%S')} раунд {self.rounds}: сайт {len(web) if web is not None else '×'}, "
