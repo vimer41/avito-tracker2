@@ -385,6 +385,35 @@ class TestChannelSelectionAndLimiter(unittest.TestCase):
         self.assertIs(lease.client, server)
         lease.release()
 
+    def _block_wave_pool(self, weak_ok: int):
+        """Two good proxies busy on both lanes, one free proxy with `weak_ok` successes in its last 10 answers."""
+        third = "http://user:secret@10.5.5.5:4000"
+        with patch.object(config, "PROXY_URLS", [PROXY_URL, PROXY_B, third]), patch.object(config, "NET_MODE", "proxy"):
+            pool = proxy_pool.ProxyPool(proxy_pool_file="", fallback_proxy_url="", allow_direct=False)
+        now = time.monotonic()
+        busy = [c for c in pool.clients if c.proxy_url in (PROXY_URL, PROXY_B)]
+        weak = next(c for c in pool.clients if c.proxy_url == third)
+        for client in busy:
+            client.in_flight = client.max_in_flight
+            client.last_acquired_at = now
+        for index in range(10):
+            weak.record_raw_http_response(200 if index < weak_ok else 403, 0.5)
+        weak.last_acquired_at = now  # no probe bonus: it was just used
+        return pool, weak
+
+    def test_free_channel_takes_the_scan_instead_of_waiting_for_busy_good_ones(self):
+        with patch.object(config, "NET_MODE", "proxy"):
+            pool, weak = self._block_wave_pool(weak_ok=4)  # health 40 %: dragged down by a block wave
+            self.assertTrue(pool.has_free_lane())
+            lease = pool.acquire_client()
+        self.assertIs(lease.client, weak)
+        lease.release()
+
+    def test_nearly_dead_free_channel_does_not_jump_ahead(self):
+        with patch.object(config, "NET_MODE", "proxy"):
+            pool, weak = self._block_wave_pool(weak_ok=1)  # health 10 %: it would only answer 403
+            self.assertFalse(pool.has_free_lane())
+
 
 class TestProbeChannel(unittest.IsolatedAsyncioTestCase):
     async def test_probe_reports_successes_failures_and_median(self):

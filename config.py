@@ -139,6 +139,9 @@ PROXY_GOOD_HEALTH = positive_float_setting("PROXY_GOOD_HEALTH", "0.7")
 # A proven IP stays preferred up to this rate; above it the score drops by PROXY_HOT_PENALTY and load spills over.
 PROXY_PREFERRED_RATE = positive_float_setting("PROXY_PREFERRED_RATE", "0.5")
 PROXY_HOT_PENALTY = positive_float_setting("PROXY_HOT_PENALTY", "0.5")
+# A free channel takes a scan before a busy one when at least this share of its recent answers succeeded:
+# below it the channel mostly answers 403 and the scan would only lose a round trip.
+PROXY_SPILL_MIN_HEALTH = positive_float_setting("PROXY_SPILL_MIN_HEALTH", "0.3")
 # An unproven channel still gets one request per PROXY_PROBE_INTERVAL s, or per PROXY_PROBE_RETRY s right
 # after a success, so that a proxy back from an outage is proven again within a minute.
 PROXY_PROBE_INTERVAL = positive_float_setting("PROXY_PROBE_INTERVAL", "60")

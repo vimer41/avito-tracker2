@@ -1026,7 +1026,8 @@ class ProxyPool:
             return None
         n = len(all_clients)
         server_first = self._evaluate_smart(now, all_clients)
-        candidates: list[tuple[float, float, int, ProxyClient]] = []
+        candidates: list[tuple[int, float, float, int, ProxyClient]] = []
+        ready_within = float(config.PROXY_BUSY_PENALTY)
         for offset in range(n):
             idx = (self._rr_cursor + offset) % n
             client = all_clients[idx]
@@ -1034,15 +1035,24 @@ class ProxyPool:
                 continue
             if not client.is_available_for_scan(now):
                 continue
+            score = client.routing_score(now, server_first=server_first)
             with client._pacing_lock:
                 # A busy fast channel usually frees up sooner than a throttled idle one becomes ready.
                 queued = max(0, client.in_flight - client.max_in_flight + 1)
                 starts_at = max(now, client._next_request_at) + queued * float(config.PROXY_BUSY_PENALTY)
-            candidates.append((-client.routing_score(now, server_first=server_first), starts_at, offset, client))
+                limit = client.max_in_flight + (1 if server_first and client.is_direct else 0)
+                free_now = client.in_flight < limit and client._next_request_at - now <= ready_within
+            # A channel that can take the scan right now goes before a busy one, unless it is nearly dead (health under PROXY_SPILL_MIN_HEALTH).
+            # Before, a busy good proxy (score 0.5) beat a free one whose health a block wave had dragged under
+            # 0.5, so scans queued behind the few busy channels while the rest idled (07.11: 67 % of plan with
+            # 33 % of channel time free).
+            health = client.long_health() if server_first and not client.is_direct else client.recent_health()
+            ready_class = 0 if free_now and health >= float(config.PROXY_SPILL_MIN_HEALTH) else 1
+            candidates.append((ready_class, -score, starts_at, offset, client))
         if not candidates:
             return None
-        candidates.sort(key=lambda item: item[:3])
-        _, _, chosen_offset, chosen = candidates[0]
+        candidates.sort(key=lambda item: item[:4])
+        chosen_offset, chosen = candidates[0][3], candidates[0][4]
         return chosen, chosen_offset, n, server_first
 
     def has_free_lane(self) -> bool:
