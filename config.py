@@ -434,6 +434,12 @@ RUB_TEST_SECONDS = 3600
 RUB_TEST_GRANTS = "pro"
 RUB_TEST_COMMAND = "arseniytest1ruble"
 
+# Referral program (referrals.py): links are issued by an admin to one owner.
+REF_PERCENT = int(os.getenv("REF_PERCENT", "15"))
+REF_HOLD_DAYS = int(os.getenv("REF_HOLD_DAYS", "7"))          # a reward can be paid out this many days after the payment
+REF_STAR_RATE = float(os.getenv("REF_STAR_RATE", "1.2"))      # rubles per star; admins change it in bot_settings.ref_star_rate
+REF_PAYOUT_CONTACT = os.getenv("REF_PAYOUT_CONTACT", "@prostatock").strip() or "@prostatock"
+
 
 def order_plan(plan: str | None) -> str | None:
     """The tariff an order actually grants (the ruble test order grants «Полный»)."""

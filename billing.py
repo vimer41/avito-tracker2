@@ -8,6 +8,7 @@ import aiosqlite
 
 import config
 import database
+import referrals
 
 
 class PaymentValidationError(ValueError):
@@ -125,9 +126,11 @@ async def complete_payment(user_id: int, payload: str, currency: str, amount: in
                 trial_before = ?, subscription_after = ?, tariff_after = ?, revision_after = ? WHERE id = ?
         """, (charge_id, provider_charge_id, before["subscription_until"], before["tariff_plan"],
               before["is_allowed"], before["trial_used"], until, order["tariff_plan"], revision, order["id"]))
+        ref_reward = await referrals.accrue_in_transaction(
+            db, "stars", order["id"], user_id, order["tariff_plan"], order["total_amount"], "XTR")
         await db.commit()
         async with db.execute("SELECT * FROM stars_orders WHERE id = ?", (order["id"],)) as cursor:
-            return dict(await cursor.fetchone(), applied=True)
+            return dict(await cursor.fetchone(), applied=True, ref_reward=ref_reward)
 
 
 # ---------- Рубли через Platega ----------
@@ -342,8 +345,11 @@ async def complete_rub_order(order_id: int, transaction_id: str, paid_amount: fl
             WHERE id = ?
         """, (paid_amount, before["subscription_until"], before["tariff_plan"], before["is_allowed"], before["trial_used"],
               until, after["tariff_plan"], after["subscription_revision"], order_id))
+        # The base is the tariff price, without the buyer's payment fee (pay_total / paid_amount).
+        ref_reward = await referrals.accrue_in_transaction(
+            db, "rub", order_id, user_id, order["tariff_plan"], order["amount"], "RUB")
         await db.commit()
-        return dict(await _rub_row(db, order_id), applied=True)
+        return dict(await _rub_row(db, order_id), applied=True, ref_reward=ref_reward)
 
 
 async def mark_rub_disputed(order_id: int) -> bool:

@@ -294,6 +294,7 @@ async def render_user_card_data(target_id: int, page: int = 0):
         [InlineKeyboardButton(text=f"🎁 Выдать / обновить триал ({config.TRIAL_HOURS} ч)", callback_data=f"admin_reset_trial_prompt:{target_id}:{page}")],
         [InlineKeyboardButton(text=f"📁 Радары ({len(user_radars)})", callback_data=f"admin_user_radars:{target_id}:{page}"),
          InlineKeyboardButton(text="⭐ Платежи / возврат", callback_data=f"admin_payments:{target_id}")],
+        [InlineKeyboardButton(text="🔗 Реферальная ссылка", callback_data=f"ref_adm_user:{target_id}")],
         limit_row,
         note_row,
     ]
@@ -404,6 +405,8 @@ ADMIN_ACTION_LABELS = {
     "limit": "изменил лимит радаров", "radars_delete": "удалил радары", "purge": "удалил пользователя",
     "refund": "вернул платёж", "note": "заметка", "broadcast": "рассылка", "extend_all": "продлил всем",
     "net_mode": "режим сети", "prices": "цены Stars", "approve": "одобрил доступ", "reject": "отклонил доступ",
+    "ref_issue": "выдал реф. ссылку", "ref_extend": "продлил реф. ссылку", "ref_off": "выключил реф. ссылку",
+    "ref_pct": "процент реф. ссылки", "ref_payout": "выплата по рефералке", "ref_rate": "курс звезды",
 }
 
 
@@ -1431,6 +1434,7 @@ async def cmd_admin_home(event):
          ui.btn("Продлить всем", "time", callback_data="admin_extend_all")],
         [ui.btn("Деньги", "coin", callback_data="admin_money"),
          ui.btn("Журнал админов", "write", callback_data="admin_alog")],
+        [ui.btn("Рефералы", "link", callback_data="ref_adm:0")],
         [ui.btn("Обновить", "refresh", callback_data="admin_refresh")],
     )
     await _show(event, text, kb)

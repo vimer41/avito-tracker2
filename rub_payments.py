@@ -26,6 +26,7 @@ import config
 import database
 import legal_docs
 import platega
+import referrals
 import ui
 
 logger = logging.getLogger(__name__)
@@ -648,6 +649,7 @@ async def _on_paid(bot: Bot, order: dict):
         logger.warning("Platega paid notice to user failed: order=%s error=%s", order["id"], type(exc).__name__)
     logger.info("Platega payment fulfilled: order=%s user=%s plan=%s amount=%s paid=%s",
                 order["id"], order["user_id"], order["tariff_plan"], order["amount"], order.get("paid_amount"))
+    await referrals.notify_reward(bot, order.get("ref_reward"))
     count = await database.count_paid_orders(order["user_id"])
     kind = "первая оплата" if count <= 1 else f"продление, {count}-я оплата"
     paid = _num(order.get("paid_amount"))

@@ -614,6 +614,10 @@ async def init_db():
             "mirror_chat_id": "INTEGER",
             "last_seen_at": "TIMESTAMP",
             "admin_note": "TEXT NOT NULL DEFAULT ''",
+            # Referral program: the link a user came through. Set once, when the users row is created.
+            "referred_by": "INTEGER",
+            "ref_link_id": "INTEGER",
+            "referred_at": "TIMESTAMP",
         })
         await db.execute("""
             CREATE TABLE IF NOT EXISTS admin_actions (
@@ -763,6 +767,55 @@ async def init_db():
                 PRIMARY KEY (user_id, day)
             ) WITHOUT ROWID
         """)
+        # Referral program (referrals.py). A link is issued by an admin to one owner; rewards are written in the
+        # same transaction that grants a paid tariff, and their state (refund, dispute) is read from the order itself.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ref_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL UNIQUE,
+                owner_id INTEGER NOT NULL,
+                percent INTEGER NOT NULL DEFAULT 15 CHECK(percent > 0 AND percent <= 100),
+                created_by INTEGER NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP,
+                revoked_at TIMESTAMP,
+                revoked_by INTEGER
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS ref_links_owner ON ref_links(owner_id, id)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ref_rewards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                link_id INTEGER NOT NULL,
+                owner_id INTEGER NOT NULL,
+                buyer_id INTEGER NOT NULL,
+                source TEXT NOT NULL CHECK(source IN ('stars', 'rub')),
+                order_id INTEGER NOT NULL,
+                tariff_plan TEXT,
+                base_amount REAL NOT NULL,
+                currency TEXT NOT NULL,
+                star_rate REAL,
+                percent INTEGER NOT NULL,
+                reward_kop INTEGER NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                available_at TIMESTAMP NOT NULL,
+                UNIQUE(source, order_id)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS ref_rewards_owner ON ref_rewards(owner_id, id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS ref_rewards_link ON ref_rewards(link_id, id)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ref_payouts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                amount_kop INTEGER NOT NULL CHECK(amount_kop > 0),
+                admin_id INTEGER NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS ref_payouts_owner ON ref_payouts(owner_id, id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS users_referred_by ON users(referred_by)")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS admin_subscription_actions (
                 token TEXT PRIMARY KEY,
@@ -1097,7 +1150,10 @@ async def set_bot_setting(key: str, value: str) -> None:
         await db.commit()
 
 
-async def get_or_create_user(user_id: int, username: Optional[str] = None, first_name: Optional[str] = None) -> Dict[str, Any]:
+async def get_or_create_user(user_id: int, username: Optional[str] = None, first_name: Optional[str] = None,
+                             referral: Optional[tuple] = None) -> Dict[str, Any]:
+    """referral=(owner_id, link_id) binds a NEW user to a referral link; an existing user is never re-bound.
+    The returned row of a user created by this call carries created=True."""
     async with writer_connection() as db:
         await db.execute("BEGIN IMMEDIATE")
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
@@ -1118,11 +1174,16 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
                 INSERT OR IGNORE INTO users (user_id, username, first_name, default_template, is_allowed, tariff_plan)
                 VALUES (?, ?, ?, ?, 0, 'standart')
             """, (user_id, username, first_name, DEFAULT_SELLER_MESSAGE))
+            if referral and int(referral[0]) != int(user_id):
+                await db.execute(
+                    "UPDATE users SET referred_by = ?, ref_link_id = ?, referred_at = datetime('now') WHERE user_id = ?",
+                    (int(referral[0]), int(referral[1]), user_id),
+                )
         await db.commit()
 
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
-            return dict(row)
+            return dict(row, created=True)
 
 
 def _plan_max_radars(plan: str, is_allowed: bool, trial_used: bool) -> int:

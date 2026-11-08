@@ -13,6 +13,7 @@ import config
 import rub_payments
 import database
 import legal_docs
+import referrals
 import trial_gate
 import ui
 from logger_setup import log_user_event
@@ -148,6 +149,15 @@ async def cmd_start(event, state: FSMContext):
     await state.clear()
     user = event.from_user
     first_name = user.first_name or "Пользователь"
+    if not isinstance(event, CallbackQuery):
+        # /start ref_<code>: only a user the bot has never seen is bound to the link's owner.
+        try:
+            bound = await referrals.bind_from_start(user.id, user.username, first_name, event.text)
+        except Exception:
+            logger.exception("Referral binding failed: user=%s", user.id)
+            bound = None
+        if bound:
+            await referrals.notify_bound(event.bot, bound)
     user_record = await database.get_or_create_user(user.id, user.username, first_name)
     await database.resume_blocked_searches(user.id)
 
@@ -266,6 +276,8 @@ async def cmd_profile(event):
     rows.append([ui.btn(f"Ночной режим: {night}", "pause", callback_data="night_mode")])
     group = "вкл" if await database.get_mirror_chat(user_id) else "выкл"
     rows.append([ui.btn(f"Лоты в группу или канал: {group}", "users", callback_data="group_delivery")])
+    if await referrals.get_owner_link(user_id):
+        rows.append([ui.btn("Партнёрская программа", "link", callback_data="ref_me")])
     rows.append([ui.btn("Обновить", "refresh", callback_data="refresh_profile"), ui.home_btn()])
     await ui.show(event, text, ui.kb(*rows), answer=False)
 

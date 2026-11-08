@@ -13,6 +13,7 @@ import billing
 import config
 import database
 import legal_docs
+import referrals
 import rub_payments
 import ui
 
@@ -252,6 +253,7 @@ async def successful_payment(message: Message, bot: Bot):
         ),
     )
     logger.info("Stars payment fulfilled: order=%s user=%s plan=%s amount=%s", order["id"], order["user_id"], order["tariff_plan"], order["total_amount"])
+    await referrals.notify_reward(bot, order.get("ref_reward"))
     try:
         await notify_admins(bot, await payment_notice(message, order), order["user_id"])
     except Exception:

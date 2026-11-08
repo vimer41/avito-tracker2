@@ -141,7 +141,7 @@ class AccessControlMiddleware(BaseMiddleware):
             )
             allowed_exact = {
                 "open_subscription_menu", "activate_trial_btn", "trial_check", "support_start_ticket", "support_cancel",
-                "start_approved", "refresh_profile", "open_help_menu", "cancel_fsm",
+                "start_approved", "refresh_profile", "open_help_menu", "cancel_fsm", "ref_me",
                 "payment_terms", "payment_support", "other_payment_methods",
                 "open_docs_menu", "doc_agreement", "doc_privacy",
             }
