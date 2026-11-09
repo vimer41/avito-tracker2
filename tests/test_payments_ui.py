@@ -229,7 +229,7 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_message(text="Не пришла подписка, заказ 42")
         admin_notices = [m for m in self.methods("SendMessage") if m.chat_id in config.ADMIN_IDS]
         self.assertEqual(len(admin_notices), len(config.ADMIN_IDS))
-        self.assertTrue(all("ОБРАЩЕНИЕ ПО ОПЛАТЕ" in m.text for m in admin_notices))
+        self.assertTrue(all("Новое обращение #1 · Оплата" in m.text for m in admin_notices))
 
     async def test_refund_ui_calls_telegram_once_and_revokes_granted_access(self):
         order = await self.paid_order()

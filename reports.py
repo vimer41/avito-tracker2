@@ -133,11 +133,14 @@ async def reminder_worker(bot: Bot) -> None:
         except Exception:
             logger.exception("Сбой рассылки напоминаний")
         try:
-            from handlers.support import retry_undelivered_tickets
+            from handlers.support import close_stale_tickets, retry_undelivered_tickets
 
             count = await retry_undelivered_tickets(bot)
             if count:
                 logger.info("Доставлено отложенных обращений в поддержку: %s", count)
+            closed = await close_stale_tickets(bot)
+            if closed:
+                logger.info("Автоматически закрыто обращений без ответа пользователя: %s", closed)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -187,6 +190,12 @@ async def build_daily_report(reset: bool = True) -> str:
     ]
     if deficit > 0:
         lines.append(f"{ui.e('warn')} Не хватает мощности: {deficit:.2f} req/s — нужны ещё прокси")
+    tickets = await database.get_ticket_stats(time.time() - 86400)
+    if tickets["opened"] or tickets["waiting"] or tickets["answered"]:
+        lines.append(
+            f"{ui.e('support')} Поддержка: новых обращений <b>{tickets['opened']}</b>, ждут ответа <b>{tickets['waiting']}</b>"
+            + (f", ответ в среднем через {_fmt_seconds(tickets['median_wait'])}" if tickets["median_wait"] is not None else "")
+        )
     return "\n".join(lines)
 
 

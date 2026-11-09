@@ -138,10 +138,11 @@ class AccessControlMiddleware(BaseMiddleware):
         if isinstance(event, CallbackQuery) and event.data:
             allowed_callbacks = (
                 "buy_tariff:", "pay_request:", "demo_tariff:", "stars_buy:", "pay_method:", "rub_check:", "doc_page:",
+                "tk:", "tk_",  # support tickets: each handler checks that the ticket is the caller's own
             )
             allowed_exact = {
                 "open_subscription_menu", "activate_trial_btn", "trial_check", "support_start_ticket", "support_cancel",
-                "start_approved", "refresh_profile", "open_help_menu", "cancel_fsm", "ref_me",
+                "start_approved", "refresh_profile", "open_help_menu", "cancel_fsm", "ref_me", "open_support_stub",
                 "payment_terms", "payment_support", "other_payment_methods",
                 "open_docs_menu", "doc_agreement", "doc_privacy",
             }
@@ -166,6 +167,11 @@ class AccessControlMiddleware(BaseMiddleware):
         if state:
             current_st = await state.get_state()
             if current_st == "SupportStates:waiting_for_user_message":
+                return await handler(event, data)
+        # A quote-reply to a support message continues that ticket, access or not.
+        if isinstance(event, Message) and event.reply_to_message is not None:
+            ticket = await database.get_ticket_by_ref(event.chat.id, event.reply_to_message.message_id)
+            if ticket is not None and ticket["user_id"] == user_id:
                 return await handler(event, data)
 
         # 2. Проверяем наличие пользователя в БД

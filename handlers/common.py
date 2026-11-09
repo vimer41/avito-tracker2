@@ -665,20 +665,9 @@ async def cb_doc_page(call: CallbackQuery):
 async def cmd_support(event, state: Optional[FSMContext] = None):
     if state:
         await state.clear()
-    text = (
-        f"{ui.e('support')} <b>Поддержка</b>\n\n"
-        "Вопросы о работе бота, оплате и возвратах.\n"
-        "• Ежедневно с 09:00 до 23:00 (МСК)\n"
-        "• Возвраты рассматриваем в течение 24 часов\n"
-        f"• {ui.e('mail')} {legal_docs.SUPPORT_EMAIL}\n\n"
-        "Нажмите кнопку ниже и опишите вопрос: оператор ответит в этом чате."
-    )
-    await ui.show(event, text, ui.kb(
-        [ui.btn("Написать в поддержку", "write", callback_data="support_start_ticket", style="primary")],
-        [ui.btn("Документы", "docs", callback_data="open_docs_menu"),
-         ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu")],
-        [ui.home_btn()],
-    ))
+    from handlers.support import support_screen
+    text, markup = await support_screen(event.from_user.id)
+    await ui.show(event, text, markup)
 
 
 @router.callback_query(F.data == "support_stub_click")

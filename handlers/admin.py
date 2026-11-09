@@ -234,6 +234,9 @@ async def render_user_card_data(target_id: int, page: int = 0):
     extra_radars = int(user.get("extra_radars") or 0)
     extra_label = f", из них +{extra_radars} от админа" if extra_radars else ""
     blocked_count = len(await database.get_user_blocked_sellers_list(target_id))
+    tickets_total, tickets_live = await database.ticket_user_summary(target_id)
+    tickets_line = (f"• Обращения в поддержку: <b>{tickets_total}</b>"
+                    + (f", открыто <b>{tickets_live}</b>" if tickets_live else "") + "\n") if tickets_total else ""
 
     if has_access and not is_allowed and trial_used:
         status_line = f"🎁 <b>Бесплатный триал ({config.TRIAL_HOURS} ч)</b>"
@@ -260,6 +263,7 @@ async def render_user_card_data(target_id: int, page: int = 0):
         + (" (не проверяются: нет доступа)" if active_radars and not has_access else "") + "\n"
         f"• Чёрный список: <b>{blocked_count}</b> продавцов\n"
         f"• Триал использован: <b>{'Да' if trial_used else 'Нет'}</b>\n"
+        + tickets_line
         + await _activity_lines(target_id, user)
         + "━━━━━━━━━━━━━━━━━━━━\n"
         "Управление пользователем:"
@@ -304,9 +308,10 @@ async def render_user_card_data(target_id: int, page: int = 0):
     if has_access:
         buttons.append([InlineKeyboardButton(text="🚫 Отозвать доступ", callback_data=f"admin_revoke_prompt:{target_id}:{page}")])
     buttons.append([
-        InlineKeyboardButton(text="🗑 Удалить пользователя", callback_data=f"admin_purge_user:{target_id}:{page}"),
-        InlineKeyboardButton(text="✍️ Написать пользователю", callback_data=f"support_reply:{target_id}")
+        InlineKeyboardButton(text=f"💬 Обращения ({tickets_total})", callback_data=f"admin_tku:{target_id}:0"),
+        InlineKeyboardButton(text="✍️ Написать пользователю", callback_data=f"support_reply:{target_id}"),
     ])
+    buttons.append([InlineKeyboardButton(text="🗑 Удалить пользователя", callback_data=f"admin_purge_user:{target_id}:{page}")])
     buttons.append(back_row)
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -1415,6 +1420,7 @@ async def cmd_admin_home(event):
     from scheduler import get_last_scan_info
 
     stats = await database.get_system_stats()
+    waiting = (await database.count_tickets())["open"]
     text = (
         f"{ui.e('admin')} <b>Админ-панель</b>\n\n"
         f"{ui.e('users')} Пользователи: <b>{stats['total_users']}</b> · с доступом <b>{stats['allowed_users']}</b>\n"
@@ -1438,7 +1444,9 @@ async def cmd_admin_home(event):
          ui.btn("Продлить всем", "time", callback_data="admin_extend_all")],
         [ui.btn("Деньги", "coin", callback_data="admin_money"),
          ui.btn("Журнал админов", "write", callback_data="admin_alog")],
-        [ui.btn("Рефералы", "link", callback_data="ref_adm:0")],
+        [ui.btn("Рефералы", "link", callback_data="ref_adm:0"),
+         ui.btn(f"Поддержка ({waiting})" if waiting else "Поддержка", "support", callback_data="admin_tks",
+                style="primary" if waiting else None)],
         [ui.btn("Обновить", "refresh", callback_data="admin_refresh")],
     )
     await _show(event, text, kb)
@@ -2042,7 +2050,8 @@ async def cb_admin_purge_user(call: CallbackQuery):
     await _show(call, (
         f"{ui.e('warn')} <b>Точно удалить пользователя?</b>\n\n"
         f"{who}\n\n"
-        "Сотрутся пользователь, его радары, история лотов и логи. Отменить нельзя."
+        "Сотрутся пользователь, его радары, история лотов и логи. Отменить нельзя.\n"
+        "Переписка с поддержкой останется: открытые обращения закроются."
     ), InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"admin_purge_yes:{target_user_id}:{page}")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{target_user_id}:{page}")],

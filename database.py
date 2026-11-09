@@ -932,6 +932,7 @@ async def init_db():
                 created_epoch REAL NOT NULL
             );
         """)
+        await _create_ticket_tables(db)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS notification_outbox (
@@ -4050,27 +4051,389 @@ def create_database_backup_file() -> Optional[str]:
         return None
 
 
-async def save_support_ticket(user_id: int, full_name: str, username: str, text: str,
-                              media_type: str, file_id: str, is_payment: bool, created_epoch: float) -> int:
+# ── Support tickets ──────────────────────────────────────────────────────
+# A ticket and every message in it are kept for good: deleting a user only marks the ticket.
+# status: open (waits for support) → answered (waits for the user) → closed (by user / admin / auto).
+
+async def _create_ticket_tables(db) -> None:
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            topic TEXT NOT NULL DEFAULT 'general',
+            status TEXT NOT NULL DEFAULT 'open',
+            full_name TEXT NOT NULL DEFAULT '',
+            username TEXT NOT NULL DEFAULT '',
+            parent_id INTEGER,
+            created_epoch REAL NOT NULL,
+            updated_epoch REAL NOT NULL,
+            last_user_epoch REAL,
+            last_admin_epoch REAL,
+            closed_epoch REAL,
+            closed_by TEXT NOT NULL DEFAULT '',
+            closed_by_admin INTEGER,
+            user_deleted_epoch REAL
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS tickets_user ON tickets(user_id, id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS tickets_status ON tickets(status, updated_epoch)")
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS ticket_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER NOT NULL,
+            author TEXT NOT NULL,
+            admin_id INTEGER,
+            author_name TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL DEFAULT '',
+            media_type TEXT NOT NULL DEFAULT '',
+            file_id TEXT NOT NULL DEFAULT '',
+            created_epoch REAL NOT NULL,
+            delivered_epoch REAL
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS ticket_messages_ticket ON ticket_messages(ticket_id, id)")
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS ticket_messages_pending ON ticket_messages(delivered_epoch) WHERE delivered_epoch IS NULL"
+    )
+    # Which Telegram message belongs to which ticket: a quote-reply to it lands in that ticket.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS ticket_refs (
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            ticket_id INTEGER NOT NULL,
+            PRIMARY KEY (chat_id, message_id)
+        )
+    """)
+    # Undelivered requests of the old outbox become tickets that still wait for delivery.
+    async with db.execute("SELECT * FROM support_outbox ORDER BY id") as cur:
+        old_rows = [dict(row) for row in await cur.fetchall()]
+    for row in old_rows:
+        cursor = await db.execute(
+            "INSERT INTO tickets (user_id, topic, status, full_name, username, created_epoch, updated_epoch, last_user_epoch)"
+            " VALUES (?, ?, 'open', ?, ?, ?, ?, ?)",
+            (row["user_id"], "payment" if row["is_payment"] else "general", row["full_name"], row["username"],
+             row["created_epoch"], row["created_epoch"], row["created_epoch"]),
+        )
+        await db.execute(
+            "INSERT INTO ticket_messages (ticket_id, author, author_name, text, media_type, file_id, created_epoch)"
+            " VALUES (?, 'user', ?, ?, ?, ?, ?)",
+            (cursor.lastrowid, row["full_name"], row["text"], row["media_type"], row["file_id"], row["created_epoch"]),
+        )
+        await db.execute("DELETE FROM support_outbox WHERE id = ?", (row["id"],))
+
+
+_LIVE_TICKET_SQL = (
+    "SELECT * FROM tickets WHERE user_id = ? AND status IN ('open', 'answered') AND user_deleted_epoch IS NULL"
+    " ORDER BY id DESC LIMIT 1"
+)
+
+
+async def _ticket_row(db, ticket_id: int) -> Optional[Dict[str, Any]]:
+    async with db.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)) as cur:
+        row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def _live_ticket_row(db, user_id: int) -> Optional[Dict[str, Any]]:
+    async with db.execute(_LIVE_TICKET_SQL, (user_id,)) as cur:
+        row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def _ticket_note(db, ticket_id: int, text: str, now: float) -> None:
+    await db.execute(
+        "INSERT INTO ticket_messages (ticket_id, author, text, created_epoch, delivered_epoch) VALUES (?, 'system', ?, ?, ?)",
+        (ticket_id, text, now, now),
+    )
+
+
+def ticket_can_reopen(ticket: Dict[str, Any], now: Optional[float] = None) -> bool:
+    if ticket["status"] != "closed" or ticket.get("user_deleted_epoch"):
+        return False
+    return (now or time.time()) - float(ticket["closed_epoch"] or 0) <= config.SUPPORT_REOPEN_DAYS * 86400
+
+
+async def add_user_ticket_message(user_id: int, full_name: str, username: str, text: str, media_type: str = "",
+                                  file_id: str = "", is_payment: bool = False,
+                                  ticket_id: Optional[int] = None) -> tuple[Dict[str, Any], int, bool]:
+    """Appends to `ticket_id` (a closed one reopens inside the window) or to the user's live ticket;
+    otherwise starts one. Returns (ticket after the change, message id, ticket is new)."""
+    now = time.time()
     async with writer_connection() as db:
-        cursor = await db.execute("""
-            INSERT INTO support_outbox (user_id, full_name, username, text, media_type, file_id, is_payment, created_epoch)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, full_name, username, text, media_type, file_id, int(is_payment), created_epoch))
+        await db.execute("BEGIN IMMEDIATE")
+        ticket = await _ticket_row(db, ticket_id) if ticket_id else None
+        if ticket and (ticket["user_id"] != user_id or ticket.get("user_deleted_epoch")):
+            ticket = None
+        parent_id = None
+        if ticket and ticket["status"] == "closed":
+            if ticket_can_reopen(ticket, now):
+                await _ticket_note(db, ticket["id"], "Открыто снова пользователем", now)
+            else:
+                parent_id, ticket = ticket["id"], None
+        if ticket is None:
+            ticket = await _live_ticket_row(db, user_id)
+        is_new = ticket is None
+        if is_new:
+            cursor = await db.execute(
+                "INSERT INTO tickets (user_id, topic, status, full_name, username, parent_id, created_epoch, updated_epoch)"
+                " VALUES (?, ?, 'open', ?, ?, ?, ?, ?)",
+                (user_id, "payment" if is_payment else "general", full_name, username, parent_id, now, now),
+            )
+            tid = int(cursor.lastrowid)
+            if parent_id:
+                await _ticket_note(db, tid, f"Продолжение обращения #{parent_id}", now)
+        else:
+            tid = ticket["id"]
+        cursor = await db.execute(
+            "INSERT INTO ticket_messages (ticket_id, author, author_name, text, media_type, file_id, created_epoch)"
+            " VALUES (?, 'user', ?, ?, ?, ?, ?)",
+            (tid, full_name, text, media_type, file_id, now),
+        )
+        message_id = int(cursor.lastrowid)
+        await db.execute(
+            "UPDATE tickets SET status = 'open', full_name = ?, username = ?, updated_epoch = ?, last_user_epoch = ?,"
+            " closed_epoch = NULL, closed_by = '', closed_by_admin = NULL,"
+            " topic = CASE WHEN ? THEN 'payment' ELSE topic END WHERE id = ?",
+            (full_name, username, now, now, int(bool(is_payment)), tid),
+        )
+        ticket = await _ticket_row(db, tid)
         await db.commit()
-        return int(cursor.lastrowid)
+    return ticket, message_id, is_new
 
 
-async def get_undelivered_support_tickets(limit: int = 20) -> List[Dict[str, Any]]:
+async def ticket_for_admin_message(user_id: int) -> Dict[str, Any]:
+    """The user's live ticket, or a new one started by support (a message to someone who never wrote)."""
+    now = time.time()
+    async with writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        ticket = await _live_ticket_row(db, user_id)
+        if ticket:
+            await db.commit()
+            return ticket
+        async with db.execute("SELECT first_name, username FROM users WHERE user_id = ?", (user_id,)) as cur:
+            user = await cur.fetchone()
+        cursor = await db.execute(
+            "INSERT INTO tickets (user_id, status, full_name, username, created_epoch, updated_epoch)"
+            " VALUES (?, 'answered', ?, ?, ?, ?)",
+            (user_id, (user["first_name"] if user else "") or "", (user["username"] if user else "") or "", now, now),
+        )
+        tid = int(cursor.lastrowid)
+        await _ticket_note(db, tid, "Обращение начато поддержкой", now)
+        ticket = await _ticket_row(db, tid)
+        await db.commit()
+    return ticket
+
+
+async def add_admin_ticket_message(ticket_id: int, admin_id: int, admin_name: str, text: str, media_type: str = "",
+                                   file_id: str = "", delivered: bool = True) -> Optional[Dict[str, Any]]:
+    """Support's answer. Answering a closed ticket reopens it."""
+    now = time.time()
+    async with writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        ticket = await _ticket_row(db, ticket_id)
+        if ticket is None:
+            await db.commit()
+            return None
+        if ticket["status"] == "closed":
+            await _ticket_note(db, ticket_id, f"Открыто снова поддержкой ({admin_name})", now)
+        await db.execute(
+            "INSERT INTO ticket_messages (ticket_id, author, admin_id, author_name, text, media_type, file_id,"
+            " created_epoch, delivered_epoch) VALUES (?, 'admin', ?, ?, ?, ?, ?, ?, ?)",
+            (ticket_id, admin_id, admin_name, text, media_type, file_id, now, now if delivered else None),
+        )
+        await db.execute(
+            "UPDATE tickets SET status = 'answered', updated_epoch = ?, last_admin_epoch = ?, closed_epoch = NULL,"
+            " closed_by = '', closed_by_admin = NULL WHERE id = ?",
+            (now, now, ticket_id),
+        )
+        ticket = await _ticket_row(db, ticket_id)
+        await db.commit()
+    return ticket
+
+
+async def close_ticket(ticket_id: int, by: str, admin_id: Optional[int] = None,
+                       admin_name: str = "") -> Optional[Dict[str, Any]]:
+    """by: user / admin / auto. None when the ticket is missing or already closed."""
+    now = time.time()
+    notes = {
+        "user": "Закрыто пользователем",
+        "admin": f"Закрыто поддержкой ({admin_name})",
+        "auto": f"Закрыто автоматически: нет ответа {config.SUPPORT_AUTOCLOSE_HOURS} ч",
+    }
+    async with writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        ticket = await _ticket_row(db, ticket_id)
+        if ticket is None or ticket["status"] == "closed":
+            await db.commit()
+            return None
+        await _ticket_note(db, ticket_id, notes[by], now)
+        await db.execute(
+            "UPDATE tickets SET status = 'closed', closed_epoch = ?, closed_by = ?, closed_by_admin = ?, updated_epoch = ?"
+            " WHERE id = ?",
+            (now, by, admin_id, now, ticket_id),
+        )
+        ticket = await _ticket_row(db, ticket_id)
+        await db.commit()
+    return ticket
+
+
+async def reopen_ticket(ticket_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+    """The user's «Открыть снова»: only their own ticket, only inside the window, only with no other live one."""
+    now = time.time()
+    async with writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        ticket = await _ticket_row(db, ticket_id)
+        if (ticket is None or ticket["user_id"] != user_id or not ticket_can_reopen(ticket, now)
+                or await _live_ticket_row(db, user_id)):
+            await db.commit()
+            return None
+        await _ticket_note(db, ticket_id, "Открыто снова пользователем", now)
+        await db.execute(
+            "UPDATE tickets SET status = 'open', closed_epoch = NULL, closed_by = '', closed_by_admin = NULL,"
+            " updated_epoch = ?, last_user_epoch = ? WHERE id = ?", (now, now, ticket_id),
+        )
+        ticket = await _ticket_row(db, ticket_id)
+        await db.commit()
+    return ticket
+
+
+async def close_stale_tickets(now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Answered tickets the user left silent for SUPPORT_AUTOCLOSE_HOURS."""
+    cutoff = (now or time.time()) - config.SUPPORT_AUTOCLOSE_HOURS * 3600
     async with reader_connection() as db:
-        async with db.execute("SELECT * FROM support_outbox ORDER BY id LIMIT ?", (limit,)) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
+        async with db.execute(
+            "SELECT id FROM tickets WHERE status = 'answered' AND COALESCE(last_admin_epoch, updated_epoch) < ?", (cutoff,),
+        ) as cur:
+            ids = [row[0] for row in await cur.fetchall()]
+    closed = []
+    for tid in ids:
+        ticket = await close_ticket(tid, "auto")
+        if ticket:
+            closed.append(ticket)
+    return closed
 
 
-async def delete_support_ticket(ticket_id: int) -> None:
+async def get_ticket(ticket_id: int) -> Optional[Dict[str, Any]]:
+    async with reader_connection() as db:
+        return await _ticket_row(db, ticket_id)
+
+
+async def get_live_ticket(user_id: int) -> Optional[Dict[str, Any]]:
+    async with reader_connection() as db:
+        return await _live_ticket_row(db, user_id)
+
+
+async def _ticket_page(where: str, args: tuple, order: str, offset: int, limit: int) -> tuple[List[Dict[str, Any]], int]:
+    async with reader_connection() as db:
+        async with db.execute(f"SELECT COUNT(*) FROM tickets t WHERE {where}", args) as cur:
+            total = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT t.*, (SELECT COUNT(*) FROM ticket_messages m WHERE m.ticket_id = t.id AND m.author != 'system')"
+            f" AS messages FROM tickets t WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?", (*args, limit, offset),
+        ) as cur:
+            rows = [dict(row) for row in await cur.fetchall()]
+    return rows, int(total)
+
+
+async def list_user_tickets(user_id: int, offset: int = 0, limit: int = 6,
+                            include_deleted: bool = False) -> tuple[List[Dict[str, Any]], int]:
+    where = "t.user_id = ?" + ("" if include_deleted else " AND t.user_deleted_epoch IS NULL")
+    return await _ticket_page(where, (user_id,), "t.id DESC", offset, limit)
+
+
+async def list_tickets(status: str, offset: int = 0, limit: int = 8) -> tuple[List[Dict[str, Any]], int]:
+    # Waiting tickets: the longest wait first. The rest: the latest change first.
+    order = "COALESCE(t.last_user_epoch, t.updated_epoch)" if status == "open" else "t.updated_epoch DESC"
+    return await _ticket_page("t.status = ?", (status,), order, offset, limit)
+
+
+async def count_tickets() -> Dict[str, int]:
+    async with reader_connection() as db:
+        async with db.execute("SELECT status, COUNT(*) FROM tickets GROUP BY status") as cur:
+            counts = {row[0]: int(row[1]) for row in await cur.fetchall()}
+    return {status: counts.get(status, 0) for status in ("open", "answered", "closed")}
+
+
+async def ticket_user_summary(user_id: int) -> tuple[int, int]:
+    """(all tickets, live tickets) of a user, the deleted account's ones included."""
+    async with reader_connection() as db:
+        async with db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(status IN ('open', 'answered')), 0) FROM tickets WHERE user_id = ?", (user_id,),
+        ) as cur:
+            total, live = await cur.fetchone()
+    return int(total), int(live)
+
+
+async def get_ticket_messages(ticket_id: int) -> List[Dict[str, Any]]:
+    async with reader_connection() as db:
+        async with db.execute("SELECT * FROM ticket_messages WHERE ticket_id = ? ORDER BY id", (ticket_id,)) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+
+async def get_undelivered_ticket_messages(limit: int = 20) -> List[Dict[str, Any]]:
+    """User messages no admin has received yet, each with its ticket's fields."""
+    async with reader_connection() as db:
+        async with db.execute(
+            "SELECT t.*, m.id AS message_id, m.text, m.media_type, m.file_id, m.created_epoch AS message_epoch,"
+            " NOT EXISTS (SELECT 1 FROM ticket_messages p WHERE p.ticket_id = m.ticket_id AND p.author = 'user'"
+            " AND p.id < m.id) AS is_new FROM ticket_messages m JOIN tickets t ON t.id = m.ticket_id"
+            " WHERE m.delivered_epoch IS NULL AND m.author = 'user' ORDER BY m.id LIMIT ?", (limit,),
+        ) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+
+async def mark_ticket_message_delivered(message_id: int) -> None:
     async with writer_connection() as db:
-        await db.execute("DELETE FROM support_outbox WHERE id = ?", (ticket_id,))
+        await db.execute("UPDATE ticket_messages SET delivered_epoch = ? WHERE id = ?", (time.time(), message_id))
         await db.commit()
+
+
+async def save_ticket_refs(ticket_id: int, refs: Iterable[tuple[int, int]]) -> None:
+    rows = [(int(chat_id), int(message_id), ticket_id) for chat_id, message_id in refs]
+    if not rows:
+        return
+    async with writer_connection() as db:
+        await db.executemany("INSERT OR REPLACE INTO ticket_refs (chat_id, message_id, ticket_id) VALUES (?, ?, ?)", rows)
+        await db.commit()
+
+
+async def get_ticket_by_ref(chat_id: int, message_id: int) -> Optional[Dict[str, Any]]:
+    async with reader_connection() as db:
+        async with db.execute(
+            "SELECT t.* FROM ticket_refs r JOIN tickets t ON t.id = r.ticket_id WHERE r.chat_id = ? AND r.message_id = ?",
+            (chat_id, message_id),
+        ) as cur:
+            row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def get_ticket_stats(since_epoch: float) -> Dict[str, Any]:
+    """For the morning report: tickets waiting now, opened since, and how long people waited for an answer."""
+    async with reader_connection() as db:
+        async with db.execute("SELECT COUNT(*) FROM tickets WHERE status = 'open'") as cur:
+            waiting = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM tickets WHERE created_epoch >= ?", (since_epoch,)) as cur:
+            opened = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT ticket_id, author, created_epoch FROM ticket_messages"
+            " WHERE author != 'system' AND ticket_id IN (SELECT DISTINCT ticket_id FROM ticket_messages"
+            " WHERE author = 'admin' AND created_epoch >= ?) ORDER BY ticket_id, id", (since_epoch,),
+        ) as cur:
+            rows = await cur.fetchall()
+    # The wait is from the first unanswered user message to the next support message.
+    waits, asked = [], {}
+    for ticket_id, author, at in rows:
+        if author == "user":
+            asked.setdefault(ticket_id, at)
+        elif ticket_id in asked:
+            start = asked.pop(ticket_id)
+            if at >= since_epoch:
+                waits.append(at - start)
+    waits.sort()
+    return {
+        "waiting": int(waiting), "opened": int(opened), "answered": len(waits),
+        "median_wait": waits[len(waits) // 2] if waits else None,
+    }
 
 
 async def purge_user_by_pattern(pattern: str) -> Dict[str, Any]:
@@ -4120,6 +4483,20 @@ async def purge_user_by_pattern(pattern: str) -> Dict[str, Any]:
             await db.execute("DELETE FROM usage_daily WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM blocked_sellers WHERE user_id = ?", (uid,))
             await db.execute("DELETE FROM support_outbox WHERE user_id = ?", (uid,))
+            # Support history stays: the ticket only learns that the account is gone.
+            now_epoch = time.time()
+            async with db.execute(
+                "SELECT id FROM tickets WHERE user_id = ? AND status IN ('open', 'answered')", (uid,)
+            ) as cur:
+                live_ids = [row[0] for row in await cur.fetchall()]
+            for tid in live_ids:
+                await _ticket_note(db, tid, "Закрыто: пользователь удалён", now_epoch)
+            await db.execute(
+                "UPDATE tickets SET status = 'closed', closed_epoch = ?, closed_by = 'admin', updated_epoch = ? "
+                "WHERE user_id = ? AND status IN ('open', 'answered')", (now_epoch, now_epoch, uid))
+            await db.execute(
+                "UPDATE tickets SET user_deleted_epoch = ? WHERE user_id = ? AND user_deleted_epoch IS NULL",
+                (now_epoch, uid))
             await db.execute("DELETE FROM admin_subscription_actions WHERE user_id = ? AND applied_at IS NULL", (uid,))
             await db.execute("DELETE FROM users WHERE user_id = ?", (uid,))
             invalidate_blacklist_cache(uid)

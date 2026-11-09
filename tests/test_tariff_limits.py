@@ -307,26 +307,21 @@ class TestExpiredAlerts(unittest.TestCase):
 
 
 class TestSupportOutbox(DatabaseCase):
-    def ticket(self, **fields):
-        return {
-            "user_id": USER_ID, "full_name": "U <b>", "username": "", "text": "x" * 4090, "media_type": "", "file_id": "",
-            "is_payment": False, "created_epoch": time.time(), **fields,
-        }
-
-    async def saved(self, **fields):
-        ticket = self.ticket(**fields)
-        ticket["id"] = await database.save_support_ticket(**ticket)
-        return ticket
+    async def saved(self, text="x" * 4090, media_type="", file_id=""):
+        ticket, message_id, _new = await database.add_user_ticket_message(USER_ID, "U <b>", "", text, media_type, file_id)
+        return {**ticket, "message_id": message_id, "text": text, "media_type": media_type, "file_id": file_id,
+                "message_epoch": ticket["last_user_epoch"]}
 
     async def test_ticket_waits_in_the_outbox_until_an_admin_gets_it(self):
         ticket = await self.saved(text="помогите")
         broken = SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("flood")))
         self.assertFalse(await support.deliver_ticket(broken, ticket))
-        self.assertEqual(len(await database.get_undelivered_support_tickets()), 1)
+        self.assertEqual(len(await database.get_undelivered_ticket_messages()), 1)
 
         working = SimpleNamespace(send_message=AsyncMock())
         self.assertEqual(await support.retry_undelivered_tickets(working), 1)
-        self.assertEqual(await database.get_undelivered_support_tickets(), [])
+        self.assertEqual(await database.get_undelivered_ticket_messages(), [])
+        self.assertEqual(len(await database.get_ticket_messages(ticket["id"])), 1)  # delivered, still in history
 
     async def test_long_ticket_is_split_into_allowed_sizes(self):
         bot = SimpleNamespace(send_message=AsyncMock())
@@ -341,13 +336,12 @@ class TestSupportOutbox(DatabaseCase):
         self.assertLess(len(bot.send_photo.await_args.kwargs["caption"]), 1024)
         bot.send_message.assert_awaited_once()
 
-    async def test_quote_reply_finds_the_user_in_plain_text(self):
-        replied = SimpleNamespace(text=f"📩 ОБРАЩЕНИЕ\n🆔 ID: {USER_ID}\n🕒 Время: 01.01", caption=None)
-        message = SimpleNamespace(from_user=SimpleNamespace(id=config.ADMIN_ID), reply_to_message=replied, reply=AsyncMock())
-        state = SimpleNamespace(get_state=AsyncMock(return_value=None))
-        with patch.object(support, "send_reply_to_user", new=AsyncMock(return_value=(True, ""))) as send:
-            await support.handle_admin_quote_reply(message, state, SimpleNamespace())
-        self.assertEqual(send.await_args.args[1], USER_ID)
+    async def test_quote_reply_to_an_old_notice_finds_the_user_in_plain_text(self):
+        replied = SimpleNamespace(text=f"📩 ОБРАЩЕНИЕ\n🆔 ID: {USER_ID}\n🕒 Время: 01.01", caption=None, message_id=7)
+        message = SimpleNamespace(from_user=SimpleNamespace(id=config.ADMIN_ID), reply_to_message=replied,
+                                  chat=SimpleNamespace(id=config.ADMIN_ID))
+        found = await support._admin_ref(message)
+        self.assertEqual(found["ref_ticket"]["user_id"], USER_ID)
 
 
 class TestDailyBackup(DatabaseCase):
