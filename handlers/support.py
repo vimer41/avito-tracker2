@@ -109,10 +109,20 @@ def _author(row: dict, ticket: dict, as_admin: bool) -> str:
 
 
 def page_slice(messages: list, page: int) -> tuple[list, int, int]:
-    pages = max(1, -(-len(messages) // PAGE_MESSAGES))
+    """PAGE_MESSAGES real messages per page. A system line («Закрыто…», «Открыто снова…») rides with the message
+    before it, so a page never holds only such lines and the last page always shows the conversation."""
+    groups: list[list] = []
+    for row in messages:
+        if row["author"] == "system" and groups:
+            groups[-1].append(row)
+        elif groups and all(r["author"] == "system" for r in groups[-1]):
+            groups[-1].append(row)  # leading lines join the first real message
+        else:
+            groups.append([row])
+    pages = max(1, -(-len(groups) // PAGE_MESSAGES))
     if page < 0 or page >= pages:
         page = pages - 1
-    return messages[page * PAGE_MESSAGES:(page + 1) * PAGE_MESSAGES], page, pages
+    return [row for group in groups[page * PAGE_MESSAGES:(page + 1) * PAGE_MESSAGES] for row in group], page, pages
 
 
 def _message_block(row: dict, ticket: dict, as_admin: bool) -> str:

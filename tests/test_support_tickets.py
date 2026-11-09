@@ -185,6 +185,19 @@ class TestTicketCard(TicketCase):
         self.assertNotIn("сообщение 6", first)
         self.assertNotIn(f"tk:{ticket['id']}:-1", self.callback_values())
 
+    async def test_close_and_reopen_lines_never_fill_a_page_alone(self):
+        ticket, _mid, _new = await database.add_user_ticket_message(USER, "Fixture", "", "сообщение 1")
+        for n in range(2, 6):
+            await database.add_user_ticket_message(USER, "Fixture", "", f"сообщение {n}")
+        await database.close_ticket(ticket["id"], "admin", ADMIN, "захар")
+        await database.reopen_ticket(ticket["id"], USER)
+        await database.close_ticket(ticket["id"], "user")
+        await self.dispatch_callback(f"tk:{ticket['id']}:-1")
+        screen = self.methods("EditMessageText")[-1].text
+        self.assertNotIn("стр.", screen)
+        self.assertIn("сообщение 5", screen)
+        self.assertIn("Закрыто пользователем", screen)
+
     async def test_long_message_is_cut_and_sent_whole_on_request(self):
         ticket, _mid, _new = await database.add_user_ticket_message(USER, "Fixture", "", "а" * 1000)
         await self.dispatch_callback(f"tk:{ticket['id']}:-1")
