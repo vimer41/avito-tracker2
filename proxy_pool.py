@@ -30,6 +30,11 @@ SMART_CRITICAL_MIN_ANSWERS = 10
 
 ALLOWED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 
+# Catalog page timing for speed-aware routing: a search page is ~300 KB, a challenge or error page is far smaller.
+PAGE_MIN_BYTES = 50_000
+PAGE_TIME_WINDOW = 30
+PAGE_TIME_MIN_SAMPLES = 5
+
 
 def compute_proxy_id(normalized_url: str | None) -> str:
     if not normalized_url:
@@ -209,6 +214,9 @@ class ProxyClient:
         self._history_10m: deque[tuple[float, int | None, bool]] = deque()
         # Last answers however old: a reserve proxy may stay idle for hours, its record must not vanish.
         self._outcomes: deque[bool] = deque(maxlen=max(1, int(config.PROXY_QUALITY_WINDOW)))
+        # Seconds per full catalog page (200, big body): routing prefers the channels that load it faster.
+        self._page_times: deque[float] = deque(maxlen=PAGE_TIME_WINDOW)
+        self.page_time_p50: float | None = None
 
         # Persistent AsyncSession per lane (created lazily)
         self._async_sessions: dict[int, curl_requests.AsyncSession] = {}
@@ -465,7 +473,17 @@ class ProxyClient:
             return "основной, работает в первую очередь"
         return "слабый, работает как запасной и проверяется раз в минуту"
 
-    def routing_score(self, now: float, server_first: bool = False) -> float:
+    def speed_bonus(self, pool_page_p50: float | None) -> float:
+        """Up to PROXY_SPEED_BONUS for a channel that loads a catalog page faster than the pool's typical one:
+        the page time adds straight to every lot's delay. Half the pool's time or less gets the full bonus."""
+        top = float(config.PROXY_SPEED_BONUS)
+        own = self.page_time_p50
+        if top <= 0 or own is None or not pool_page_p50 or pool_page_p50 <= 0:
+            return 0.0
+        gain = (pool_page_p50 - own) / pool_page_p50
+        return top * max(0.0, min(1.0, gain * 2.0))
+
+    def routing_score(self, now: float, server_first: bool = False, pool_page_p50: float | None = None) -> float:
         """Higher goes first: unproven channel due for a probe, proven proxy, server or weak proxy, overloaded proxy.
         With server_first (smart mode while the server copes) the server leads and proxies are a reserve
         ordered by their long record: no probes, so an idle proxy costs no scan a timeout."""
@@ -484,8 +502,13 @@ class ProxyClient:
             last_ok = last is not None and not last[2] and last[1] is not None and 200 <= last[1] < 400
             if idle >= float(config.PROXY_PROBE_RETRY if last_ok else config.PROXY_PROBE_INTERVAL):
                 return 2.0
-        # Every proven proxy scores the same, so the load rotates among them; the server is never one of them.
-        score = 1.0 if good and not self.is_direct else min(health, float(config.PROXY_GOOD_HEALTH) * 0.99)
+        # Proven proxies rotate; a faster one goes first while it is cold (the bonus stays under PROXY_HOT_PENALTY,
+        # so a hot fast proxy yields to a cold slow one and no IP is pushed past PROXY_PREFERRED_RATE).
+        # The server is never one of them.
+        if good and not self.is_direct:
+            score = 1.0 + min(self.speed_bonus(pool_page_p50), float(config.PROXY_HOT_PENALTY) * 0.9)
+        else:
+            score = min(health, float(config.PROXY_GOOD_HEALTH) * 0.99)
         with self._pacing_lock:
             busy = self.in_flight >= self.max_in_flight
         if busy or idle < 1.0 / float(config.PROXY_PREFERRED_RATE):
@@ -505,6 +528,11 @@ class ProxyClient:
         self._prune_10m_history(now)
         self._history_10m.append((now, status_code, is_transport_error))
         self._outcomes.append(not is_transport_error and status_code is not None and 200 <= status_code < 400)
+        if not is_transport_error and status_code == 200 and size_bytes >= PAGE_MIN_BYTES and latency_seconds > 0:
+            self._page_times.append(float(latency_seconds))
+            if len(self._page_times) >= PAGE_TIME_MIN_SAMPLES:
+                ordered = sorted(self._page_times)
+                self.page_time_p50 = ordered[len(ordered) // 2]
 
         METRICS.record_http_request(
             self.proxy_id,
@@ -1049,6 +1077,8 @@ class ProxyPool:
             return None
         n = len(all_clients)
         server_first = self._evaluate_smart(now, all_clients)
+        page_times = sorted(c.page_time_p50 for c in all_clients if c.page_time_p50 is not None and not c.is_direct)
+        pool_page_p50 = page_times[len(page_times) // 2] if len(page_times) >= 3 else None
         candidates: list[tuple[int, float, float, int, ProxyClient]] = []
         ready_within = float(config.PROXY_BUSY_PENALTY)
         for offset in range(n):
@@ -1058,7 +1088,7 @@ class ProxyPool:
                 continue
             if not client.is_available_for_scan(now):
                 continue
-            score = client.routing_score(now, server_first=server_first)
+            score = client.routing_score(now, server_first=server_first, pool_page_p50=pool_page_p50)
             with client._pacing_lock:
                 # A busy fast channel usually frees up sooner than a throttled idle one becomes ready.
                 queued = max(0, client.in_flight - client.max_in_flight + 1)

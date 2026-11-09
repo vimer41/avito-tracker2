@@ -142,6 +142,9 @@ PROXY_GOOD_HEALTH = positive_float_setting("PROXY_GOOD_HEALTH", "0.7")
 # A proven IP stays preferred up to this rate; above it the score drops by PROXY_HOT_PENALTY and load spills over.
 PROXY_PREFERRED_RATE = positive_float_setting("PROXY_PREFERRED_RATE", "0.5")
 PROXY_HOT_PENALTY = positive_float_setting("PROXY_HOT_PENALTY", "0.5")
+# A proven proxy that loads a catalog page faster than the pool's typical one goes first while it is cold
+# (up to this score bonus, kept under PROXY_HOT_PENALTY). 0 turns speed-aware routing off.
+PROXY_SPEED_BONUS = non_negative_float_setting("PROXY_SPEED_BONUS", "0.3")
 # A free channel takes a scan before a busy one when at least this share of its recent answers succeeded:
 # below it the channel mostly answers 403 and the scan would only lose a round trip. 0.3 (08.11 evening) let
 # the server, blocked on 70 % of answers, take more scans than any proxy.

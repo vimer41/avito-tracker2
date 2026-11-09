@@ -214,6 +214,42 @@ class TestChannelRouting(unittest.TestCase):
         self.assertEqual(set(picked), {self.good, self.other})
         self.assertLessEqual(abs(picked.count(self.good) - picked.count(self.other)), 1)
 
+    def load_pages(self, client, seconds, count=6):
+        for _ in range(count):
+            client.record_raw_http_response(200, seconds, size_bytes=290_000)
+
+    def test_a_faster_proxy_goes_first_while_it_is_cold(self):
+        self.settle_channels()
+        self.answer(self.weak, *[200] * 10)  # three proven proxies
+        self.load_pages(self.good, 1.0)
+        self.load_pages(self.other, 4.0)
+        self.load_pages(self.weak, 4.0)
+        self.assertEqual(self.good.page_time_p50, 1.0)
+        picked = [self.pick(1.0 / config.PROXY_PREFERRED_RATE + 0.1) for _ in range(5)]
+        self.assertEqual(picked, [self.good] * 5)
+
+    def test_a_hot_fast_proxy_yields_to_a_cold_slow_one(self):
+        self.settle_channels()
+        self.answer(self.weak, *[200] * 10)
+        self.load_pages(self.good, 1.0)
+        self.load_pages(self.other, 4.0)
+        self.load_pages(self.weak, 4.0)
+        picked = [self.pick(0.2) for _ in range(3)]
+        self.assertIs(picked[0], self.good)
+        self.assertNotIn(self.good, picked[1:])
+
+    def test_small_pages_and_off_switch_leave_rotation_alone(self):
+        self.settle_channels()
+        for _ in range(6):
+            self.good.record_raw_http_response(200, 0.2, size_bytes=4_000)  # challenge page, not a catalog
+        self.assertIsNone(self.good.page_time_p50)
+        self.load_pages(self.good, 1.0)
+        self.load_pages(self.other, 4.0)
+        self.load_pages(self.weak, 4.0)
+        with patch.object(config, "PROXY_SPEED_BONUS", 0.0):
+            picked = [self.pick(1.0) for _ in range(8)]
+        self.assertLessEqual(abs(picked.count(self.good) - picked.count(self.other)), 1)
+
     def test_load_above_preferred_rate_spills_to_the_better_reserve(self):
         self.settle_channels()
         self.answer(self.direct, 200, 200)  # 60 % ok beats the weak proxy's 50 %
