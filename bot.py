@@ -15,6 +15,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import config  # first: loads .env before other modules read the environment
 import anti_bot.challenge_process as challenge_process
 import database
+import link_check
 import reports
 import ui
 from handlers import main_router
@@ -170,6 +171,7 @@ async def main():
             pid=os.getpid(),
         )
         background_tasks.append(asyncio.create_task(reports.announce_release(bot, version), name="release-note"))
+        background_tasks.append(asyncio.create_task(link_check.warn_bad_links(bot), name="bad-links"))
         await dp.start_polling(bot)
     finally:
         logger.info("Завершение работы бота...")

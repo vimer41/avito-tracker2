@@ -1195,6 +1195,26 @@ def _plan_max_radars(plan: str, is_allowed: bool, trial_used: bool) -> int:
 
 PAUSE_LIMIT = "limit"      # paused by the bot: the radar does not fit the tariff
 PAUSE_BLOCKED = "blocked"  # paused by the bot: the user blocked it
+PAUSE_BAD_LINK = "bad_link"  # paused by the bot: the link can never be a search (link_check); a new link resumes it
+
+
+async def pause_bad_link_searches(keeps_running) -> list[dict]:
+    """Running radars whose link fails keeps_running(url) pause with PAUSE_BAD_LINK. Returns them."""
+    async with writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT id, user_id, title, url FROM searches WHERE is_active = 1") as cursor:
+            rows = await cursor.fetchall()
+        bad = [
+            {"id": int(row[0]), "user_id": int(row[1]), "title": row[2], "url": row[3]}
+            for row in rows if not keeps_running(row[3] or "")
+        ]
+        for radar in bad:
+            await db.execute(
+                "UPDATE searches SET is_active = 0, pause_reason = ? WHERE id = ?", (PAUSE_BAD_LINK, radar["id"])
+            )
+            await log_radar_history(db, radar["user_id"], radar["id"], "bad_link_pause", detail="ссылка не на поиск")
+        await db.commit()
+    return bad
 
 
 async def sync_radar_limit_in_transaction(db, user_id: int) -> None:
@@ -1562,6 +1582,8 @@ RADAR_HISTORY_LABELS = {
     "limit_resume": "снова в работе: место в тарифе",
     "blocked_pause": "пауза: бот заблокирован",
     "blocked_resume": "снова в работе: бот разблокирован",
+    "bad_link_pause": "пауза: ссылка не на поиск",
+    "bad_link_resume": "снова в работе: новая ссылка",
 }
 
 
@@ -1827,7 +1849,9 @@ async def get_paid_user_ids() -> set[int]:
 async def replace_search_url(search_id: int, user_id: int, url: str, search_in_title_only: int,
                              *, title: Optional[str] = None, initial_items=None) -> bool:
     """New search link for an existing radar: settings and stop words stay, the old baseline is dropped.
-    initial_items=None defers calibration to the first scan, like add_search."""
+    initial_items=None defers calibration to the first scan, like add_search.
+    A radar paused for a bad link runs again with the new one when the tariff has room."""
+    max_radars = await get_user_max_radars(user_id)
     async with writer_connection() as db:
         await db.execute("BEGIN IMMEDIATE")
         cursor = await db.execute(
@@ -1838,6 +1862,18 @@ async def replace_search_url(search_id: int, user_id: int, url: str, search_in_t
             await db.commit()
             return False
         await log_radar_history(db, user_id, search_id, "url")
+        async with db.execute("SELECT pause_reason FROM searches WHERE id = ?", (search_id,)) as cur:
+            row = await cur.fetchone()
+        if row and row[0] == PAUSE_BAD_LINK:
+            async with db.execute(
+                "SELECT COUNT(*) FROM searches WHERE user_id = ? AND is_active = 1", (user_id,)
+            ) as cur:
+                running = int((await cur.fetchone())[0])
+            if user_id in ADMIN_IDS or running < max_radars:
+                await db.execute("UPDATE searches SET is_active = 1, pause_reason = '' WHERE id = ?", (search_id,))
+                await log_radar_history(db, user_id, search_id, "bad_link_resume")
+            else:
+                await db.execute("UPDATE searches SET pause_reason = '' WHERE id = ?", (search_id,))
         await db.execute("DELETE FROM seen_items WHERE search_id = ?", (search_id,))
         await db.execute("DELETE FROM notification_outbox WHERE search_id = ?", (search_id,))
         if initial_items is not None:

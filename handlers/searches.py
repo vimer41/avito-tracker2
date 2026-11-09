@@ -12,6 +12,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import config
 import database
+import link_check
 import radar_filters
 import ui
 from parser import AvitoParser
@@ -114,7 +115,7 @@ async def bulk_add_radars(message: Message, state: FSMContext, urls: List[str]) 
 
     added, duplicates, invalid, over_limit = [], 0, 0, 0
     for raw in urls:
-        if "/item/" in raw or re.search(r"_\d{8,}", raw):
+        if "/item/" in raw or re.search(r"_\d{8,}", raw) or link_check.link_problem(raw) is not None:
             invalid += 1
             continue
         try:
@@ -236,6 +237,9 @@ def search_url_error(raw_url: str) -> Optional[str]:
     if "/item/" in raw_url or re.search(r"_\d{8,}", raw_url):
         return (f"{ui.e('warn')} <b>Это ссылка на одно объявление</b>\n\n"
                 "Радару нужна ссылка на <b>страницу поиска</b>: со списком объявлений и фильтрами.")
+    problem = link_check.link_problem(raw_url)
+    if problem is not None:
+        return link_check.problem_message(problem)
     return None
 
 
@@ -484,8 +488,11 @@ def build_radar_card(s: dict, lots_day: Optional[int] = None) -> Tuple[str, Inli
     status = f"{ui.e('on')} Работает" if is_active else f"{ui.e('pause')} На паузе"
     if s.get("pause_reason") == database.PAUSE_LIMIT:
         status += " (не вошёл в лимит тарифа)"
+    elif s.get("pause_reason") == database.PAUSE_BAD_LINK:
+        status += " (ссылка не на поиск)"
     card_text = (
         f"{ui.e('radar')} <b>{html.escape(s['title'])}</b>\n\n"
+        + link_check.card_warning(s["url"]) +
         f"<b>Статус:</b> {status}\n"
         + _check_line(s, lots_day)
         + f"<b>Ищет:</b> {_scope_label(title_only)}\n"
@@ -601,6 +608,11 @@ async def cb_open_search(call: CallbackQuery):
 @router.callback_query(F.data.startswith("toggle_search:"))
 async def cb_toggle_search(call: CallbackQuery):
     search_id = int(call.data.split(":")[1])
+    current = await database.get_search(search_id)
+    if (current and current.get("user_id") == call.from_user.id and not current.get("is_active")
+            and not link_check.keeps_running(current.get("url") or "")):
+        await call.answer("Эта ссылка не страница поиска, радар ничего не пришлёт. Нажмите «Сменить ссылку».", show_alert=True)
+        return
     try:
         new_status = await database.toggle_search_active(search_id, call.from_user.id)
     except database.RadarLimitError as exc:
