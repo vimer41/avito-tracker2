@@ -460,6 +460,8 @@ def _clean_button(b):
                 icon = custom_id(slot)
                 break
     label = drop_colour_emoji(text).strip()
+    if label[:1] in ("❌", "✖"):  # a red cross next to the cancel icon reads twice: the icon alone
+        label, icon = label.lstrip("❌✖️ ").strip(), icon or custom_id("cancel")
     if label in _HOME_LABELS:
         label, icon = "Меню", icon or custom_id("home")
     elif label.startswith("« ") and len(label) > 2:

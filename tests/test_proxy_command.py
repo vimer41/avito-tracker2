@@ -270,6 +270,9 @@ class TestNetworkScreen(ProxyEnvMixin, DispatcherFixture, unittest.IsolatedAsync
         delete_buttons = [v for v in self.callback_values() if v.startswith("admin_net_del:")]
         self.assertEqual(len(delete_buttons), 2)
         await self.dispatch_callback(delete_buttons[0], config.ADMIN_ID)
+        self.assertEqual(len(await database.get_proxy_urls()), 2, "the first tap only asks")
+        confirm = next(v for v in self.callback_values() if v.startswith("admin_net_dely:"))
+        await self.dispatch_callback(confirm, config.ADMIN_ID)
         self.assertEqual(len(await database.get_proxy_urls()), 1)
 
         # Removing the last proxy in proxy-only mode must not silently stop scanning.

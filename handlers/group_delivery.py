@@ -140,6 +140,18 @@ async def cb_group_delivery(call: CallbackQuery, bot: Bot):
 
 
 @router.callback_query(F.data == "group_off")
+async def cb_group_off_prompt(call: CallbackQuery):
+    """The button only asks; the group is unlinked by «Да, отключить» (group_off_yes)."""
+    await ui.show(call, (
+        f"{ui.e('warn')} <b>Точно отключить группу или канал?</b>\n\n"
+        "Копии новых лотов перестанут туда приходить. Подключить снова можно в любой момент."
+    ), ui.kb(
+        [ui.btn("Да, отключить", "cancel", callback_data="group_off_yes", style="danger")],
+        [ui.btn("Отмена", "cancel", callback_data="group_delivery")],
+    ))
+
+
+@router.callback_query(F.data == "group_off_yes")
 async def cb_group_off(call: CallbackQuery, bot: Bot):
     await database.set_mirror_chat(call.from_user.id, None)
     log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Группа для лотов", "отключена", status="OK")

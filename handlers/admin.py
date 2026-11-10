@@ -110,6 +110,26 @@ async def cb_admin_approve(call: CallbackQuery, bot: Bot):
 
 
 @router.callback_query(F.data.startswith("admin_reject:"))
+async def cb_admin_reject_prompt(call: CallbackQuery):
+    """The button only asks; the request is rejected by «Да, отклонить» (admin_reject_yes)."""
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        target_user_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректная кнопка", show_alert=True)
+        return
+    await ui.show(call, (
+        f"{ui.e('ban')} <b>Точно отклонить доступ?</b>\n\n"
+        f"Пользователь <code>{target_user_id}</code> получит сообщение, что доступ отклонён."
+    ), ui.kb(
+        [ui.btn("Да, отклонить", "ban", callback_data=f"admin_reject_yes:{target_user_id}", style="danger")],
+        [ui.btn("Отмена", "cancel", callback_data=f"admin_user:{target_user_id}:0")],
+    ))
+
+
+@router.callback_query(F.data.startswith("admin_reject_yes:"))
 async def cb_admin_reject(call: CallbackQuery, bot: Bot):
     if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав администратора", show_alert=True)
@@ -157,10 +177,10 @@ async def cb_admin_grant_sub(call: CallbackQuery):
         f"Пользователь: <code>{target_user_id}</code>\nТариф: <b>{config.plan_title(plan)}</b>\nДобавить: <b>{days} дн.</b>\n\n"
         "Срок добавится к текущей подписке или триалу; выбранный тариф применяется сразу. "
         "Это ручная выдача доступа, а не подтверждение оплаты Stars.",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Подтвердить выдачу / продление", callback_data=f"admin_confirm_sub:{token}")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{target_user_id}:{page}")],
-        ]),
+        parse_mode="HTML", reply_markup=ui.kb(
+            [ui.btn("Подтвердить выдачу / продление", "ok", callback_data=f"admin_confirm_sub:{token}", style="success")],
+            [ui.btn("Отмена", "cancel", callback_data=f"admin_user:{target_user_id}:{page}")],
+        ),
     )
     await call.answer()
 
@@ -424,10 +444,11 @@ async def cb_admin_note(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_note)
     await state.update_data(note_user=target_id, note_page=page)
     current = f"\n\nСейчас: <i>{html.escape(user['admin_note'])}</i>" if user.get("admin_note") else ""
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑 Стереть заметку", callback_data=f"admin_note_clear:{target_id}:{page}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{target_id}:{page}")],
-    ])
+    kb = ui.kb(
+        [ui.btn("Стереть заметку", "trash", callback_data=f"admin_note_clear:{target_id}:{page}", style="danger")]
+        if user.get("admin_note") else [],
+        [ui.btn("Отмена", "cancel", callback_data=f"admin_user:{target_id}:{page}")],
+    )
     await ui.show(call, f"📝 <b>Заметка о пользователе</b> <code>{target_id}</code>\n\n"
                         f"Пришлите текст. Её видят только админы.{current}", kb)
 
@@ -642,10 +663,10 @@ async def cb_admin_grant_vip_prompt(call: CallbackQuery):
         "Пользователю будет выдан постоянный бессрочный доступ к боту без ограничения по времени. "
         "Пользователь получит мгновенное уведомление в чат."
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить выдачу VIP", callback_data=f"admin_confirm_vip:{target_id}:{plan}:{page}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{target_id}:{page}")]
-    ])
+    kb = ui.kb(
+        [ui.btn("Подтвердить выдачу VIP", "ok", callback_data=f"admin_confirm_vip:{target_id}:{plan}:{page}", style="success")],
+        [ui.btn("Отмена", "cancel", callback_data=f"admin_user:{target_id}:{page}")],
+    )
     await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await call.answer()
 
@@ -707,10 +728,10 @@ async def cb_admin_reset_trial_prompt(call: CallbackQuery):
         f"({config.TRIAL_RADARS} радар, проверка раз в {config.plan_interval('pro')} с, как на «Полном»). "
         "Пользователь получит мгновенное уведомление в чат."
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✅ Активировать триал {config.TRIAL_HOURS} ч", callback_data=f"admin_confirm_trial:{target_id}:{page}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{target_id}:{page}")]
-    ])
+    kb = ui.kb(
+        [ui.btn(f"Активировать триал {config.TRIAL_HOURS} ч", "trial", callback_data=f"admin_confirm_trial:{target_id}:{page}", style="success")],
+        [ui.btn("Отмена", "cancel", callback_data=f"admin_user:{target_id}:{page}")],
+    )
     await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await call.answer()
 
@@ -1404,12 +1425,13 @@ async def cb_admin_revoke_prompt(call: CallbackQuery):
     if config.is_admin(user_id) or not await database.get_user(user_id):
         await call.answer("Отзыв недоступен", show_alert=True)
         return
-    await call.message.edit_text(f"🚫 Отозвать подписку / триал пользователя <code>{user_id}</code>?\n"
+    await call.message.edit_text(f"{ui.e('ban')} <b>Точно отозвать доступ?</b>\n\n"
+                                 f"Пользователь <code>{user_id}</code> потеряет подписку или триал, радары перестанут присылать лоты.\n"
                                  "Возврат Stars не выполняется автоматически.", parse_mode="HTML",
-                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                                     [InlineKeyboardButton(text="✅ Отозвать доступ", callback_data=f"admin_revoke:{user_id}:{page}")],
-                                     [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{user_id}:{page}")],
-                                 ]))
+                                 reply_markup=ui.kb(
+                                     [ui.btn("Да, отозвать доступ", "ban", callback_data=f"admin_revoke:{user_id}:{page}", style="danger")],
+                                     [ui.btn("Отмена", "cancel", callback_data=f"admin_user:{user_id}:{page}")],
+                                 ))
     await call.answer()
 
 
@@ -1929,7 +1951,7 @@ async def cb_admin_broadcast(call: CallbackQuery, state: FSMContext):
     users = [u for u in (await _filtered_users(user_filter))[0] if not config.is_admin(u["user_id"])]
     await state.set_state(AdminStates.waiting_for_broadcast)
     await state.update_data(bc_filter=user_filter)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_page:0:{user_filter}")]])
+    kb = ui.kb([ui.btn("Отмена", "cancel", callback_data=f"admin_page:0:{user_filter}")])
     await ui.show(
         call,
         f"📣 <b>Рассылка</b> · {USER_FILTERS[user_filter]} ({len(users)} чел.)\n\n"
@@ -1955,10 +1977,10 @@ async def msg_admin_broadcast(message: Message, state: FSMContext):
     user_filter = data.get("bc_filter") or "all"
     users = [u for u in (await _filtered_users(user_filter))[0] if not config.is_admin(u["user_id"])]
     await state.update_data(bc_text=text[:4000])
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✅ Отправить {len(users)} чел.", callback_data="admin_bc_go")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_page:0:{user_filter}")],
-    ])
+    kb = ui.kb(
+        [ui.btn(f"Отправить {len(users)} чел.", "mail", callback_data="admin_bc_go", style="success")],
+        [ui.btn("Отмена", "cancel", callback_data=f"admin_page:0:{user_filter}")],
+    )
     await message.answer(text[:4000], parse_mode="HTML", disable_web_page_preview=True)
     await message.answer(
         f"☝️ Так увидят сообщение <b>{len(users)}</b> чел. ({USER_FILTERS[user_filter]}). Отправить?",
@@ -2145,10 +2167,10 @@ async def cb_admin_purge_user(call: CallbackQuery):
         f"{who}\n\n"
         "Сотрутся пользователь, его радары, история лотов и логи. Отменить нельзя.\n"
         "Переписка с поддержкой останется: открытые обращения закроются."
-    ), InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"admin_purge_yes:{target_user_id}:{page}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_user:{target_user_id}:{page}")],
-    ]))
+    ), ui.kb(
+        [ui.btn("Да, удалить", "trash", callback_data=f"admin_purge_yes:{target_user_id}:{page}", style="danger")],
+        [ui.btn("Отмена", "cancel", callback_data=f"admin_user:{target_user_id}:{page}")],
+    ))
     await call.answer()
 
 
@@ -2785,7 +2807,7 @@ async def cb_admin_search_user_prompt(call: CallbackQuery, state: FSMContext):
         "• <code>Алексей</code>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_search_cancel")]
+        [ui.btn("Отмена", "cancel", callback_data="admin_search_cancel")]
     ])
     try:
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -2817,7 +2839,7 @@ async def cmd_admin_find_user(message: Message, state: FSMContext):
             "🔍 Введите <b>@username</b>, <b>Telegram ID</b> или имя пользователя для поиска:",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_search_cancel")]
+                [ui.btn("Отмена", "cancel", callback_data="admin_search_cancel")]
             ])
         )
         return
@@ -3012,10 +3034,10 @@ def _net_mode_confirm(mode: str, yes_data: str) -> tuple[str, InlineKeyboardMark
         f"Станет: <b>{NET_MODE_TITLES.get(mode, mode)}</b>\n\n"
         f"<i>{NET_MODE_HINTS.get(mode, '')}</i>"
     )
-    return text, InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, переключить", callback_data=yes_data)],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_net")],
-    ])
+    return text, ui.kb(
+        [ui.btn("Да, переключить", "ok", callback_data=yes_data, style="danger")],
+        [ui.btn("Отмена", "cancel", callback_data="admin_net")],
+    )
 
 
 @router.callback_query(F.data.startswith("admin_toggle_direct_avito"))
@@ -3238,10 +3260,10 @@ async def cb_admin_net_lanes(call: CallbackQuery):
         "⚡ <b>Сколько запросов одновременно на один прокси?</b>\n\n"
         f"Сейчас: <b>{config.PROXY_MAX_IN_FLIGHT}</b>\nСтанет: <b>{target}</b>\n\n<i>{LANES_HINT}</i>"
     )
-    await _show(call, text, InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✅ Да, {target}", callback_data=f"admin_net_lanes_yes:{target}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_net")],
-    ]))
+    await _show(call, text, ui.kb(
+        [ui.btn(f"Да, {target}", "ok", callback_data=f"admin_net_lanes_yes:{target}", style="danger")],
+        [ui.btn("Отмена", "cancel", callback_data="admin_net")],
+    ))
     await call.answer()
 
 
@@ -3432,11 +3454,11 @@ async def _add_proxies(message: Message, raw: str) -> None:
     text, kb = await _render_net("\n".join(report))
     extra = []
     if held:
-        extra += [[InlineKeyboardButton(text=f"✅ Да, добавить ещё {len(held)}", callback_data="admin_net_samenet_yes")],
-                  [InlineKeyboardButton(text="✖️ Нет, не добавлять", callback_data="admin_net_samenet_no")]]
+        extra += [[ui.btn(f"Да, добавить ещё {len(held)}", "ok", callback_data="admin_net_samenet_yes", style="success")],
+                  [ui.btn("Нет, не добавлять", "cancel", callback_data="admin_net_samenet_no")]]
     if soft:
-        extra += [[InlineKeyboardButton(text=f"➕ Добавить всё равно ({len(soft)})", callback_data="admin_net_force_yes")],
-                  [InlineKeyboardButton(text="✖️ Не добавлять", callback_data="admin_net_force_no")]]
+        extra += [[ui.btn(f"Добавить всё равно ({len(soft)})", "add", callback_data="admin_net_force_yes")],
+                  [ui.btn("Не добавлять", "cancel", callback_data="admin_net_force_no")]]
     if extra:
         kb = InlineKeyboardMarkup(inline_keyboard=[*extra, *kb.inline_keyboard])
     await status.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -3579,7 +3601,7 @@ async def _render_proxy_list(page: int) -> tuple[str, InlineKeyboardMarkup]:
         )
         buttons.append([
             InlineKeyboardButton(text=f"📊 {index}. {_proxy_host(url)}", callback_data=f"admin_net_stat:{pid}:{page}"),
-            InlineKeyboardButton(text="🗑", callback_data=f"admin_net_del:{pid}:{page}"),
+            ui.btn("Удалить", "trash", callback_data=f"admin_net_del:{pid}:{page}"),
         ])
     if not urls:
         lines.append("Список пуст.")
@@ -3589,7 +3611,7 @@ async def _render_proxy_list(page: int) -> tuple[str, InlineKeyboardMarkup]:
     if nav:
         buttons.append(nav)
     if urls:
-        buttons.append([InlineKeyboardButton(text="🗑 Удалить все", callback_data="admin_net_delall")])
+        buttons.append([ui.btn("Удалить все", "trash", callback_data="admin_net_delall", style="danger")])
     buttons.append([
         InlineKeyboardButton(text="➕ Добавить", callback_data="admin_net_add"),
         InlineKeyboardButton(text="« Сеть и прокси", callback_data="admin_net"),
@@ -3651,7 +3673,7 @@ async def _render_proxy_card(proxy_id: str, page: int) -> tuple[str, InlineKeybo
 
     buttons = [[InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin_net_stat:{proxy_id}:{page}")]]
     if not is_direct:
-        buttons.append([InlineKeyboardButton(text="🗑 Удалить прокси", callback_data=f"admin_net_del:{proxy_id}:{page}")])
+        buttons.append([ui.btn("Удалить прокси", "trash", callback_data=f"admin_net_del:{proxy_id}:{page}", style="danger")])
     buttons.append(back)
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -3739,7 +3761,7 @@ async def cb_admin_net_add(call: CallbackQuery, state: FSMContext):
         "Пришлите один или сколько угодно прокси — каждый с новой строки. Бот удалит сообщение из чата, "
         "отсеет прокси с одинаковым IP, проверит каждый на Авито и добавит только рабочие. "
         "Из одной подсети сразу добавит один, про остальные спросит.\n\n" + PROXY_FORMAT_HELP,
-        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Отмена", callback_data="admin_net")]]),
+        ui.kb([ui.btn("Отмена", "cancel", callback_data="admin_net")]),
     )
 
 
@@ -3779,6 +3801,33 @@ async def cb_admin_net_stat(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("admin_net_del:"))
+async def cb_admin_net_del_prompt(call: CallbackQuery):
+    """The button only asks; the proxy goes on «Да, удалить» (admin_net_dely)."""
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    from proxy_pool import compute_proxy_id
+
+    parts = call.data.split(":")
+    proxy_id = parts[1] if len(parts) > 1 else ""
+    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    url = next((u for u in config.PROXY_URLS if compute_proxy_id(u) == proxy_id), None)
+    if url is None:
+        await call.answer("Этого прокси уже нет в списке", show_alert=True)
+        text, kb = await _render_proxy_list(page)
+        await _show(call, text, kb)
+        return
+    await call.answer()
+    await _show(call, (
+        f"{ui.e('trash')} <b>Точно удалить прокси?</b>\n\n"
+        f"<code>{html.escape(_proxy_host(url))}</code> перестанет сканировать сразу."
+    ), ui.kb(
+        [ui.btn("Да, удалить", "trash", callback_data=f"admin_net_dely:{proxy_id}:{page}", style="danger")],
+        [ui.btn("Отмена", "cancel", callback_data=f"admin_net_list:{page}")],
+    ))
+
+
+@router.callback_query(F.data.startswith("admin_net_dely:"))
 async def cb_admin_net_del(call: CallbackQuery):
     if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав администратора", show_alert=True)

@@ -226,15 +226,13 @@ class AccessControlMiddleware(BaseMiddleware):
             f"🔗 <b>Username:</b> @{user.username if user.username else 'нет'}\n"
             f"🆔 <b>ID:</b> <code>{user_id}</code>{user_msg}"
         )
-        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        admin_kb = ui.kb(
             [
-                InlineKeyboardButton(text="💳 Выдать / продлить подписку", callback_data=f"admin_user:{user_id}:0"),
-                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"admin_reject:{user_id}")
+                ui.btn("Выдать / продлить", "tariffs", callback_data=f"admin_user:{user_id}:0", style="primary"),
+                ui.btn("Отклонить", "ban", callback_data=f"admin_reject:{user_id}", style="danger"),
             ],
-            [
-                InlineKeyboardButton(text="✍️ Написать пользователю", callback_data=f"support_reply:{user_id}")
-            ]
-        ])
+            [ui.btn("Написать пользователю", "write", callback_data=f"support_reply:{user_id}")],
+        )
 
         for admin_id in config.ADMIN_IDS:
             try:

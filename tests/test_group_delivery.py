@@ -84,6 +84,9 @@ class TestGroupDelivery(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_callback("group_delivery", user_id=self.user_id)
         self.assertIn("group_off", self.callback_values())
         await self.dispatch_callback("group_off", user_id=self.user_id)
+        self.assertEqual(await database.get_mirror_chat(self.user_id), GROUP_ID, "the first tap only asks")
+        self.assertIn("group_off_yes", self.callback_values())
+        await self.dispatch_callback("group_off_yes", user_id=self.user_id)
         self.assertIsNone(await database.get_mirror_chat(self.user_id))
         urls = [b.url for row in self.last_markup().inline_keyboard for b in row if b.url]
         self.assertEqual(urls, ["https://t.me/fixture_bot?startgroup=radar",

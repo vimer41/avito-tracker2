@@ -418,10 +418,10 @@ async def admin_rub_refund_prompt(call: CallbackQuery):
         if result["review"] else "Доступ, оплаченный этим заказом, отзовётся сразу.",
         "Отменить возврат будет нельзя.",
     ]
-    await ui.show(call, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✅ Да, вернуть {rub(paid)} ₽", callback_data=f"admin_rubrefund_yes:{order_id}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_payments:{order['user_id']}")],
-    ]), answer=False)
+    await ui.show(call, "\n".join(lines), ui.kb(
+        [ui.btn(f"Да, вернуть {rub(paid)} ₽", "back", callback_data=f"admin_rubrefund_yes:{order_id}", style="danger")],
+        [ui.btn("Отмена", "cancel", callback_data=f"admin_payments:{order['user_id']}")],
+    ), answer=False)
 
 
 @router.callback_query(F.data.startswith("admin_rubrefund_yes:"))
@@ -470,10 +470,10 @@ async def refund_prompt(call: CallbackQuery):
         f"↩️ Вернуть <b>{order['total_amount']} ⭐</b> по заказу #{order['id']} пользователю {order['user_id']}?\n\n"
         "Оплаченное этим платежом продление будет отменено. Если после него были другие платежи или ручные изменения, "
         "система не перезапишет их: потребуется сверить срок подписки вручную.", parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Подтвердить возврат Stars", callback_data=f"admin_refund:{order['id']}")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_payments:{order['user_id']}")],
-        ]),
+        reply_markup=ui.kb(
+            [ui.btn(f"Да, вернуть {order['total_amount']} Stars", "back", callback_data=f"admin_refund:{order['id']}", style="danger")],
+            [ui.btn("Отмена", "cancel", callback_data=f"admin_payments:{order['user_id']}")],
+        ),
     )
     await call.answer()
 
