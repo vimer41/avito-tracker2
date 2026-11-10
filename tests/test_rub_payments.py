@@ -178,7 +178,7 @@ class TestRubPayments(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
     async def test_buttons_open_the_chosen_method_and_show_the_fee(self):
         created = AsyncMock(return_value={"transactionId": TX, "redirect": "https://pay.platega.io/p/abc",
                                           "status": "PENDING", "expiresIn": "00:30:00"})
-        status = AsyncMock(return_value=reply("PENDING", 216.92, 1))
+        status = AsyncMock(return_value=reply("PENDING", 380.41, 1))
         with patch.object(platega, "create_payment", created), patch.object(platega, "get_status", status):
             await self.dispatch_callback("pay_method:card:lite:1")
             await self.dispatch_callback("pay_method:card:lite:1")
@@ -186,7 +186,7 @@ class TestRubPayments(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created.await_args.kwargs["method"], "card")
         invoices = [text for text in self.user_texts() if f"Счёт на {PRICE} ₽" in text]
         self.assertEqual(len(invoices), 2)
-        self.assertIn("К оплате: <b>216,92 ₽</b>", invoices[0])
+        self.assertIn("К оплате: <b>380,41 ₽</b>", invoices[0])
         self.assertIn("Ссылка действует 30 мин.", invoices[0])
         order = await billing.get_rub_order(1)
         self.assertEqual((order["payment_method"], order["buyer_name"], order["status"]), ("card", "Fixture", "pending"))

@@ -59,8 +59,8 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         with patch.object(config, "STARS_PAYMENTS_ENABLED", False):
             await self.dispatch_message(text="/tariffs")
             text = self.methods("SendMessage")[-1].text
-            self.assertIn("449 ₽", text)
-            self.assertIn("899 ₽", text)
+            self.assertIn("699 ₽", text)
+            self.assertIn("1290 ₽", text)
             await self.dispatch_callback("buy_tariff:pro")
             self.assertFalse(any(v and v.startswith("stars_buy:") for v in self.callback_values()))
             await self.dispatch_callback("stars_buy:pro:899")
@@ -94,7 +94,7 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
     async def test_three_months_is_ten_percent_cheaper_and_gives_90_days(self):
         await self.dispatch_callback("buy_tariff:pro:3")
         text = self.methods("EditMessageText")[-1].text
-        self.assertIn("2399 ₽", text)
+        self.assertIn("3499 ₽", text)
         labels = [b.text for row in self.last_markup().inline_keyboard for b in row]
         self.assertIn("✓ 3 месяца −10%", labels)
         self.assertIn("1 месяц", labels)
@@ -141,7 +141,7 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"buy_tariff:{plan}", values)
         self.assertNotIn("other_payment_methods", values)
         text = self.methods("EditMessageText")[-1].text
-        for title in ("Базовый", "Средний", "Полный", "199 ₽", "449 ₽", "899 ₽"):
+        for title in ("Базовый", "Средний", "Полный", "349 ₽", "699 ₽", "1290 ₽"):
             self.assertIn(title, text)
         await self.dispatch_callback("buy_tariff:standart")
         self.assertNotIn("other_payment_methods", self.callback_values())
@@ -160,16 +160,16 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
                 task.cancel()
             await asyncio.gather(*watchers, return_exceptions=True)
             kwargs = created.await_args.kwargs
-            self.assertEqual((kwargs["amount"], kwargs["user_id"]), (199, self.user_id))
+            self.assertEqual((kwargs["amount"], kwargs["user_id"]), (349, self.user_id))
             await self.dispatch_callback(f"rub_check:{kwargs['order_id']}")
             await self.dispatch_callback(f"rub_check:{kwargs['order_id']}")
         return await billing.get_rub_order(kwargs["order_id"])
 
     async def test_platega_confirmed_grants_tariff_once(self):
-        order = await self.platega_order({"id": "tx-1", "status": "CONFIRMED", "paymentDetails": {"amount": 199, "currency": "RUB"}})
+        order = await self.platega_order({"id": "tx-1", "status": "CONFIRMED", "paymentDetails": {"amount": 349, "currency": "RUB"}})
         self.assertEqual(order["status"], "paid")
         self.assertEqual((await database.get_user(self.user_id))["tariff_plan"], "lite")
-        paid = [m for m in self.methods("SendMessage") if "Оплата 199 ₽ прошла" in (m.text or "")]
+        paid = [m for m in self.methods("SendMessage") if "Оплата 349 ₽ прошла" in (m.text or "")]
         self.assertEqual(len(paid), 1)
 
     async def test_platega_canceled_or_short_payment_grants_nothing(self):
@@ -182,7 +182,7 @@ class TestPaymentsUI(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         values = self.callback_values()
         for value in ("pay_method:sbp:lite:1", "pay_method:card:lite:1", "stars_buy:lite:1:199", "pay_method:crypto:lite:1"):
             self.assertIn(value, values)
-        self.assertIn("199 ₽", self.methods("EditMessageText")[-1].text)
+        self.assertIn("349 ₽", self.methods("EditMessageText")[-1].text)
         for method in ("sbp", "crypto"):
             await self.dispatch_callback(f"pay_method:{method}:lite")
             answer = self.methods("AnswerCallbackQuery")[-1]

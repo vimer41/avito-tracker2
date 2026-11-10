@@ -60,14 +60,14 @@ class TestPlanSwitch(DatabaseCase):
         for _ in range(3):
             await database.grant_subscription(USER_ID, 30, "lite")
         await database.grant_subscription(USER_ID, 30, "pro")
-        fair = 90 * config.stars_price("lite") / config.stars_price("pro") + 30
+        fair = 90 * config.rub_price("lite") / config.rub_price("pro") + 30
         self.assertAlmostEqual(await self.days_left(), fair, delta=0.01)
         self.assertEqual((await database.get_user(USER_ID))["tariff_plan"], "pro")
 
     async def test_moving_down_keeps_the_value_of_paid_days(self):
         await database.grant_subscription(USER_ID, 30, "pro")
         await database.grant_subscription(USER_ID, 30, "lite")
-        fair = 30 * config.stars_price("pro") / config.stars_price("lite") + 30
+        fair = 30 * config.rub_price("pro") / config.rub_price("lite") + 30
         self.assertAlmostEqual(await self.days_left(), fair, delta=0.01)
 
     async def test_same_tariff_just_adds_days(self):

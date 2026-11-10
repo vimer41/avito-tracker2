@@ -1715,7 +1715,7 @@ async def msg_admin_stars_prices(message: Message, state: FSMContext):
         config.apply_stars_prices(*prices)
     except ValueError:
         await message.answer(
-            f"Нужны три целых числа по возрастанию, не больше {config.STARS_PRICE_MAX}. Например: <code>199 449 899</code>",
+            f"Нужны три целых числа по возрастанию, не больше {config.STARS_PRICE_MAX}. Например: <code>229 449 829</code>",
             parse_mode="HTML", reply_markup=ui.kb([ui.btn("Отмена", "cancel", callback_data="admin_prices")]),
         )
         return

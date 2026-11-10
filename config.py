@@ -360,9 +360,9 @@ validate_runtime_config()
 # Stars — единственный способ оплаты цифровой подписки. Включается явно.
 STARS_PAYMENTS_ENABLED = os.getenv("STARS_PAYMENTS_ENABLED", "0").strip() == "1"
 # New env names on purpose: the deploy still writes the old STARS_PRICE_STANDART/PRO (170/470), which are ignored now.
-STARS_PRICE_LITE = int(os.getenv("STARS_PRICE_BASIC", "199"))
+STARS_PRICE_LITE = int(os.getenv("STARS_PRICE_BASIC", "229"))
 STARS_PRICE_STANDART = int(os.getenv("STARS_PRICE_MEDIUM", "449"))
-STARS_PRICE_PRO = int(os.getenv("STARS_PRICE_FULL", "899"))
+STARS_PRICE_PRO = int(os.getenv("STARS_PRICE_FULL", "829"))
 STARS_PRICE_TEST = int(os.getenv("STARS_PRICE_TEST", "10"))
 # Hidden 1-day plan for checking checkout end to end. Off, it cannot be bought even with a forged button.
 STARS_TEST_ENABLED = os.getenv("STARS_TEST_ENABLED", "0").strip() == "1"
@@ -436,9 +436,9 @@ def stars_price(plan: str, months: int = 1) -> int:
 
 # The ruble price is the main one shown to users; СБП and crypto checkouts are not connected yet.
 PRICE_RUB: dict[str, int] = {
-    "lite": positive_int_setting("PRICE_RUB_BASIC", "199"),
-    "standart": positive_int_setting("PRICE_RUB_MEDIUM", "449"),
-    "pro": positive_int_setting("PRICE_RUB_FULL", "899"),
+    "lite": positive_int_setting("PRICE_RUB_BASIC", "349"),
+    "standart": positive_int_setting("PRICE_RUB_MEDIUM", "699"),
+    "pro": positive_int_setting("PRICE_RUB_FULL", "1290"),
 }
 # The payment provider refuses a single transaction above this.
 PAYMENT_LIMIT_RUB = 10000
@@ -456,7 +456,7 @@ RUB_TEST_COMMAND = "arseniytest1ruble"
 # Referral program (referrals.py): links are issued by an admin to one owner.
 REF_PERCENT = int(os.getenv("REF_PERCENT", "15"))
 REF_HOLD_DAYS = int(os.getenv("REF_HOLD_DAYS", "7"))          # a reward can be paid out this many days after the payment
-REF_STAR_RATE = float(os.getenv("REF_STAR_RATE", "1.2"))      # rubles per star; admins change it in bot_settings.ref_star_rate
+REF_STAR_RATE = float(os.getenv("REF_STAR_RATE", "1.55"))     # rubles per star; admins change it in bot_settings.ref_star_rate
 REF_PAYOUT_CONTACT = os.getenv("REF_PAYOUT_CONTACT", "@prostatock").strip() or "@prostatock"
 
 
