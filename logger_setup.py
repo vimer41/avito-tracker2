@@ -502,11 +502,26 @@ def sanitize_logs_for_user(pattern: str):
                 logging.getLogger(__name__).warning(f"Не удалось очистить лог {lf}: {e}")
 
 
-def cleanup_logs(max_total_mb: int = 40, keep_days: int = 3) -> int:
+def cleanup_logs(max_total_mb: Optional[int] = None, keep_days: float = LOG_KEEP_DAYS) -> int:
     """
-    Автоматическая очистка старых ротированных логов (*.log.1, *.log.2).
-    Удаляет файлы старше keep_days или самые старые ротации при превышении max_total_mb.
+    Автоматическая очистка старых ротированных логов.
+    По умолчанию применяет единую политику хранения LOG_KEEP_DAYS (30 дней) и лимиты LOG_LIMITS_MB
+    через prune_rotations для каждого лог-файла. Если передан max_total_mb — использует старый общий лимит.
     """
+    if max_total_mb is None:
+        removed_count = 0
+        managed = (
+            (COMBINED_LOG, "bot"),
+            (ERRORS_LOG, "errors"),
+            (USER_ACTIONS_LOG, "user_actions"),
+            (EVENTS_LOG, "events"),
+            (METRICS_LOG, "metrics"),
+        )
+        for path, kind in managed:
+            _, keep_mb = LOG_LIMITS_MB[kind]
+            removed_count += prune_rotations(path, keep_days, int(keep_mb * 1024 * 1024))
+        return removed_count
+
     removed_count = 0
     now = time.time()
     cutoff = now - (keep_days * 86400)

@@ -673,6 +673,20 @@ class TestMonthOfHistory(LogFixture):
         self.assertEqual(logger_setup.prune_rotations(base, 30, 1500, now=now), 1)
         self.assertEqual([p.name for p in self.logs.glob("x.log.*")], ["x.log.1.gz"])
 
+    def test_cleanup_logs_keeps_month_rotations_and_drops_older(self):
+        import os
+
+        now = time.time()
+        kept = self.logs / "errors.log.1.gz"
+        old = self.logs / "errors.log.2.gz"
+        kept.write_bytes(b"a" * 500)
+        old.write_bytes(b"b" * 500)
+        os.utime(kept, (now - 10 * 86400, now - 10 * 86400))
+        os.utime(old, (now - 35 * 86400, now - 35 * 86400))
+        self.assertGreaterEqual(logger_setup.cleanup_logs(), 1)
+        self.assertTrue(kept.exists())
+        self.assertFalse(old.exists())
+
     def test_past_the_row_cap_the_newest_rows_are_kept(self):
         logger = logging.getLogger("monitoring")
         for index in range(10):

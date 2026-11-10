@@ -42,6 +42,7 @@ LONG_STALL_ALERT_INTERVAL = 3 * 3600.0
 STALL_DUMP_REARM_SECONDS = 1.0
 SOURCE_STATS_SECONDS = 600
 WORKER_CRASH_PAUSE = 1.0
+SEARCHES_SYNC_SECONDS = 5.0  # how often active radars are re-read from SQLite when nothing bumped SEARCHES_REVISION
 STRETCH_CHECK_SECONDS = 30.0  # how often the interval stretch is reconsidered
 STRETCH_STEP = 0.1  # smaller changes of the stretch are not applied, so intervals do not jitter
 CRASH_ALERT_INTERVAL = 24 * 3600  # the same code error pushes once a day; every repeat is in errors.log
@@ -709,11 +710,30 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         persisted_states = await database.load_all_source_scan_states()
         capacity_rps: Optional[float] = None  # the channels' measured capacity, req/s
         stretch, stretch_checked_at = 1.0, 0.0  # all tariff intervals × stretch while the capacity falls short
+        searches: list[dict] = []
+        groups: dict[str, list[dict]] = {}
+        base: dict[str, float] = {}
+        last_searches_sync = 0.0
+        last_searches_rev = -1
+        last_synced_stretch = 1.0
 
         while True:
-            searches = await database.get_all_active_searches()
-            groups = group_sources(searches)
-            seen_store.prune(groups)
+            now_tick = time.monotonic()
+            resumed_urls = pop_resumed_source_urls()
+            current_rev = getattr(database, "SEARCHES_REVISION", 0)
+            need_searches_sync = (
+                startup
+                or bool(resumed_urls)
+                or current_rev != last_searches_rev
+                or (now_tick - last_searches_sync) >= SEARCHES_SYNC_SECONDS
+            )
+            if need_searches_sync:
+                last_searches_rev = current_rev
+                searches = await database.get_all_active_searches()
+                groups = group_sources(searches)
+                seen_store.prune(groups)
+                base = {key: source_interval(radars, key) for key, radars in groups.items()}
+                last_searches_sync = time.monotonic()
             network = budget.snapshot()
             proxy_snaps = pool.snapshots()
             # A deleted proxy must not linger in screens or capacity math.
@@ -762,7 +782,6 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             # What the channels measurably give (previous pass of this loop); their rate limits until measured.
             effective_rps = max(0.1, capacity_rps if (capacity_rps and proxy_snaps) else limits_rps)
 
-            base = {key: source_interval(radars, key) for key, radars in groups.items()}
             METRICS.set_planned_scan_rate(sum(1.0 / interval for interval in base.values()))
             plan = calculate_interval_plan(
                 base,
@@ -789,17 +808,18 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                         factor=target, need=round(demand_rps, 2), have=round(capacity_rps or 0.0, 2),
                     )
                     stretch = target
-            planner.sync(
-                groups,
-                base if stretch <= 1.0 else {key: round(value * stretch, 2) for key, value in base.items()},
-                now,
-                startup=startup,
-                startup_spread=config.SCAN_STARTUP_SPREAD,
-                persisted_states=persisted_states if startup else None,
-            )
+            if need_searches_sync or stretch != last_synced_stretch:
+                planner.sync(
+                    groups,
+                    base if stretch <= 1.0 else {key: round(value * stretch, 2) for key, value in base.items()},
+                    now,
+                    startup=startup,
+                    startup_spread=config.SCAN_STARTUP_SPREAD,
+                    persisted_states=persisted_states if startup else None,
+                )
+                last_synced_stretch = stretch
             startup = False
 
-            resumed_urls = pop_resumed_source_urls()
             if resumed_urls:
                 planner.force_due_now(resumed_urls, now)
 
@@ -907,7 +927,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             if now - last_cleanup >= 86400:
                 await database.cleanup_old_seen_items(days=7)
                 from logger_setup import cleanup_logs
-                await asyncio.to_thread(cleanup_logs, max_total_mb=40, keep_days=3)
+                await asyncio.to_thread(cleanup_logs)
                 last_cleanup = now
 
             await asyncio.sleep(1)

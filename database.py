@@ -218,6 +218,13 @@ def close_db_sync(target_dir: str | Path | None = None) -> None:
 
 # --- In-memory TTL кэш черного списка продавцов (45 с) ---
 _BLACKLIST_CACHE: dict[int, tuple[float, set[str]]] = {}
+# Счётчик ревизий радаров и подписок для мгновенной синхронизации в monitoring.dispatch
+SEARCHES_REVISION: int = 0
+
+
+def bump_searches_revision() -> None:
+    global SEARCHES_REVISION
+    SEARCHES_REVISION += 1
 
 
 def invalidate_blacklist_cache(user_id: int | None = None) -> None:
@@ -1219,6 +1226,7 @@ async def pause_bad_link_searches(keeps_running) -> list[dict]:
 
 async def sync_radar_limit_in_transaction(db, user_id: int) -> None:
     """Running radars fit the tariff: extras pause, and radars paused for this reason return when room appears."""
+    bump_searches_revision()
     if user_id in ADMIN_IDS:
         return
     async with db.execute(
@@ -1402,6 +1410,7 @@ async def find_users_by_query(query: str) -> List[Dict[str, Any]]:
 async def recalibrate_if_no_access_in_transaction(db, user_id: int) -> None:
     """Access is coming back after a gap: the first scan only remembers what is already listed.
     Without this the user would get a catch-up of old lots, as after downtime."""
+    bump_searches_revision()
     if int(user_id) in ADMIN_IDS:
         return
     async with db.execute(
@@ -1458,6 +1467,7 @@ async def update_user_default_template(user_id: int, template: str):
             (template.strip(), user_id)
         )
         await db.commit()
+    bump_searches_revision()
 
 
 async def add_search(user_id: int, title: str, url: str, search_in_title_only: int = 0, max_age_minutes: int = 5,
@@ -1529,6 +1539,7 @@ async def initialize_search_snapshot(search_id: int, items) -> bool:
         )
         await db.execute("UPDATE searches SET initialized_at = datetime('now') WHERE id = ?", (search_id,))
         await db.commit()
+        bump_searches_revision()
         return True
 
 
@@ -1540,6 +1551,8 @@ async def update_search_max_age(search_id: int, user_id: int, max_age_minutes: i
             (clamped_val, search_id, user_id)
         )
         await db.commit()
+        if cursor.rowcount > 0:
+            bump_searches_revision()
         return cursor.rowcount > 0
 
 
@@ -1590,6 +1603,7 @@ RADAR_HISTORY_LABELS = {
 async def log_radar_history(db, user_id: int, search_id: int, action: str, title: Optional[str] = None,
                             url: Optional[str] = None, detail: str = "") -> None:
     """One row per radar change, inside the caller's transaction. Missing title/url are taken from the radar."""
+    bump_searches_revision()
     if title is None or url is None:
         async with db.execute("SELECT title, url FROM searches WHERE id = ?", (search_id,)) as cursor:
             row = await cursor.fetchone()
@@ -2164,6 +2178,7 @@ async def add_stop_word_to_search(search_id: int, word: str, user_id: int) -> bo
                 (json.dumps(stop_words, ensure_ascii=False), search_id, user_id)
             )
         await db.commit()
+        bump_searches_revision()
         return True
 
 
@@ -2185,6 +2200,7 @@ async def remove_stop_word_from_search(search_id: int, word: str, user_id: int) 
                 (json.dumps(stop_words, ensure_ascii=False), search_id, user_id)
             )
             await db.commit()
+            bump_searches_revision()
             return True
         await db.commit()
         return False
@@ -2197,6 +2213,7 @@ async def update_search_template(search_id: int, user_id: int, template: Optiona
             (template.strip() if template else None, search_id, user_id)
         )
         await db.commit()
+    bump_searches_revision()
 
 
 async def get_all_active_searches() -> List[Dict[str, Any]]:
@@ -2446,6 +2463,8 @@ async def update_search_filters(search_id: int, user_id: int, **fields: Any) -> 
             (*fields.values(), search_id, user_id),
         )
         await db.commit()
+        if cursor.rowcount > 0:
+            bump_searches_revision()
         return cursor.rowcount > 0
 
 
@@ -2457,6 +2476,8 @@ async def update_search_discount_percent(search_id: int, user_id: int, percent: 
             (int(percent), search_id, user_id)
         )
         await db.commit()
+        if cursor.rowcount > 0:
+            bump_searches_revision()
         return cursor.rowcount > 0
 
 
@@ -2656,6 +2677,7 @@ async def enqueue_group_events(
                     "UPDATE searches SET initialized_at = datetime('now') WHERE id = ? AND initialized_at IS NULL",
                     (sid,),
                 )
+            bump_searches_revision()
 
         if seen_records:
             await db.executemany(
@@ -3803,6 +3825,7 @@ async def extend_active_subscriptions(seconds: int) -> list[tuple[int, str]]:
                 row = await cur.fetchone()
             result.append((uid, row[0] if row else ""))
         await db.commit()
+    bump_searches_revision()
     return result
 
 
@@ -3861,6 +3884,7 @@ async def deactivate_user_searches(user_id: int):
             (PAUSE_BLOCKED, user_id),
         )
         await db.commit()
+    bump_searches_revision()
 
 
 # --- Совместимые функции очереди уведомлений поверх notification_events ---
@@ -4538,6 +4562,7 @@ async def purge_user_by_pattern(pattern: str) -> Dict[str, Any]:
             invalidate_blacklist_cache(uid)
 
         await db.commit()
+    bump_searches_revision()
 
     # Outside the write lock and off the event loop: a month of logs takes seconds to rewrite.
     try:
