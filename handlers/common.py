@@ -337,7 +337,7 @@ async def cmd_profile(event):
     ])
     night_mode, night_from, night_to = await database.get_night_settings(user_id)
     night = "выкл" if night_mode == database.NIGHT_OFF else f"{night_from:02d}–{night_to:02d}"
-    rows.append([ui.btn(f"Ночной режим: {night}", "pause", callback_data="night_mode")])
+    rows.append([ui.btn(f"Ночной режим: {night}", "moon", callback_data="night_mode")])
     group = "вкл" if await database.get_mirror_chat(user_id) else "выкл"
     rows.append([ui.btn(f"Лоты в группу или канал: {group}", "users", callback_data="group_delivery")])
     if await referrals.get_owner_link(user_id):
@@ -439,7 +439,9 @@ async def cb_activate_trial(call: CallbackQuery):
 @router.message(Command("subscribe"))
 @router.message(Command("tariffs"))
 @router.callback_query(F.data == "open_subscription_menu")
-async def cmd_subscription_menu(event):
+async def cmd_subscription_menu(event, state: Optional[FSMContext] = None):
+    if state:
+        await state.clear()
     user_id = event.from_user.id
     user = await database.get_or_create_user(user_id)
     current = (user.get("tariff_plan") or "").lower() if user.get("is_allowed") else ""
@@ -694,7 +696,11 @@ async def cb_manage_blacklist(call: CallbackQuery):
     )
     if len(blocked) > 12:
         text += f"\n<i>Показаны первые 12 из {len(blocked)}.</i>"
-    rows = [[ui.btn(f"✖ {b['seller_name'][:30]}", callback_data=f"unban_seller:{b['id']}")] for b in blocked[:12]]
+    rows = [
+        [ui.btn(b["seller_name"][:30] if (ui.clean() and ui.custom_id("cancel")) else f"✖ {b['seller_name'][:30]}",
+                "cancel", callback_data=f"unban_seller:{b['id']}")]
+        for b in blocked[:12]
+    ]
     rows.append(back_row)
     await ui.show(call, text, ui.kb(*rows))
 

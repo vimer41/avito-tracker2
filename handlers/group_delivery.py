@@ -117,7 +117,7 @@ async def group_screen(user_id: int, bot: Bot) -> tuple[str, object]:
         )
         return text, ui.kb(
             [ui.btn("Отключить", "cancel", callback_data="group_off", style="danger")],
-            [ui.btn("Другая группа", "users", url=add_url), ui.btn("Другой канал", "users", url=channel_url)],
+            [ui.btn("Другая группа", "users", url=add_url), ui.btn("Другой канал", "megaphone", url=channel_url)],
             [ui.btn("« Профиль", callback_data="refresh_profile"), ui.home_btn()],
         )
     text = header + (
@@ -129,7 +129,7 @@ async def group_screen(user_id: int, bot: Bot) -> tuple[str, object]:
     )
     return text, ui.kb(
         [ui.btn("Добавить в группу", "users", url=add_url, style="primary")],
-        [ui.btn("Добавить в канал", "users", url=channel_url, style="primary")],
+        [ui.btn("Добавить в канал", "megaphone", url=channel_url, style="primary")],
         [ui.btn("« Профиль", callback_data="refresh_profile"), ui.home_btn()],
     )
 

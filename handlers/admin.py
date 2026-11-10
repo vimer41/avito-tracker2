@@ -32,6 +32,11 @@ class AdminStates(StatesGroup):
     waiting_for_lot = State()
     waiting_for_broadcast = State()
     waiting_for_note = State()
+    waiting_for_direct_msg = State()
+
+
+_LAST_USER_FILTER: dict[int, str] = {}
+_LAST_SEARCH_QUERY: dict[int, str] = {}
 
 
 @router.callback_query(F.data == "admin_probe")
@@ -218,7 +223,7 @@ async def cb_admin_confirm_sub(call: CallbackQuery, bot: Bot):
         logger.warning(f"Не удалось уведомить пользователя {target_user_id} об активации подписки: {e}")
 
 
-async def render_user_card_data(target_id: int, page: int = 0):
+async def render_user_card_data(target_id: int, page: int = 0, admin_id: int = 0):
     user = await database.get_user(target_id)
     if not user:
         return None, None
@@ -233,86 +238,75 @@ async def render_user_card_data(target_id: int, page: int = 0):
     max_radars = await database.get_user_max_radars(target_id)
     extra_radars = int(user.get("extra_radars") or 0)
     extra_label = f", из них +{extra_radars} от админа" if extra_radars else ""
-    blocked_count = len(await database.get_user_blocked_sellers_list(target_id))
     tickets_total, tickets_live = await database.ticket_user_summary(target_id)
-    tickets_line = (f"• Обращения в поддержку: <b>{tickets_total}</b>"
-                    + (f", открыто <b>{tickets_live}</b>" if tickets_live else "") + "\n") if tickets_total else ""
 
-    if has_access and not is_allowed and trial_used:
-        status_line = f"🎁 <b>Бесплатный триал ({config.TRIAL_HOURS} ч)</b>"
+    if config.is_admin(target_id):
+        access_line = f"👑 <b>Администратор</b> (тариф «{plan_name}»)"
+    elif has_access and not is_allowed and trial_used:
+        access_line = f"🎁 <b>Бесплатный триал ({config.TRIAL_HOURS} ч)</b> · до {until}"
     elif has_access and is_allowed and user.get("subscription_until"):
-        status_line = f"🟢 <b>{plan_name} Подписка</b>"
+        access_line = f"🟢 <b>Тариф «{plan_name}»</b> · до {until}"
     elif has_access and is_allowed:
-        status_line = f"🟢 <b>Бессрочный VIP ({plan_name})</b>"
+        access_line = f"🟢 <b>Бессрочный VIP («{plan_name}»)</b>"
     else:
-        status_line = "🔴 <b>Доступ истёк / отозван</b>"
+        tried_note = " (триал был)" if trial_used else " (триал не брал)"
+        access_line = f"🔴 <b>Доступ не активен</b>{tried_note}"
 
-    uname = f"@{user['username']}" if user.get("username") else "—"
+    uname = f"@{html.escape(user['username'])}" if user.get("username") else "без @"
     fname = html.escape(user.get("first_name") or "Без имени")
+    radars_pause_note = " (не проверяются: нет доступа)" if active_radars and not has_access else ""
 
     text = (
-        "👤 <b>КАРТОЧКА ПОЛЬЗОВАТЕЛЯ</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"• Имя: <b>{fname}</b>\n"
-        f"• Username: <b>{uname}</b>\n"
-        f"• Telegram ID: <code>{target_id}</code>\n"
-        f"• Статус: {status_line}\n"
-        f"• Тариф: <b>{plan_name}</b> (лимит: до {max_radars} радаров{extra_label})\n"
-        f"• Срок подписки: <i>{until}</i>\n"
-        f"• Радары: <b>{active_radars}</b> акт. / <b>{len(user_radars)}</b> всего"
-        + (" (не проверяются: нет доступа)" if active_radars and not has_access else "") + "\n"
-        f"• Чёрный список: <b>{blocked_count}</b> продавцов\n"
-        f"• Триал использован: <b>{'Да' if trial_used else 'Нет'}</b>\n"
-        + tickets_line
-        + await _activity_lines(target_id, user)
-        + "━━━━━━━━━━━━━━━━━━━━\n"
-        "Управление пользователем:"
+        f"👤 <b>КАРТОЧКА ПОЛЬЗОВАТЕЛЯ</b>\n"
+        f"<b>{fname}</b> · {uname} · <code>{target_id}</code>\n\n"
+        f"• Доступ: {access_line}\n"
+        f"• Радары: <b>{active_radars}</b> акт. из <b>{len(user_radars)}</b> · лимит до <b>{max_radars}</b>{extra_label}{radars_pause_note}\n"
+        + await _activity_lines(target_id, user, tickets_total, tickets_live)
     )
 
-    limit_row = [
-        InlineKeyboardButton(text="➖5 радаров", callback_data=f"admin_radar_limit:{target_id}:-5:{page}"),
-        InlineKeyboardButton(text="➕5 радаров", callback_data=f"admin_radar_limit:{target_id}:5:{page}"),
-        InlineKeyboardButton(text="➕20 радаров", callback_data=f"admin_radar_limit:{target_id}:20:{page}"),
-    ]
+    uf = _LAST_USER_FILTER.get(admin_id, "all") if admin_id else "all"
+    list_cb = f"admin_page:{page}" if uf == "all" else f"admin_page:{page}:{uf}"
     back_row = [
-        InlineKeyboardButton(text="🔍 Найти другого", callback_data="admin_search_user_prompt"),
-        InlineKeyboardButton(text="« Список пользователей", callback_data=f"admin_page:{page}"),
-    ]
-    delete_row = [InlineKeyboardButton(text="🗑 Удалить радары", callback_data=f"admin_rdel:new:{target_id}:{page}")] if user_radars else []
-    note_row = [
-        InlineKeyboardButton(text="📝 Заметка", callback_data=f"admin_note:{target_id}:{page}"),
-        InlineKeyboardButton(text="🧾 Действия админов", callback_data=f"admin_ulog:{target_id}:{page}"),
+        ui.btn("Найти другого", "scope", callback_data="admin_search_user_prompt"),
+        ui.btn("« Список пользователей", callback_data=list_cb),
     ]
     if config.is_admin(target_id):
-        # Admins have no subscription: only radars and the radar limit are managed here.
-        text = text.replace(f"• Статус: {status_line}\n", "• Статус: 👑 <b>Администратор</b>\n")
+        limit_row = [
+            InlineKeyboardButton(text="−5 рад.", callback_data=f"admin_radar_limit:{target_id}:-5:{page}"),
+            InlineKeyboardButton(text="+5 рад.", callback_data=f"admin_radar_limit:{target_id}:5:{page}"),
+            InlineKeyboardButton(text="+20 рад.", callback_data=f"admin_radar_limit:{target_id}:20:{page}"),
+        ]
+        delete_row = [ui.btn("Удалить радары", "trash", callback_data=f"admin_rdel:new:{target_id}:{page}")] if user_radars else []
+        note_row = [
+            ui.btn("Заметка", "note", callback_data=f"admin_note:{target_id}:{page}"),
+            ui.btn("Лог адм.", "logs", callback_data=f"admin_ulog:{target_id}:{page}"),
+        ]
         return text, InlineKeyboardMarkup(inline_keyboard=[row for row in (
-            [InlineKeyboardButton(text=f"📁 Радары ({len(user_radars)})", callback_data=f"admin_user_radars:{target_id}:{page}")],
+            [ui.btn(f"Радары и лимит ({len(user_radars)})", "radars", callback_data=f"admin_user_radars:{target_id}:{page}")],
             note_row,
             delete_row,
             limit_row,
             back_row,
         ) if row])
 
-    buttons = [
-        [InlineKeyboardButton(text="💳 Выдать / продлить → выбрать тариф", callback_data=f"admin_sub_menu:{target_id}:{page}")],
-        [InlineKeyboardButton(text=f"🎁 Выдать / обновить триал ({config.TRIAL_HOURS} ч)", callback_data=f"admin_reset_trial_prompt:{target_id}:{page}")],
-        [InlineKeyboardButton(text=f"📁 Радары ({len(user_radars)})", callback_data=f"admin_user_radars:{target_id}:{page}"),
-         InlineKeyboardButton(text="⭐ Платежи / возврат", callback_data=f"admin_payments:{target_id}")],
-        [InlineKeyboardButton(text="🔗 Реферальная ссылка", callback_data=f"ref_adm_user:{target_id}")],
-        limit_row,
-        note_row,
-    ]
-    if delete_row:
-        buttons.insert(3, delete_row)
+    danger_row = []
     if has_access:
-        buttons.append([InlineKeyboardButton(text="🚫 Отозвать доступ", callback_data=f"admin_revoke_prompt:{target_id}:{page}")])
-    buttons.append([
-        InlineKeyboardButton(text=f"💬 Обращения ({tickets_total})", callback_data=f"admin_tku:{target_id}:0"),
-        InlineKeyboardButton(text="✍️ Написать пользователю", callback_data=f"support_reply:{target_id}"),
-    ])
-    buttons.append([InlineKeyboardButton(text="🗑 Удалить пользователя", callback_data=f"admin_purge_user:{target_id}:{page}")])
-    buttons.append(back_row)
+        danger_row.append(ui.btn("Отозвать доступ", "ban", callback_data=f"admin_revoke_prompt:{target_id}:{page}", style="danger"))
+    danger_row.append(ui.btn("Удалить юзера", "trash", callback_data=f"admin_purge_user:{target_id}:{page}", style="danger"))
+
+    buttons = [
+        [ui.btn("Выдать тариф / VIP", "tariffs", callback_data=f"admin_sub_menu:{target_id}:{page}", style="primary"),
+         ui.btn(f"Триал ({config.TRIAL_HOURS} ч)", "trial", callback_data=f"admin_reset_trial_prompt:{target_id}:{page}")],
+        [ui.btn(f"Радары и лимит ({len(user_radars)})", "radars", callback_data=f"admin_user_radars:{target_id}:{page}"),
+         ui.btn("Платежи / возврат", "star", callback_data=f"admin_payments:{target_id}")],
+        [ui.btn(f"Обращения ({tickets_total})", "support", callback_data=f"admin_tku:{target_id}:0"),
+         ui.btn("Написать юзеру", "megaphone", callback_data=f"admin_dm:{target_id}:{page}")],
+        [ui.btn("Реф. ссылка", "link", callback_data=f"ref_adm_user:{target_id}"),
+         ui.btn("Заметка", "note", callback_data=f"admin_note:{target_id}:{page}"),
+         ui.btn("Лог адм.", "logs", callback_data=f"admin_ulog:{target_id}:{page}")],
+        danger_row,
+        back_row,
+    ]
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -333,22 +327,86 @@ def _ago(value) -> str:
     return f"{_dur(time.time() - epoch)} назад"
 
 
-async def _activity_lines(target_id: int, user: dict) -> str:
+async def _activity_lines(target_id: int, user: dict, tickets_total: int = 0, tickets_live: int = 0) -> str:
     activity = await database.get_user_activity(target_id)
+    if activity["paid_count"] or activity["rub_count"]:
+        parts = []
+        if activity["rub_count"]:
+            parts.append(f"<b>{activity['rub_count']}</b> на <b>{activity['rub_total']} ₽</b> (посл. {_ago(activity['last_rub'])})")
+        if activity["paid_count"]:
+            parts.append(f"<b>{activity['paid_count']}</b> на <b>{activity['paid_total']} ⭐</b> (посл. {_ago(activity['last_paid'])})")
+        pay_line = "• Оплат: " + " · ".join(parts)
+    else:
+        pay_line = "• Оплат: <b>0</b> (не платил)"
+
+    tk_note = f" · обращений: <b>{tickets_total}</b>" + (f" (откр. {tickets_live})" if tickets_live else "") if tickets_total else ""
     lines = [
-        f"• Заходил: <b>{_ago(user.get('last_seen_at'))}</b>",
-        f"• Лотов получил: <b>{activity['lots_day']}</b> за сутки, <b>{activity['lots_week']}</b> за неделю, "
-        f"всего {activity['lots_total']} · последний {_ago(activity['last_sent'])}",
-        f"• Оплат: <b>{activity['paid_count']}</b> на <b>{activity['paid_total']} ⭐</b>"
-        + (f" · последняя {_ago(activity['last_paid'])}" if activity["paid_count"] else "")
-        + (f"; рублями <b>{activity['rub_count']}</b> на <b>{activity['rub_total']} ₽</b> · последняя {_ago(activity['last_rub'])}"
-           if activity["rub_count"] else ""),
+        f"• Лотов получил: <b>{activity['lots_day']}</b> за сутки, <b>{activity['lots_week']}</b> за нед., "
+        f"всего {activity['lots_total']} · посл. {_ago(activity['last_sent'])}",
+        pay_line,
+        f"• Заходил: <b>{_ago(user.get('last_seen_at'))}</b>{tk_note}",
     ]
     if activity["blocked_bot"]:
         lines.append("• ⛔️ <b>Заблокировал бота</b>: радары на паузе, сообщения не доходят")
     if user.get("admin_note"):
         lines.append(f"• 📝 Заметка: <i>{html.escape(user['admin_note'])}</i>")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data.startswith("admin_dm:"))
+async def cb_admin_dm(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        _, target_raw, page_raw = call.data.split(":")
+        target_id, page = int(target_raw), int(page_raw)
+    except ValueError:
+        await call.answer("Некорректная кнопка", show_alert=True)
+        return
+    user = await database.get_user(target_id)
+    uname = f"@{html.escape(user['username'])}" if user and user.get("username") else f"ID <code>{target_id}</code>"
+    await state.set_state(AdminStates.waiting_for_direct_msg)
+    await state.update_data(dm_user=target_id, dm_page=page)
+    await ui.show(
+        call,
+        f"{ui.e('megaphone')} <b>Сообщение пользователю</b> · {uname}\n\n"
+        "Пришлите текст сообщения. Пользователь получит его с заголовком:\n"
+        "<blockquote><b>Вам сообщение от Администрации</b></blockquote>",
+        ui.kb([ui.btn("« Карточка пользователя", callback_data=f"admin_user:{target_id}:{page}")]),
+    )
+
+
+@router.message(AdminStates.waiting_for_direct_msg, F.text)
+async def msg_admin_direct_msg(message: Message, state: FSMContext, bot: Bot):
+    if not config.is_admin(message.from_user.id):
+        return
+    from handlers.searches import route_menu_text
+    if await route_menu_text(message, state):
+        return
+    data = await state.get_data()
+    await state.clear()
+    target_id, page = int(data.get("dm_user") or 0), int(data.get("dm_page") or 0)
+    body = (message.text or "").strip()
+    if not body or not target_id:
+        return
+    try:
+        await bot.send_message(
+            chat_id=target_id,
+            text=(
+                f"{ui.e('megaphone')} <b>Вам сообщение от Администрации</b>\n\n"
+                f"{html.escape(body)}"
+            ),
+            reply_markup=ui.kb([ui.btn("Написать в поддержку", "support", callback_data="open_support_stub")]),
+            parse_mode="HTML",
+        )
+        await database.log_admin_action(message.from_user.id, target_id, "dm", body[:100])
+        await message.answer(f"{ui.e('ok')} Сообщение отправлено пользователю <code>{target_id}</code>.", parse_mode="HTML")
+    except Exception as exc:
+        await message.answer(f"{ui.e('warn')} Не удалось доставить сообщение: {html.escape(str(exc)[:150])}", parse_mode="HTML")
+    text, kb = await render_user_card_data(target_id, page, admin_id=message.from_user.id)
+    if text:
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("admin_note:"))
@@ -409,11 +467,13 @@ async def msg_admin_note(message: Message, state: FSMContext):
 ADMIN_ACTION_LABELS = {
     "grant": "выдал подписку", "vip": "выдал VIP", "trial": "выдал триал", "revoke": "отозвал доступ",
     "limit": "изменил лимит радаров", "radars_delete": "удалил радары", "purge": "удалил пользователя",
-    "refund": "вернул платёж", "note": "заметка", "broadcast": "рассылка", "extend_all": "продлил всем",
-    "net_mode": "режим сети", "prices": "цены Stars", "approve": "одобрил доступ", "reject": "отклонил доступ",
+    "refund": "вернул платёж", "note": "заметка", "dm": "сообщение юзеру", "broadcast": "рассылка",
+    "extend_all": "продлил всем", "net_mode": "режим сети", "prices": "цены Stars",
+    "approve": "одобрил доступ", "reject": "отклонил доступ",
     "ref_issue": "выдал реф. ссылку", "ref_extend": "продлил реф. ссылку", "ref_off": "выключил реф. ссылку",
     "ref_pct": "процент реф. ссылки", "ref_payout": "выплата по рефералке", "ref_rate": "курс звезды",
 }
+ADMIN_LOG_PAGE = 20
 
 
 def _admin_action_lines(rows: list[dict], with_user: bool) -> list[str]:
@@ -431,23 +491,42 @@ async def cb_admin_user_log(call: CallbackQuery):
     if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав администратора", show_alert=True)
         return
-    _, target_raw, page_raw = call.data.split(":")
-    rows = await database.get_admin_actions(int(target_raw), limit=25)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="« Карточка пользователя", callback_data=f"admin_user:{target_raw}:{page_raw}")],
-    ])
-    text = f"🧾 <b>Действия админов</b> · <code>{target_raw}</code>\n\n" + "\n".join(_admin_action_lines(rows, False))
+    parts = call.data.split(":")
+    target_raw, page_raw = parts[1], parts[2]
+    log_page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+    rows = await database.get_admin_actions(int(target_raw), limit=100)
+    total_pages = max(1, -(-len(rows) // ADMIN_LOG_PAGE))
+    log_page = max(0, min(log_page, total_pages - 1))
+    chunk = rows[log_page * ADMIN_LOG_PAGE:(log_page + 1) * ADMIN_LOG_PAGE]
+    nav = ui.page_nav(log_page, total_pages, f"admin_ulog:{target_raw}:{page_raw}:{{page}}")
+    kb = ui.kb(
+        nav,
+        [ui.btn("« Карточка пользователя", callback_data=f"admin_user:{target_raw}:{page_raw}")],
+    )
+    page_note = f" · стр. {log_page + 1}/{total_pages}" if total_pages > 1 else ""
+    text = f"🧾 <b>Действия админов</b> · <code>{target_raw}</code>{page_note}\n\n" + "\n".join(_admin_action_lines(chunk, False))
     await ui.show(call, text + "\n\n<blockquote>Время МСК.</blockquote>", kb)
 
 
 @router.callback_query(F.data == "admin_alog")
+@router.callback_query(F.data.startswith("admin_alog:"))
 async def cb_admin_log_all(call: CallbackQuery):
     if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав администратора", show_alert=True)
         return
-    rows = await database.get_admin_actions(None, limit=30)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="admin_refresh")]])
-    text = "🧾 <b>Журнал админов</b> (последние 30)\n\n" + "\n".join(_admin_action_lines(rows, True))
+    parts = call.data.split(":")
+    log_page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    rows = await database.get_admin_actions(None, limit=120)
+    total_pages = max(1, -(-len(rows) // ADMIN_LOG_PAGE))
+    log_page = max(0, min(log_page, total_pages - 1))
+    chunk = rows[log_page * ADMIN_LOG_PAGE:(log_page + 1) * ADMIN_LOG_PAGE]
+    nav = ui.page_nav(log_page, total_pages, "admin_alog:{page}")
+    kb = ui.kb(
+        nav,
+        [ui.btn("« Админ-панель", callback_data="admin_refresh")],
+    )
+    page_note = f" · стр. {log_page + 1}/{total_pages}" if total_pages > 1 else ""
+    text = f"🧾 <b>Журнал админов</b>{page_note}\n\n" + "\n".join(_admin_action_lines(chunk, True))
     await ui.show(call, text + "\n\n<blockquote>Время МСК.</blockquote>", kb)
 
 
@@ -471,10 +550,14 @@ async def cb_admin_radar_limit(call: CallbackQuery):
     await call.answer(f"Лимит радаров: {max_radars} (бонус +{extra})")
     if target_raw == "self":
         return
-    text, kb = await render_user_card_data(target_id, page)
+    in_radars_screen = bool(call.message and "РАДАРЫ ПОЛЬЗОВАТЕЛЯ" in (call.message.text or ""))
+    if in_radars_screen:
+        text, kb = await _render_user_radars(target_id, page)
+    else:
+        text, kb = await render_user_card_data(target_id, page, admin_id=call.from_user.id)
     if text:
         try:
-            await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
         except Exception:
             pass
 
@@ -489,7 +572,7 @@ async def cb_admin_user(call: CallbackQuery):
         target_id = int(parts[1])
         plan = parts[2] if parts[0] == "admin_sub_days" else None
         page = max(0, int(parts[3] if plan is not None else parts[2]))
-        if plan is not None and plan not in config.PAID_PLANS:
+        if plan not in (None, *config.PAID_PLANS):
             raise ValueError("Неизвестный тариф")
     except (ValueError, IndexError):
         await call.answer("Некорректная кнопка пользователя", show_alert=True)
@@ -503,7 +586,7 @@ async def cb_admin_user(call: CallbackQuery):
         return
 
     if parts[0] == "admin_user":
-        text, kb = await render_user_card_data(target_id, page)
+        text, kb = await render_user_card_data(target_id, page, admin_id=call.from_user.id)
         if not text:
             await call.answer("Пользователь не найден", show_alert=True)
             return
@@ -521,22 +604,24 @@ async def cb_admin_user(call: CallbackQuery):
     if parts[0] == "admin_sub_menu":
         text += "<b>Выберите тариф для выдачи / продления:</b>"
         buttons = [
-            *[[InlineKeyboardButton(
-                text=f"{config.plan_title(p)} · {config.plan_radars(p)} рад. · раз в {config.plan_interval(p)} с",
+            *[[ui.btn(
+                f"{config.plan_title(p)} · {config.plan_radars(p)} рад. · раз в {config.plan_interval(p)} с",
+                p,
                 callback_data=f"admin_sub_days:{target_id}:{p}:{page}",
             )] for p in config.PAID_PLANS],
-            *[[InlineKeyboardButton(
-                text=f"👑 Бессрочный «{config.plan_title(p)}» (VIP)",
+            *[[ui.btn(
+                f"Бессрочный «{config.plan_title(p)}» (VIP)",
+                "admin",
                 callback_data=f"admin_grant_vip_prompt:{target_id}:{p}:{page}",
             )] for p in config.PAID_PLANS],
-            [InlineKeyboardButton(text="« Назад в карточку", callback_data=f"admin_user:{target_id}:{page}")]
+            [ui.btn("« Назад в карточку", callback_data=f"admin_user:{target_id}:{page}")]
         ]
     elif parts[0] == "admin_sub_days":
         text += f"<b>Добавить срок на тарифе «{config.plan_title(plan)}»:</b>"
         buttons = [
             [InlineKeyboardButton(text=f"➕ {days} дн.", callback_data=f"admin_grant_sub:{target_id}:{plan}:{days}:{page}") for days in (1, 7, 14)],
             [InlineKeyboardButton(text=f"➕ {days} дн.", callback_data=f"admin_grant_sub:{target_id}:{plan}:{days}:{page}") for days in (30, 90, 365)],
-            [InlineKeyboardButton(text="« Назад к выбору тарифа", callback_data=f"admin_sub_menu:{target_id}:{page}")]
+            [ui.btn("« Назад к выбору тарифа", callback_data=f"admin_sub_menu:{target_id}:{page}")]
         ]
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     await call.answer()
@@ -669,18 +754,16 @@ async def cb_admin_confirm_trial(call: CallbackQuery, bot: Bot):
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 
-@router.callback_query(F.data.startswith("admin_user_radars:"))
-async def cb_admin_user_radars(call: CallbackQuery):
-    if not config.is_admin(call.from_user.id):
-        await call.answer("У вас нет прав администратора", show_alert=True)
-        return
-    parts = call.data.split(":")
-    target_id, page = int(parts[1]), int(parts[2])
+async def _render_user_radars(target_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
     radars = await database.get_user_searches(target_id)
+    user = await database.get_user(target_id) or {}
+    max_radars = await database.get_user_max_radars(target_id)
+    extra_radars = int(user.get("extra_radars") or 0)
+    extra_label = f", из них +{extra_radars} от админа" if extra_radars else ""
 
     text_lines = [
-        f"📁 <b>РАДАРЫ ПОЛЬЗОВАТЕЛЯ <code>{target_id}</code></b> (всего: {len(radars)})\n"
-        "━━━━━━━━━━━━━━━━━━━━"
+        f"📁 <b>РАДАРЫ ПОЛЬЗОВАТЕЛЯ <code>{target_id}</code></b>\n"
+        f"Всего: <b>{len(radars)}</b> · лимит до <b>{max_radars}</b>{extra_label}\n"
     ]
     if not radars:
         text_lines.append("<i>У пользователя пока нет созданных радаров.</i>")
@@ -688,28 +771,42 @@ async def cb_admin_user_radars(call: CallbackQuery):
         for idx, r in enumerate(radars, start=1):
             is_active = bool(r.get("is_active", 1))
             status_emoji = "🟢" if is_active else "⏸"
-            scope = "🏷 В заголовках" if r.get("search_in_title_only") else "📄 Заголовок+текст"
+            scope = "В заголовках" if r.get("search_in_title_only") else "Заголовок+текст"
             title = html.escape(r.get("title") or "Без названия")
             url = html.escape(r.get("url") or "")
             text_lines.append(
-                f"{idx}. {status_emoji} <b>{title}</b> · #{r['id']}\n"
-                f"   ├ Выборка: <i>{scope}</i>\n"
-                f"   └ <a href=\"{url}\">Ссылка на Авито</a>"
+                f"{idx}. {status_emoji} <b>{title}</b> · #{r['id']} ({scope}) · <a href=\"{url}\">Авито</a>"
             )
 
-    scan_buttons = [
-        InlineKeyboardButton(text=f"📊 Сканы {idx}. {(r.get('title') or 'Радар')[:22]}",
-                             callback_data=f"admin_scans:{r['id']}:{target_id}:{page}")
+    rows = [
+        [ui.btn(f"Сканы {idx}. {(r.get('title') or 'Радар')[:22]}", "stats",
+                callback_data=f"admin_scans:{r['id']}:{target_id}:{page}")]
         for idx, r in enumerate(radars[:20], start=1)
     ]
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        *[[button] for button in scan_buttons],
-        [InlineKeyboardButton(text="📜 История радаров", callback_data=f"admin_rhist:{target_id}:{page}:0")],
-        [InlineKeyboardButton(text="« Назад в карточку пользователя", callback_data=f"admin_user:{target_id}:{page}")]
+    rows.append([
+        InlineKeyboardButton(text="−5 рад.", callback_data=f"admin_radar_limit:{target_id}:-5:{page}"),
+        InlineKeyboardButton(text="+5 рад.", callback_data=f"admin_radar_limit:{target_id}:5:{page}"),
+        InlineKeyboardButton(text="+20 рад.", callback_data=f"admin_radar_limit:{target_id}:20:{page}"),
     ])
+    act_row = [ui.btn("История радаров", "time", callback_data=f"admin_rhist:{target_id}:{page}:0")]
+    if radars:
+        act_row.append(ui.btn("Удалить радары", "trash", callback_data=f"admin_rdel:new:{target_id}:{page}", style="danger"))
+    rows.append(act_row)
+    rows.append([ui.btn("« Карточка пользователя", callback_data=f"admin_user:{target_id}:{page}")])
     text = "\n".join(text_lines)
     if len(text) > 3800:
         text = text[:3800].rsplit("\n", 1)[0] + "\n…"
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("admin_user_radars:"))
+async def cb_admin_user_radars(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    parts = call.data.split(":")
+    target_id, page = int(parts[1]), int(parts[2])
+    text, kb = await _render_user_radars(target_id, page)
     await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
     await call.answer()
 
@@ -780,15 +877,11 @@ async def cb_admin_radar_history(call: CallbackQuery):
             line += f' · <a href="{html.escape(row["url"])}">ссылка</a>'
         lines.append(line)
     lines.append("\n<blockquote>✖ — радара уже нет. Время МСК.</blockquote>")
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="«", callback_data=f"admin_rhist:{target_id}:{card_page}:{page - 1}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton(text="»", callback_data=f"admin_rhist:{target_id}:{card_page}:{page + 1}"))
-    kb = InlineKeyboardMarkup(inline_keyboard=[row for row in (
+    nav = ui.page_nav(page, pages, f"admin_rhist:{target_id}:{card_page}:{{page}}")
+    kb = ui.kb(
         nav,
-        [InlineKeyboardButton(text="« Радары", callback_data=f"admin_user_radars:{target_id}:{card_page}")],
-    ) if row])
+        [ui.btn("« Радары", callback_data=f"admin_user_radars:{target_id}:{card_page}")],
+    )
     await ui.show(call, "\n".join(lines), kb)
 
 
@@ -898,10 +991,15 @@ async def cb_admin_scans(call: CallbackQuery):
         return
     owner = await database.get_user(int(radar["user_id"])) or {}
     radar = {**radar, **{k: owner.get(k) for k in ("tariff_plan", "is_allowed", "trial_used", "subscription_until")}}
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data=call.data)],
-        [InlineKeyboardButton(text="« Радары", callback_data=f"admin_user_radars:{target_id}:{card_page}")],
-    ])
+    back_btn = (
+        ui.btn("« Все сканы радаров", callback_data="admin_scans_pick:0")
+        if card_page < 0 else
+        ui.btn("« Радары", callback_data=f"admin_user_radars:{target_id}:{card_page}")
+    )
+    kb = ui.kb(
+        [ui.btn("Обновить", "refresh", callback_data=call.data)],
+        [back_btn],
+    )
     await ui.show(call, render_scan_journal(radar), kb, disable_web_page_preview=True)
 
 
@@ -1110,10 +1208,12 @@ async def _answer_lot(message: Message, text: str) -> None:
     if item_id is None:
         await message.answer("Не нашёл номер объявления. Пришлите ссылку вида avito.ru/…_1234567890 или сам номер.")
         return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Ещё раз", callback_data=f"admin_lot:{item_id}")],
-    ])
-    await message.answer(await explain_lot(item_id), reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    kb = ui.kb(
+        [ui.btn("Ещё раз", "refresh", callback_data=f"admin_lot:{item_id}"),
+         ui.btn("Другой лот", "scope", callback_data="admin_lot_prompt")],
+        [ui.btn("« Логи", callback_data="admin_logs_menu")],
+    )
+    await ui.show(message, await explain_lot(item_id), kb, disable_web_page_preview=True)
 
 
 @router.callback_query(F.data.startswith("admin_lot:"))
@@ -1122,7 +1222,11 @@ async def cb_admin_lot(call: CallbackQuery):
         await call.answer("У вас нет прав администратора", show_alert=True)
         return
     item_id = call.data.split(":", 1)[1]
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Ещё раз", callback_data=call.data)]])
+    kb = ui.kb(
+        [ui.btn("Ещё раз", "refresh", callback_data=call.data),
+         ui.btn("Другой лот", "scope", callback_data="admin_lot_prompt")],
+        [ui.btn("« Логи", callback_data="admin_logs_menu")],
+    )
     await ui.show(call, await explain_lot(item_id), kb, disable_web_page_preview=True)
 
 
@@ -1145,18 +1249,12 @@ async def cb_admin_scans_pick(call: CallbackQuery):
     rows = [
         [InlineKeyboardButton(
             text=f"📊 #{r['id']} {(r.get('title') or 'Радар')[:24]} · {r.get('username') or r['user_id']}"[:60],
-            callback_data=f"admin_scans:{r['id']}:{r['user_id']}:0",
+            callback_data=f"admin_scans:{r['id']}:{r['user_id']}:-1",
         )]
         for r in radars[page * SCANS_PICK_PAGE:(page + 1) * SCANS_PICK_PAGE]
     ]
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="«", callback_data=f"admin_scans_pick:{page - 1}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton(text="»", callback_data=f"admin_scans_pick:{page + 1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton(text="« Логи", callback_data="admin_logs_menu")])
+    rows.append(ui.page_nav(page, pages, "admin_scans_pick:{page}"))
+    rows.append([ui.btn("« Логи", callback_data="admin_logs_menu")])
     text = (
         f"{ui.e('radar')} <b>Сканы радаров</b>\n\n"
         f"Работающих радаров: <b>{len(radars)}</b>" + (f" · стр. {page + 1}/{pages}" if pages > 1 else "")
@@ -1215,14 +1313,9 @@ async def _radars_delete_screen(call: CallbackQuery, state: FSMContext, target_i
         mark = "☑" if radar["id"] in selected else "☐"
         title = (radar.get("title") or "Без названия").strip()
         rows.append([ui.btn(f"{mark} {i}. {title[:30]}", callback_data=f"admin_rtog:{radar['id']}:{page}:{suffix}")])
-    nav = []
-    if page > 0:
-        nav.append(ui.btn("«", callback_data=f"admin_rdel:{page - 1}:{suffix}"))
-    if page < pages - 1:
-        nav.append(ui.btn("»", callback_data=f"admin_rdel:{page + 1}:{suffix}"))
-    rows.append(nav)
-    rows.append([ui.btn("Выбрать все", callback_data=f"admin_rall:{page}:{suffix}"),
-                 ui.btn("Снять все", callback_data=f"admin_rnone:{page}:{suffix}")])
+    rows.append(ui.page_nav(page, pages, f"admin_rdel:{{page}}:{suffix}"))
+    rows.append([ui.btn("Выбрать все", "ok", callback_data=f"admin_rall:{page}:{suffix}"),
+                 ui.btn("Снять все", "cancel", callback_data=f"admin_rnone:{page}:{suffix}")])
     if selected:
         rows.append([ui.btn(f"Удалить выбранные ({len(selected)})", "trash", callback_data=f"admin_rgo:{suffix}", style="danger")])
     rows.append([ui.btn("« Карточка пользователя", callback_data=f"admin_user:{suffix}")])
@@ -1744,6 +1837,7 @@ async def cmd_admin_panel(event, page: int = 0):
         await event.answer()
     if not config.is_admin(user_id):
         return
+    _LAST_USER_FILTER[user_id] = user_filter
 
     all_users, ever_ids, paid_ids, allowed = await _filtered_users(user_filter)
     total_pages = max(1, (len(all_users) + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
@@ -1775,19 +1869,16 @@ async def cmd_admin_panel(event, page: int = 0):
             icon, status = "⚪️", "не пробовал"
         lines.append(f"{idx}. {icon} <b>{html.escape(fname)}</b> {html.escape(tag)} — {status}")
         label = f"{icon} {fname[:18]} · {tag[:16]}"
-        callback = "admin_noop" if config.is_admin(u_id) else f"admin_user:{u_id}:{page}"
+        callback = f"admin_user:{u_id}:{page}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=callback)])
 
     if not page_users:
         lines.append("Никого нет.")
     lines.append("\nНажмите на пользователя: подписка, радары, платежи, блок и удаление — в карточке.")
 
-    if total_pages > 1:
-        buttons.append([
-            InlineKeyboardButton(text="◀️", callback_data=f"admin_page:{page - 1}{suffix}" if page > 0 else "admin_noop"),
-            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="admin_noop"),
-            InlineKeyboardButton(text="▶️", callback_data=f"admin_page:{page + 1}{suffix}" if page < total_pages - 1 else "admin_noop"),
-        ])
+    nav = ui.page_nav(page, total_pages, f"admin_page:{{page}}{suffix}")
+    if nav:
+        buttons.append(nav)
     filter_buttons = [
         InlineKeyboardButton(text=("• " if key == user_filter else "") + title, callback_data=f"admin_page:0:{key}")
         for key, title in USER_FILTERS.items()
@@ -1797,7 +1888,7 @@ async def cmd_admin_panel(event, page: int = 0):
     buttons.append([InlineKeyboardButton(text=f"📣 Рассылка: {USER_FILTERS[user_filter]}", callback_data=f"admin_bc:{user_filter}")])
     buttons.append([
         InlineKeyboardButton(text="🔍 Найти", callback_data="admin_search_user_prompt"),
-        InlineKeyboardButton(text="⬅️ Меню", callback_data="admin_refresh"),
+        InlineKeyboardButton(text="« Админ-панель", callback_data="admin_refresh"),
     ])
     await _show(event, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons))
 
@@ -1987,7 +2078,7 @@ async def cb_admin_money(event):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📣 Написать ушедшим", callback_data="admin_bc:lost")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_money"),
-         InlineKeyboardButton(text="⬅️ Меню", callback_data="admin_refresh")],
+         InlineKeyboardButton(text="« Админ-панель", callback_data="admin_refresh")],
     ])
     if isinstance(event, CallbackQuery):
         await ui.show(event, "\n".join(lines), kb)
@@ -2020,15 +2111,17 @@ async def cb_admin_revoke(call: CallbackQuery, bot: Bot):
                 "⚠️ <b>Ваш доступ к AVITO RADAR был приостановлен администратором.</b>\n\n"
                 "Если у вас есть вопросы или возникла ошибка, свяжитесь со службой поддержки:"
             ),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💬 Написать в поддержку", callback_data="support_start_ticket")]
-            ]),
+            reply_markup=ui.kb([ui.btn("Написать в поддержку", "support", callback_data="open_support_stub")]),
             parse_mode="HTML"
         )
     except Exception as e:
         logger.warning("Не удалось уведомить пользователя %s об отзыве доступа: %s", target_user_id, e)
 
-    await cmd_admin_panel(call, page=page)
+    text, kb = await render_user_card_data(target_user_id, page, admin_id=call.from_user.id)
+    if text:
+        await ui.show(call, text, kb, answer=False)
+    else:
+        await cmd_admin_panel(call, page=page)
 
 
 @router.callback_query(F.data.startswith("admin_purge_user:"))
@@ -2214,17 +2307,17 @@ async def cmd_admin_logs_menu(event):
         *([[ui.btn("Показывать всю историю", "logs", callback_data="admin_hist_all")]] if since else []),
         [ui.btn("Все логи (ZIP)", "box", callback_data="admin_log_get:all_zip")],
         [
-            InlineKeyboardButton(text="bot.log", callback_data="admin_log_get:bot"),
-            InlineKeyboardButton(text="errors.log", callback_data="admin_log_get:errors")
+            ui.btn("bot.log", "docs", callback_data="admin_log_get:bot"),
+            ui.btn("errors.log", "warn", callback_data="admin_log_get:errors")
         ],
         [
-            InlineKeyboardButton(text="user_actions.log", callback_data="admin_log_get:user_actions"),
-            InlineKeyboardButton(text="events.jsonl", callback_data="admin_log_get:events")
+            ui.btn("user_actions.log", "users", callback_data="admin_log_get:user_actions"),
+            ui.btn("events.jsonl", "note", callback_data="admin_log_get:events")
         ],
-        [InlineKeyboardButton(text="metrics.jsonl", callback_data="admin_log_get:metrics")],
+        [ui.btn("metrics.jsonl", "stats", callback_data="admin_log_get:metrics")],
         [
             ui.btn("Скачать БД", "db", callback_data="admin_backup"),
-            ui.btn("В админку", "admin", callback_data="admin_refresh")
+            ui.btn("« Админ-панель", callback_data="admin_refresh")
         ]
     ])
 
@@ -2740,60 +2833,94 @@ async def msg_admin_user_query(message: Message, state: FSMContext):
     await do_admin_user_search(message, query, state)
 
 
+async def _render_user_search_page(query: str, page: int = 0) -> tuple[str | None, InlineKeyboardMarkup | None, int | None]:
+    users = await database.find_users_by_query(query)
+    if not users:
+        text = (
+            f"{ui.e('warn')} <b>Пользователь не найден</b>\n\n"
+            f"По запросу <code>{html.escape(query)}</code> в базе данных бота ничего не найдено.\n\n"
+            f"Убедитесь, что пользователь хотя бы раз отправлял <code>/start</code> в бот."
+        )
+        kb = ui.kb(
+            [ui.btn("Искать снова", "scope", callback_data="admin_search_user_prompt")],
+            [ui.btn("« Админ-панель", callback_data="admin_refresh")],
+        )
+        return text, kb, None
+
+    if len(users) == 1:
+        return None, None, users[0]["user_id"]
+
+    pages = max(1, (len(users) + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    start_idx = page * USERS_PER_PAGE
+    page_users = users[start_idx:start_idx + USERS_PER_PAGE]
+    page_info = f" · стр. {page + 1}/{pages}" if pages > 1 else ""
+
+    text = (
+        f"{ui.e('scope')} <b>Результаты поиска</b> ({len(users)}){page_info}\n"
+        f"Запрос: <code>{html.escape(query)}</code>\n\n"
+    )
+    rows = []
+    for idx, u in enumerate(page_users, start=start_idx + 1):
+        u_id = u["user_id"]
+        uname = f"@{u['username']}" if u.get("username") else f"ID: {u_id}"
+        fname_raw = u.get("first_name") or "Без имени"
+        fname = html.escape(fname_raw)
+        plan = config.plan_title(u.get("tariff_plan"))
+        has_access = await database.is_user_allowed(u_id)
+        status_icon = "🟢" if has_access else "🔴"
+        text += f"{idx}. {status_icon} <b>{fname}</b> ({html.escape(uname)}) — <i>[{plan}]</i> [ID: <code>{u_id}</code>]\n"
+        rows.append([InlineKeyboardButton(
+            text=f"{status_icon} {fname_raw[:18]} · {uname[:16]}",
+            callback_data=f"admin_user:{u_id}:0",
+        )])
+
+    rows.append(ui.page_nav(page, pages, "admin_find_page:{page}"))
+    rows.append([
+        ui.btn("Новый поиск", "scope", callback_data="admin_search_user_prompt"),
+        ui.btn("« Админ-панель", callback_data="admin_refresh"),
+    ])
+    return text, ui.kb(*rows), None
+
+
 async def do_admin_user_search(message: Message, query: str, state: FSMContext):
     await state.clear()
     if not query:
         await message.answer("Запрос пуст. Попробуйте снова.")
         return
 
-    users = await database.find_users_by_query(query)
-    if not users:
-        await message.answer(
-            f"❌ <b>Пользователь не найден</b>\n\n"
-            f"По запросу <code>{html.escape(query)}</code> в базе данных бота ничего не найдено.\n\n"
-            f"Убедитесь, что пользователь хотя бы раз отправлял <code>/start</code> в бот.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔍 Искать снова", callback_data="admin_search_user_prompt")],
-                [InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_refresh")]
-            ])
-        )
-        return
-
-    if len(users) == 1:
-        u_id = users[0]["user_id"]
-        text, kb = await render_user_card_data(u_id, page=0)
-        if text:
-            await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    _LAST_SEARCH_QUERY[message.from_user.id] = query
+    text, kb, single_uid = await _render_user_search_page(query, page=0)
+    if single_uid is not None:
+        card_text, card_kb = await render_user_card_data(single_uid, page=0, admin_id=message.from_user.id)
+        if card_text:
+            await message.answer(card_text, reply_markup=card_kb, parse_mode="HTML")
             return
-
-    text = (
-        f"🔍 <b>РЕЗУЛЬТАТЫ ПОИСКА</b> (найдено: {len(users)})\n"
-        f"Запрос: <code>{html.escape(query)}</code>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-    )
-    buttons = []
-    for idx, u in enumerate(users[:10], start=1):
-        u_id = u["user_id"]
-        uname = f"@{u['username']}" if u.get("username") else f"ID: {u_id}"
-        fname = html.escape(u.get("first_name") or "Без имени")
-        plan = config.plan_title(u.get("tariff_plan"))
-        has_access = await database.is_user_allowed(u_id)
-        status_icon = "🟢" if has_access else "🔴"
-        text += f"{idx}. {status_icon} <b>{fname}</b> ({uname}) — <i>[{plan}]</i> [ID: <code>{u_id}</code>]\n"
-        buttons.append([
-            InlineKeyboardButton(text=f"👤 Карточка {uname}", callback_data=f"admin_user:{u_id}:0"),
-            InlineKeyboardButton(text="💳 Выдать", callback_data=f"admin_sub_menu:{u_id}:0")
-        ])
-
-    buttons.append([
-        InlineKeyboardButton(text="🔍 Новый поиск", callback_data="admin_search_user_prompt"),
-        InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_refresh")
-    ])
-    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    if text:
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
-
+@router.callback_query(F.data.startswith("admin_find_page:"))
+async def cb_admin_find_page(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        page = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        page = 0
+    query = _LAST_SEARCH_QUERY.get(call.from_user.id, "")
+    if not query:
+        await call.answer("Запрос поиска устарел", show_alert=True)
+        return
+    text, kb, single_uid = await _render_user_search_page(query, page=page)
+    if single_uid is not None:
+        card_text, card_kb = await render_user_card_data(single_uid, page=0, admin_id=call.from_user.id)
+        if card_text:
+            await ui.show(call, card_text, card_kb)
+            return
+    if text:
+        await ui.show(call, text, kb)
 
 
 @router.message(Command("stats"))
@@ -2817,15 +2944,18 @@ async def cmd_admin_stats(event):
     from runtime_metrics import METRICS
     await reports.refresh_live_metrics()
 
-    stats_kb = InlineKeyboardMarkup(inline_keyboard=[
+    stats_kb = ui.kb(
         [
-            InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_runtime_stats"),
-            InlineKeyboardButton(text="🌐 Сеть и прокси", callback_data="admin_net"),
+            ui.btn("Обновить", "refresh", callback_data="admin_runtime_stats"),
+            ui.btn("Сеть и прокси", "net", callback_data="admin_net"),
         ],
-        [InlineKeyboardButton(text="⬅️ Меню", callback_data="admin_refresh")],
-    ])
+        [ui.btn("« Админ-панель", callback_data="admin_refresh")],
+    )
 
     chunks = METRICS.format_stats_messages()
+    if isinstance(event, CallbackQuery) and len(chunks) == 1:
+        await ui.show(event, chunks[0], stats_kb, answer=False)
+        return
     for idx, chunk in enumerate(chunks):
         is_last = idx == len(chunks) - 1
         await message.answer(chunk, reply_markup=stats_kb if is_last else None, parse_mode="HTML")
@@ -3455,17 +3585,14 @@ async def _render_proxy_list(page: int) -> tuple[str, InlineKeyboardMarkup]:
         lines.append("Список пуст.")
     if any(client.is_direct for client in pool.clients):
         buttons.append([InlineKeyboardButton(text="📊 Сервер", callback_data=f"admin_net_stat:direct:{page}")])
-    if pages > 1:
-        buttons.append([
-            InlineKeyboardButton(text="◀️", callback_data=f"admin_net_list:{page - 1}" if page > 0 else "admin_noop"),
-            InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="admin_noop"),
-            InlineKeyboardButton(text="▶️", callback_data=f"admin_net_list:{page + 1}" if page < pages - 1 else "admin_noop"),
-        ])
+    nav = ui.page_nav(page, pages, "admin_net_list:{page}")
+    if nav:
+        buttons.append(nav)
     if urls:
         buttons.append([InlineKeyboardButton(text="🗑 Удалить все", callback_data="admin_net_delall")])
     buttons.append([
         InlineKeyboardButton(text="➕ Добавить", callback_data="admin_net_add"),
-        InlineKeyboardButton(text="🌐 К сети", callback_data="admin_net"),
+        InlineKeyboardButton(text="« Сеть и прокси", callback_data="admin_net"),
     ])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -3674,10 +3801,10 @@ async def cb_admin_net_delall(call: CallbackQuery):
     await _show(
         call,
         f"🗑 Удалить все прокси ({len(config.PROXY_URLS)} шт.)?",
-        InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Да, удалить все", callback_data="admin_net_delall_yes"),
-            InlineKeyboardButton(text="Отмена", callback_data="admin_net_list:0"),
-        ]]),
+        ui.kb([
+            ui.btn("Да, удалить все", "trash", callback_data="admin_net_delall_yes", style="danger"),
+            ui.btn("Отмена", "cancel", callback_data="admin_net_list:0"),
+        ]),
     )
 
 
@@ -3831,13 +3958,7 @@ async def cb_admin_emoji_slots(call: CallbackQuery, state: FSMContext):
             row = []
     if row:
         rows.append(row)
-    nav = []
-    if page > 0:
-        nav.append(ui.btn("«", callback_data=f"admin_emoji_slots:{page - 1}"))
-    if page < pages - 1:
-        nav.append(ui.btn("»", callback_data=f"admin_emoji_slots:{page + 1}"))
-    if nav:
-        rows.append(nav)
+    rows.append(ui.page_nav(page, pages, "admin_emoji_slots:{page}"))
     rows.append([ui.btn("« Эмодзи", callback_data="admin_emoji")])
     await _show(call, f"{ui.e('write')} <b>Какое место заменить?</b> · стр. {page + 1}/{pages}", ui.kb(*rows))
 

@@ -112,6 +112,8 @@ class TestAdminRadars(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
     async def test_admin_deletes_selected_radars_of_a_user(self):
         radars = await self.add_user_radars(3)
         await self.dispatch_callback(f"admin_user:{USER_ID}:0", config.ADMIN_ID)
+        self.assertIn(f"admin_user_radars:{USER_ID}:0", self.callback_values())
+        await self.dispatch_callback(f"admin_user_radars:{USER_ID}:0", config.ADMIN_ID)
         self.assertIn(f"admin_rdel:new:{USER_ID}:0", self.callback_values())
 
         await self.dispatch_callback(f"admin_rdel:new:{USER_ID}:0", config.ADMIN_ID)

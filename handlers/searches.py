@@ -217,9 +217,12 @@ async def btn_add_search(event, state: FSMContext):
 @router.callback_query(F.data == "cancel_fsm")
 async def cb_cancel_fsm(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await ui.show(call, f"{ui.e('cancel')} <b>Отменено</b>", ui.kb(
-        [ui.btn("Мои радары", "radars", callback_data="list_searches"), ui.home_btn()],
-    ))
+    searches = await database.get_user_searches(call.from_user.id)
+    if searches:
+        await show_searches(call, state)
+    else:
+        from handlers.common import cmd_start
+        await cmd_start(call, state)
 
 
 def _url_error_kb() -> InlineKeyboardMarkup:
@@ -432,9 +435,11 @@ async def process_avito_url(message: Message, state: FSMContext):
     )
     markup = ui.kb(
         [_scope_button(search_id, bool(is_title_only))],
-        [ui.btn("Стоп-слова", "shield", callback_data=f"manage_stops:{search_id}"),
+        [ui.btn("Фильтры и настройки", "sliders", callback_data=f"flt_open:{search_id}"),
+         ui.btn("Стоп-слова", "shield", callback_data=f"manage_stops:{search_id}")],
+        [ui.btn("Карточка радара", "radar", callback_data=f"open_search:{search_id}"),
          ui.btn("На Авито", "link", url=normalized_url)],
-        [ui.btn("Мои радары", "radars", callback_data="list_searches")],
+        [ui.btn("Мои радары", "radars", callback_data="list_searches"), ui.home_btn()],
     )
     await status_msg.edit_text(text, reply_markup=markup, parse_mode="HTML")
 
@@ -497,8 +502,7 @@ def build_radar_card(s: dict, lots_day: Optional[int] = None) -> Tuple[str, Inli
         + _check_line(s, lots_day)
         + f"<b>Ищет:</b> {_scope_label(title_only)}\n"
         f"<b>Стоп-слова:</b> {stops_count or 'нет'}\n"
-        f"<b>Фильтры:</b> {html.escape(radar_filters.summary(s))}\n"
-        f"<a href=\"{html.escape(s['url'], quote=True)}\">Открыть выдачу на Авито</a>"
+        f"<b>Фильтры:</b> {html.escape(radar_filters.summary(s))}"
     )
     toggle = (
         ui.btn("Пауза", "pause", callback_data=f"toggle_search:{search_id}")
@@ -508,7 +512,7 @@ def build_radar_card(s: dict, lots_day: Optional[int] = None) -> Tuple[str, Inli
     markup = ui.kb(
         [toggle, ui.btn(f"Стоп-слова ({stops_count})", "shield", callback_data=f"manage_stops:{search_id}")],
         [_scope_button(search_id, title_only)],
-        [ui.btn("Фильтры и сообщение продавцу", "note", callback_data=f"flt_open:{search_id}")],
+        [ui.btn("Фильтры и сообщение продавцу", "sliders", callback_data=f"flt_open:{search_id}")],
         [ui.btn("Переименовать", "write", callback_data=f"rename_search:{search_id}"),
          ui.btn("Сменить ссылку", "refresh", callback_data=f"change_url:{search_id}")],
         [ui.btn("На Авито", "link", url=s["url"]),
@@ -718,7 +722,7 @@ async def cb_set_age_menu(call: CallbackQuery):
     if row:
         rows.append(row)
     rows.append([ui.btn("Ввести вручную (1–30)", "write", callback_data=f"custom_age:{search_id}")])
-    rows.append([ui.btn("« К радару", callback_data=f"open_search:{search_id}")])
+    rows.append([ui.btn("« К фильтрам", callback_data=f"flt_open:{search_id}")])
     await ui.show(call, text, ui.kb(*rows))
 
 
@@ -737,8 +741,8 @@ async def cb_save_age(call: CallbackQuery):
     ans_text = f"Установлен фильтр: {format_max_age_label(val)}"
     log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Настройка свежести", f"Радар #{search_id} -> {ans_text}", status="OK")
     await call.answer(ans_text)
-    card_text, markup = build_radar_card(s)
-    await ui.show(call, card_text, markup, answer=False, disable_web_page_preview=True)
+    text, markup = build_filters_screen(s)
+    await ui.show(call, text, markup, answer=False)
 
 
 @router.callback_query(F.data.startswith("custom_age:"))
@@ -781,7 +785,8 @@ async def process_custom_age_input(message: Message, state: FSMContext):
         log_user_event(message.from_user.id, message.from_user.username, message.from_user.first_name, "Настройка свежести", f"Радар #{search_id} -> свой порог: {val} мин.", status="OK")
         s = await database.get_search(search_id)
         if s:
-            await _show_card(message, s)
+            text_out, markup = build_filters_screen(s)
+            await ui.show(message, text_out, markup)
             return
 
     await show_searches(message, state)
@@ -853,15 +858,11 @@ async def _bulk_screen(call: CallbackQuery, state: FSMContext, page: int) -> Non
         mark = "☑" if s["id"] in selected else "☐"
         title = s["title"].strip()
         rows.append([ui.btn(f"{mark} {i}. {title[:30]}", callback_data=f"bulk_tog:{s['id']}:{page}")])
-    nav = []
-    if page > 0:
-        nav.append(ui.btn("«", callback_data=f"bulk_del:{page - 1}"))
-    if page < pages - 1:
-        nav.append(ui.btn("»", callback_data=f"bulk_del:{page + 1}"))
+    nav = ui.page_nav(page, pages, "bulk_del:{page}")
     if nav:
         rows.append(nav)
-    rows.append([ui.btn("Выбрать все", callback_data=f"bulk_all:{page}"),
-                 ui.btn("Снять все", callback_data=f"bulk_none:{page}")])
+    rows.append([ui.btn("Выбрать все", "ok", callback_data=f"bulk_all:{page}"),
+                 ui.btn("Снять все", "cancel", callback_data=f"bulk_none:{page}")])
     if selected:
         rows.append([ui.btn(f"Удалить выбранные ({len(selected)})", "trash", callback_data="bulk_go", style="danger")])
     rows.append([ui.btn("« Мои радары", callback_data="list_searches")])
@@ -1015,7 +1016,8 @@ async def cb_manage_stops(call: CallbackQuery):
     rows, row = [], []
     # The button carries the word's position, not the word: callback data is limited to 64 bytes.
     for idx, w in enumerate(stop_words):
-        row.append(ui.btn(f"✖ {w}", callback_data=f"rm_stop_i:{search_id}:{idx}"))
+        btn_label = w if (ui.clean() and ui.custom_id("cancel")) else f"✖ {w}"
+        row.append(ui.btn(btn_label, "cancel", callback_data=f"rm_stop_i:{search_id}:{idx}"))
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -1030,14 +1032,18 @@ async def cb_manage_stops(call: CallbackQuery):
 async def _start_stop_word_fsm(call: CallbackQuery, state: FSMContext, search_id: int) -> None:
     await state.set_state(SearchStates.waiting_for_stop_word)
     await state.update_data(search_id=search_id)
-    if call.message:
-        await call.message.answer(
-            f"{ui.e('write')} <b>Пришлите стоп-слово или фразу</b>\n\n"
-            "Несколько — через запятую: <code>на запчасти, копия, без комплекта</code>",
-            reply_markup=ui.kb([ui.btn("Отмена", "cancel", callback_data="cancel_fsm")]),
-            parse_mode="HTML"
-        )
-    await call.answer()
+    prompt_text = (
+        f"{ui.e('write')} <b>Пришлите стоп-слово или фразу</b>\n\n"
+        "Несколько — через запятую: <code>на запчасти, копия, без комплекта</code>"
+    )
+    markup = ui.kb([ui.btn("Отмена", "cancel", callback_data=f"manage_stops:{search_id}")])
+    from_lot = bool(call.data and call.data.startswith(("add_stop_from_item:", "event_stop:")))
+    if not from_lot:
+        await ui.show(call, prompt_text, markup)
+    else:
+        if call.message:
+            await call.message.answer(prompt_text, reply_markup=markup, parse_mode="HTML")
+        await call.answer()
 
 
 @router.callback_query(F.data.startswith("event_stop:"))
@@ -1120,10 +1126,16 @@ def build_filters_screen(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
     price_min, price_max = int(s.get("price_min") or 0), int(s.get("price_max") or 0)
     words = radar_filters.parse_words(s.get("must_words"))
     template = (s.get("reply_template") or "").strip()
+    cur_age = s.get("max_age_minutes")
+    if not cur_age or cur_age <= 0:
+        cur_age = 5
+    elif cur_age > 30:
+        cur_age = 30
     text = (
-        f"{ui.e('note')} <b>Фильтры радара</b>\n«{html.escape(s['title'])}»\n\n"
+        f"{ui.e('sliders')} <b>Фильтры радара</b>\n«{html.escape(s['title'])}»\n\n"
         f"<b>Цена:</b> {radar_filters.price_label(price_min, price_max)}\n"
         f"<b>Обязательные слова:</b> {html.escape(', '.join(words)) or 'нет'}\n"
+        f"<b>Свежесть лотов:</b> до {cur_age} мин.\n"
         f"<b>Только с Авито Доставкой:</b> {_yes_no(s.get('delivery_only'))}\n"
         f"<b>Скрывать продвинутые:</b> {_yes_no(s.get('hide_promoted'))}\n"
         f"<b>Сообщение продавцу:</b> {html.escape(template) or 'нет'}\n\n"
@@ -1133,11 +1145,12 @@ def build_filters_screen(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
     markup = ui.kb(
         [ui.btn("Цена", "price", callback_data=f"flt_price:{search_id}"),
          ui.btn("Обязательные слова", "scope", callback_data=f"flt_must:{search_id}")],
-        [ui.btn(f"Только с доставкой: {_yes_no(s.get('delivery_only'))}", "box",
+        [ui.btn(f"Свежесть: до {cur_age} мин", "time", callback_data=f"set_age:{search_id}"),
+         ui.btn(f"Только с доставкой: {_yes_no(s.get('delivery_only'))}", "box",
                 callback_data=f"flt_tog:delivery_only:{search_id}")],
         [ui.btn(f"Скрывать продвинутые: {_yes_no(s.get('hide_promoted'))}", "ban",
-                callback_data=f"flt_tog:hide_promoted:{search_id}")],
-        [ui.btn("Сообщение продавцу", "write", callback_data=f"flt_tpl:{search_id}")],
+                callback_data=f"flt_tog:hide_promoted:{search_id}"),
+         ui.btn("Сообщение продавцу", "write", callback_data=f"flt_tpl:{search_id}")],
         [ui.btn("« К радару", callback_data=f"open_search:{search_id}")],
     )
     return text, markup

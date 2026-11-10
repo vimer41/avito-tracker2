@@ -283,7 +283,7 @@ async def payment_support(event, state: FSMContext):
     user = event.from_user
     orders = await billing.list_orders(user.id)
     rub_orders = await billing.list_rub_orders(user.id, 5)
-    text = f"{ui.e('support')} <b>Оплата и возврат</b>\n\n{ui.e('mail')} {legal_docs.SUPPORT_EMAIL}\n\n"
+    text = f"{ui.e('tariffs')} <b>Оплата и возврат</b>\n\n{ui.e('mail')} {legal_docs.SUPPORT_EMAIL}\n\n"
     if orders or rub_orders:
         text += "<b>Последние платежи:</b>\n" + "\n".join(
             [f"• R{o['id']} · {html.escape(rub_payments.order_title(o))} · {rub_payments.rub(o['amount'])} ₽ · "
@@ -294,13 +294,18 @@ async def payment_support(event, state: FSMContext):
         ) + "\n\n"
     text += "Опишите проблему или запрос возврата следующим сообщением, укажите номер заказа, если знаете. Ответим прямо здесь."
     await state.set_state(SupportStates.waiting_for_user_message)
-    await state.update_data(payment_support=True)
-    message = event.message if isinstance(event, CallbackQuery) else event
-    await message.answer(text, parse_mode="HTML", reply_markup=ui.kb(
-        [ui.btn("Отмена", "cancel", callback_data="support_cancel")],
-    ))
-    if isinstance(event, CallbackQuery):
-        await event.answer()
+    await state.update_data(
+        payment_support=True,
+        force_new=True,
+        ticket_topic="payment",
+        ticket_priority="high",
+    )
+    back_cb = "open_subscription_menu" if isinstance(event, CallbackQuery) else "support_cancel"
+    back_label = "« Назад к тарифам" if isinstance(event, CallbackQuery) else "Отмена"
+    await ui.show(event, text, ui.kb([ui.btn(back_label, callback_data=back_cb)]))
+
+
+ADMIN_PAYMENTS_PAGE = 8
 
 
 @router.callback_query(F.data.startswith("admin_payments:"))
@@ -308,43 +313,54 @@ async def admin_payments(call: CallbackQuery):
     if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав администратора", show_alert=True)
         return
+    parts = call.data.split(":")
     try:
-        user_id = int(call.data.split(":")[1])
+        user_id = int(parts[1])
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
     except (ValueError, IndexError):
         await call.answer("Некорректный пользователь", show_alert=True)
         return
     orders = await billing.list_orders(user_id)
-    rub_orders = await billing.list_rub_orders(user_id, 10)
-    lines = [f"⭐ <b>Платежи пользователя {user_id}</b>",
+    rub_orders = await billing.list_rub_orders(user_id, 50)
+    combined = [("rub", o) for o in rub_orders] + [("stars", o) for o in orders]
+    total_pages = max(1, -(-len(combined) // ADMIN_PAYMENTS_PAGE))
+    page = max(0, min(page, total_pages - 1))
+    page_items = combined[page * ADMIN_PAYMENTS_PAGE:(page + 1) * ADMIN_PAYMENTS_PAGE]
+    page_note = f" · стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
+    lines = [f"⭐ <b>Платежи пользователя {user_id}</b>{page_note}",
              "<i>R12 — заказ №12, оплата рублями (Platega). #12 — заказ №12, оплата Stars. "
              "Этот номер покупатель видит в сообщении об оплате.</i>", ""]
     buttons = []
-    for order in rub_orders:
-        refund_note = (f" · {rub_payments.REFUND_RESULT_TITLES.get(order.get('refund_result'), '')}"
-                       if order.get("refund_requested_at") else "")
-        lines.append(
-            f"R{order['id']} · {html.escape(rub_payments.order_title(order))} · {rub_payments.rub(order['amount'])} ₽ · "
-            f"{rub_payments.method_title(order)} · {rub_payments.STATUS_TITLES.get(order['status'], order['status'])}"
-            + refund_note + (" · ⚠️ сверить подписку вручную" if order["refund_needs_review"] else "")
-        )
-        if order["paid_at"]:  # evidence is for paid orders only: an unpaid link has nothing to prove
-            row = [InlineKeyboardButton(text=f"📄 Доказательства R{order['id']}",
-                                        callback_data=f"admin_rubproof:{order['id']}")]
-            if rub_payments.refund_problem(order) is None:
-                row.append(InlineKeyboardButton(text=f"↩️ Вернуть R{order['id']}",
-                                                callback_data=f"admin_rubrefund:{order['id']}"))
-            buttons.append(row)
-    for order in orders:
-        lines.append(f"#{order['id']} · {config.plan_title(order['tariff_plan'])} · {order['total_amount']} ⭐ · {order['status']}"
-                     + (" · ⚠️ сверить подписку вручную" if order["refund_needs_review"] else ""))
-        if order["status"] in ("paid", "refunding"):
-            buttons.append([InlineKeyboardButton(text=f"↩️ Вернуть #{order['id']} ({order['total_amount']} ⭐)", callback_data=f"admin_refund_prompt:{order['id']}")])
+    for kind, order in page_items:
+        if kind == "rub":
+            refund_note = (f" · {rub_payments.REFUND_RESULT_TITLES.get(order.get('refund_result'), '')}"
+                           if order.get("refund_requested_at") else "")
+            lines.append(
+                f"R{order['id']} · {html.escape(rub_payments.order_title(order))} · {rub_payments.rub(order['amount'])} ₽ · "
+                f"{rub_payments.method_title(order)} · {rub_payments.STATUS_TITLES.get(order['status'], order['status'])}"
+                + refund_note + (" · ⚠️ сверить подписку вручную" if order["refund_needs_review"] else "")
+            )
+            if order["paid_at"]:  # evidence is for paid orders only: an unpaid link has nothing to prove
+                row = [InlineKeyboardButton(text=f"📄 Доказательства R{order['id']}",
+                                            callback_data=f"admin_rubproof:{order['id']}")]
+                if rub_payments.refund_problem(order) is None:
+                    row.append(InlineKeyboardButton(text=f"↩️ Вернуть R{order['id']}",
+                                                    callback_data=f"admin_rubrefund:{order['id']}"))
+                buttons.append(row)
+        else:
+            lines.append(f"#{order['id']} · {config.plan_title(order['tariff_plan'])} · {order['total_amount']} ⭐ · {order['status']}"
+                         + (" · ⚠️ сверить подписку вручную" if order["refund_needs_review"] else ""))
+            if order["status"] in ("paid", "refunding"):
+                buttons.append([InlineKeyboardButton(text=f"↩️ Вернуть #{order['id']} ({order['total_amount']} ⭐)", callback_data=f"admin_refund_prompt:{order['id']}")])
     if rub_orders:
         lines.append("\n«↩️ Вернуть» отправляет полный возврат в Platega и сразу отзывает оплаченный доступ. "
                      "Во время спора возврат недоступен.")
-    if not orders and not rub_orders:
+    if not combined:
         lines.append("Подтверждённых платежей пока нет.")
-    buttons.append([InlineKeyboardButton(text="« Карточка пользователя", callback_data=f"admin_user:{user_id}:0")])
+    nav = ui.page_nav(page, total_pages, f"admin_payments:{user_id}:{{page}}")
+    if nav:
+        buttons.append(nav)
+    buttons.append([ui.btn("« Карточка пользователя", callback_data=f"admin_user:{user_id}:0")])
     await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     await call.answer()
 

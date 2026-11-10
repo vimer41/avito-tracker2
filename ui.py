@@ -87,6 +87,10 @@ SLOTS: dict[str, tuple[str, str]] = {
     "prio_high": ("🚨", "срочный приоритет"),
     "inbox": ("📥", "все обращения"),
     "clip": ("📎", "вложения"),
+    "moon": ("🌙", "ночной режим"),
+    "sliders": ("🎛", "фильтры"),
+    "back": ("⬅️", "назад"),
+    "megaphone": ("📢", "канал, рассылка"),
 }
 
 # Reply-keyboard labels and their legacy spellings. A reply button sends its label back as text,
@@ -151,6 +155,8 @@ DEFAULT_IDS: dict[str, str] = {
     "bug": "5449893837369554567", "question": "5447481298404814201", "tag": "5449738462632652930",
     "flag": "5447661356318765353", "prio_low": "5447661863124904643", "prio_mid": "5447408069212420475",
     "prio_high": "5449789362290077759", "inbox": "5447155520840445438", "clip": "5447255357355252826",
+    "moon": "5447573395388541696", "sliders": "5447359437297724000", "back": "5447409035580060202",
+    "megaphone": "5447528238102391887",
 }
 
 # The clean theme's own monochrome pack (tools/make_icon_pack.py, Tabler outline icons): adaptive custom emoji,
@@ -177,6 +183,8 @@ CLEAN_IDS: dict[str, str] = {
     "bug": "5449893837369554567", "question": "5447481298404814201", "tag": "5449738462632652930",
     "flag": "5447661356318765353", "prio_low": "5447661863124904643", "prio_mid": "5447408069212420475",
     "prio_high": "5449789362290077759", "inbox": "5447155520840445438", "clip": "5447255357355252826",
+    "moon": "5447573395388541696", "sliders": "5447359437297724000", "back": "5447409035580060202",
+    "megaphone": "5447528238102391887",
 }
 
 
@@ -226,17 +234,42 @@ def e(name: str) -> str:
 def btn(text: str, icon: Optional[str] = None, *, style: Optional[str] = None, **kwargs) -> InlineKeyboardButton:
     """Inline button with an icon slot: animated icon when filled, plain emoji in the text otherwise.
     The clean theme uses its own monochrome icon and never puts a colour emoji into the text."""
+    if icon is None:
+        if text.startswith("« ") and len(text) > 2:
+            icon = "back"
+        elif text == "Отмена":
+            icon = "cancel"
     if clean():
-        return InlineKeyboardButton(text=text, icon_custom_emoji_id=custom_id(icon) if icon else None,
-                                    style=style, **kwargs)
+        cid = custom_id(icon) if icon else None
+        if cid and text.startswith("« ") and len(text) > 2:
+            text = text[2:].strip()
+        return InlineKeyboardButton(text=text, icon_custom_emoji_id=cid, style=style, **kwargs)
     cid = custom_id(icon) if icon else None
-    if icon and not cid:
+    if icon and not cid and not text.startswith("« "):
         text = f"{SLOTS[icon][0]} {text}"
     return InlineKeyboardButton(text=text, icon_custom_emoji_id=cid, style=style, **kwargs)
 
 
 def kb(*rows: Iterable[InlineKeyboardButton]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows if r])
+
+
+def page_nav(page: int, total_pages: int, callback_fmt: str, noop_data: str = "admin_noop") -> list[InlineKeyboardButton]:
+    """Unified [←] [1 / N] [→] pagination row for multi-page lists."""
+    if total_pages <= 1:
+        return []
+    prev_btn = (
+        InlineKeyboardButton(text="←", callback_data=callback_fmt.format(page=page - 1))
+        if page > 0 else
+        InlineKeyboardButton(text="·", callback_data=noop_data)
+    )
+    mid_btn = InlineKeyboardButton(text=f"{page + 1} / {total_pages}", callback_data=noop_data)
+    next_btn = (
+        InlineKeyboardButton(text="→", callback_data=callback_fmt.format(page=page + 1))
+        if page + 1 < total_pages else
+        InlineKeyboardButton(text="·", callback_data=noop_data)
+    )
+    return [prev_btn, mid_btn, next_btn]
 
 
 def home_btn() -> InlineKeyboardButton:
@@ -378,6 +411,7 @@ _EXTRA_SLOTS = {
     "🗜": "db", "♻": "refresh", "🔁": "refresh", "🔎": "scope", "📂": "radars", "📋": "radars",
     # network modes: every mode button gets an icon, not just «Прокси» (🛰 = logo)
     "🧠": "radar", "🔀": "refresh", "🖥": "db", "🤖": "net",
+    "↩": "back",
 }
 _HOME_LABELS = {"Меню", "Главное меню", "« Меню", "« Главное меню", "В меню"}
 
@@ -428,6 +462,12 @@ def _clean_button(b):
     label = drop_colour_emoji(text).strip()
     if label in _HOME_LABELS:
         label, icon = "Меню", icon or custom_id("home")
+    elif label.startswith("« ") and len(label) > 2:
+        back_id = icon or custom_id("back")
+        if back_id:
+            label, icon = label[2:].strip(), back_id
+    elif label == "Отмена" and not icon:
+        icon = custom_id("cancel")
     if not label:  # an icon-only button («🗑»): a word instead of the bare picture
         slot = next((slot_for(m.group(0)) for m in _EMOJI.finditer(text) if slot_for(m.group(0))), None)
         label = SLOTS[slot][1].split(",")[0].capitalize() if slot else b.text

@@ -148,14 +148,10 @@ async def cb_ref_list(call: CallbackQuery):
         mark = "🟢" if referrals.is_active(link) else "⚪️"
         rows.append([ui.btn(f"{mark} {referrals.owner_name(link)} · {link['percent']}% · пришло {link['came']}",
                             callback_data=f"ref_adm_link:{link['id']}")])
-    nav = []
-    if page:
-        nav.append(ui.btn("«", callback_data=f"ref_adm:{page - 1}"))
-    if (page + 1) * PAGE_SIZE < total:
-        nav.append(ui.btn("»", callback_data=f"ref_adm:{page + 1}"))
-    rows.append(nav)
+    total_pages = max(1, -(-total // PAGE_SIZE))
+    rows.append(ui.page_nav(page, total_pages, "ref_adm:{page}"))
     rows.append([ui.btn("Курс звезды", "star", callback_data="ref_adm_rate"),
-                 ui.btn("В админку", "admin", callback_data="admin_refresh")])
+                 ui.btn("« Админ-панель", callback_data="admin_refresh")])
     await ui.show(call, text, ui.kb(*rows))
 
 

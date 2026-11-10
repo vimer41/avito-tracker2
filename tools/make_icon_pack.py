@@ -42,6 +42,7 @@ ICONS = {
     "bug": "bug", "question": "help-circle", "tag": "tag", "flag": "flag",
     "prio_low": "bell", "prio_mid": "bell-ringing", "prio_high": "urgent",
     "inbox": "inbox", "clip": "paperclip",
+    "moon": "moon", "sliders": "adjustments", "back": "arrow-left", "megaphone": "speakerphone",
 }
 
 
