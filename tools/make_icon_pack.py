@@ -39,6 +39,9 @@ ICONS = {
     "bank": "building-bank", "star": "star", "coin": "currency-bitcoin", "lock": "lock", "scope": "search",
     "write": "pencil", "mail": "mail", "admin": "shield-lock", "users": "users", "net": "world",
     "stats": "chart-line", "db": "database", "logs": "list", "palette": "palette",
+    "bug": "bug", "question": "help-circle", "tag": "tag", "flag": "flag",
+    "prio_low": "bell", "prio_mid": "bell-ringing", "prio_high": "urgent",
+    "inbox": "inbox", "clip": "paperclip",
 }
 
 
@@ -78,28 +81,41 @@ def main():
 
     bot = api(token, "getMe")["username"]
     name = f"{PACK_SHORT}_by_{bot}"
+    existing_pack = None
     if "--replace" in sys.argv:
         try:
             api(token, "deleteStickerSet", name=name)
             print(f"старый набор {name} удалён")
         except RuntimeError:
             pass
+    else:
+        try:
+            existing_pack = api(token, "getStickerSet", name=name)
+        except RuntimeError:
+            existing_pack = None
 
+    existing_chars = {ui._norm(s.get("emoji", "")) for s in (existing_pack or {}).get("stickers", [])}
     stickers, seen = [], set()
     for slot, icon in ICONS.items():
         char = ui.SLOTS[slot][0]
-        if char in seen:
+        norm_char = ui._norm(char)
+        if norm_char in seen or norm_char in existing_chars:
             continue
-        seen.add(char)
+        seen.add(norm_char)
         png = render(icon)
         file_id = api(token, "uploadStickerFile", files={"sticker": (f"{slot}.png", png, "image/png")},
                       user_id=owner, sticker_format="static")["file_id"]
-        stickers.append({"sticker": file_id, "format": "static", "emoji_list": [char]})
+        sticker_obj = {"sticker": file_id, "format": "static", "emoji_list": [char]}
+        if existing_pack is not None:
+            api(token, "addStickerToSet", user_id=owner, name=name, sticker=json.dumps(sticker_obj, ensure_ascii=False))
+        else:
+            stickers.append(sticker_obj)
         print(f"{slot:9} {icon:18} {char}")
         time.sleep(0.2)
 
-    api(token, "createNewStickerSet", user_id=owner, name=name, title=PACK_TITLE, sticker_type="custom_emoji",
-        needs_repainting="true", stickers=json.dumps(stickers, ensure_ascii=False))
+    if existing_pack is None:
+        api(token, "createNewStickerSet", user_id=owner, name=name, title=PACK_TITLE, sticker_type="custom_emoji",
+            needs_repainting="true", stickers=json.dumps(stickers, ensure_ascii=False))
     pack = api(token, "getStickerSet", name=name)
     ids = ui.match_slots((s.get("emoji", ""), s["custom_emoji_id"]) for s in pack["stickers"])
     print(f"\nНабор: https://t.me/addemoji/{name}  ({len(pack['stickers'])} иконок, слотов {len(ids)} из {len(ui.SLOTS)})")

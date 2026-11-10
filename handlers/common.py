@@ -42,7 +42,7 @@ def get_doc_keyboard(name: str, page: int) -> InlineKeyboardMarkup:
         nav,
         [ui.btn("К списку документов", "docs", callback_data="open_docs_menu")],
         [ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu"),
-         ui.btn("Поддержка", "support", callback_data="support_start_ticket")],
+         ui.btn("Поддержка", "support", callback_data="open_support_stub")],
         [ui.home_btn()],
     )
 
@@ -80,7 +80,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
          ui.btn("Профиль", "profile", callback_data="refresh_profile")],
         [ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu"),
          ui.btn("Инструкция", "help", callback_data="open_help_menu")],
-        [ui.btn("Поддержка", "support", callback_data="support_start_ticket"),
+        [ui.btn("Поддержка", "support", callback_data="open_support_stub"),
          ui.btn("Документы", "docs", callback_data="open_docs_menu")],
     )
 
@@ -280,7 +280,7 @@ async def cmd_help(event):
     markup = ui.kb(
         [ui.btn("Добавить радар", "radar", callback_data="add_search_prompt", style="primary")],
         [ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu"),
-         ui.btn("Поддержка", "support", callback_data="support_start_ticket")],
+         ui.btn("Поддержка", "support", callback_data="open_support_stub")],
         [ui.home_btn()],
     )
     await ui.show(event, text, markup)

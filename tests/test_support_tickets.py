@@ -79,7 +79,7 @@ class TestTicketFlow(TicketCase):
         await self.write("Помогите")
         await self.admin_answer(1, "Уже смотрим")
         answer = self.sent_to(USER)[-1]
-        self.assertIn("Ответ по обращению #1", answer.text)
+        self.assertIn("Пришёл ответ в обращении #1", answer.text)
         self.assertIn("Уже смотрим", answer.text)
         self.assertTrue(any("ответил" in m.text for m in self.sent_to(ADMIN2)))
         self.assertEqual((await database.get_ticket(1))["status"], "answered")
@@ -91,7 +91,7 @@ class TestTicketFlow(TicketCase):
         self.assertEqual((await database.get_ticket_by_ref(ADMIN, notice_id))["id"], 1)
         await self.say("Ответ цитатой", ADMIN, reply_to=notice_id)
         answer = self.sent_to(USER)[-1]
-        self.assertIn("Ответ по обращению #1", answer.text)
+        self.assertIn("Пришёл ответ в обращении #1", answer.text)
         await self.say("Спасибо, а ещё?", USER, reply_to=self.session.calls.index(answer) + 1)
         authors = [m["author"] for m in await database.get_ticket_messages(1)]
         self.assertEqual(authors, ["user", "admin", "user"])
@@ -150,7 +150,7 @@ class TestTicketFlow(TicketCase):
         await self.say("Здравствуйте, у вас кончается подписка", ADMIN)
         ticket = await database.get_live_ticket(USER)
         self.assertEqual(ticket["status"], "answered")
-        self.assertIn("Ответ по обращению", self.sent_to(USER)[-1].text)
+        self.assertIn("Пришёл ответ в обращении", self.sent_to(USER)[-1].text)
 
     async def test_stranger_cannot_open_someone_elses_ticket(self):
         await self.write("Личное")
@@ -220,10 +220,39 @@ class TestTicketCard(TicketCase):
         await self.write("Вопрос")
         await self.dispatch_callback("admin_tks", user_id=ADMIN)
         self.assertIn("admin_tkl:open:0", self.callback_values())
+        self.assertIn("admin_tkl:all:0", self.callback_values())
         await self.dispatch_callback("admin_tkl:open:0", user_id=ADMIN)
-        self.assertIn("tk:1:-1", self.callback_values())
+        self.assertIn("tk:1:-1:a", self.callback_values())
         await self.dispatch_callback("admin_refresh", user_id=ADMIN)
         self.assertIn("admin_tks", self.callback_values())
+
+    async def test_wizard_creates_ticket_with_topic_priority_and_allows_second_open_ticket(self):
+        await self.dispatch_callback("tk_new", user_id=USER)
+        self.assertIn("tk_topic:radar", self.callback_values())
+        await self.dispatch_callback("tk_topic:radar", user_id=USER)
+        self.assertIn("tk_prio:urgent", self.callback_values())
+        await self.dispatch_callback("tk_prio:urgent", user_id=USER)
+        await self.say("Не работает ссылка на ноутбуки", USER)
+
+        t1 = await database.get_ticket(1)
+        self.assertEqual((t1["topic"], t1["priority"], t1["status"]), ("radar", "urgent", "open"))
+
+        # User opens a second ticket with a custom topic while #1 is still waiting
+        await self.dispatch_callback("tk_new", user_id=USER)
+        await self.dispatch_callback("tk_topic:custom", user_id=USER)
+        await self.say("Перенос подписки", USER)
+        await self.dispatch_callback("tk_prio:high", user_id=USER)
+        await self.say("Можно перенести на другой аккаунт?", USER)
+
+        t2 = await database.get_ticket(2)
+        self.assertEqual((t2["topic"], t2["priority"], t2["status"]), ("Перенос подписки", "high", "open"))
+        live = await database.list_live_tickets(USER)
+        self.assertEqual([t["id"] for t in live], [2, 1])
+
+        # Urgent ticket #1 sorts above High ticket #2 in admin waiting list
+        waiting, total = await database.list_tickets("open")
+        self.assertEqual(total, 2)
+        self.assertEqual([t["id"] for t in waiting], [1, 2])
 
     async def test_non_admin_cannot_open_the_admin_panel(self):
         await self.dispatch_callback("admin_tkl:open:0", user_id=USER)

@@ -4121,6 +4121,7 @@ async def _create_ticket_tables(db) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             topic TEXT NOT NULL DEFAULT 'general',
+            priority TEXT NOT NULL DEFAULT 'normal',
             status TEXT NOT NULL DEFAULT 'open',
             full_name TEXT NOT NULL DEFAULT '',
             username TEXT NOT NULL DEFAULT '',
@@ -4135,6 +4136,10 @@ async def _create_ticket_tables(db) -> None:
             user_deleted_epoch REAL
         )
     """)
+    async with db.execute("PRAGMA table_info(tickets)") as cur:
+        ticket_cols = {row[1] for row in await cur.fetchall()}
+    if "priority" not in ticket_cols:
+        await db.execute("ALTER TABLE tickets ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'")
     await db.execute("CREATE INDEX IF NOT EXISTS tickets_user ON tickets(user_id, id)")
     await db.execute("CREATE INDEX IF NOT EXISTS tickets_status ON tickets(status, updated_epoch)")
     await db.execute("""
@@ -4215,29 +4220,38 @@ def ticket_can_reopen(ticket: Dict[str, Any], now: Optional[float] = None) -> bo
 
 async def add_user_ticket_message(user_id: int, full_name: str, username: str, text: str, media_type: str = "",
                                   file_id: str = "", is_payment: bool = False,
-                                  ticket_id: Optional[int] = None) -> tuple[Dict[str, Any], int, bool]:
+                                  ticket_id: Optional[int] = None, topic: Optional[str] = None,
+                                  priority: Optional[str] = None,
+                                  force_new: bool = False) -> tuple[Dict[str, Any], int, bool]:
     """Appends to `ticket_id` (a closed one reopens inside the window) or to the user's live ticket;
-    otherwise starts one. Returns (ticket after the change, message id, ticket is new)."""
+    when `force_new` is True, always starts a new ticket. Returns (ticket after the change, message id, ticket is new)."""
     now = time.time()
     async with writer_connection() as db:
         await db.execute("BEGIN IMMEDIATE")
-        ticket = await _ticket_row(db, ticket_id) if ticket_id else None
+        ticket = await _ticket_row(db, ticket_id) if (ticket_id and not force_new) else None
         if ticket and (ticket["user_id"] != user_id or ticket.get("user_deleted_epoch")):
             ticket = None
         parent_id = None
+        inherited_topic = None
+        inherited_prio = None
         if ticket and ticket["status"] == "closed":
             if ticket_can_reopen(ticket, now):
                 await _ticket_note(db, ticket["id"], "Открыто снова пользователем", now)
             else:
-                parent_id, ticket = ticket["id"], None
-        if ticket is None:
+                parent_id = ticket["id"]
+                inherited_topic = ticket.get("topic")
+                inherited_prio = ticket.get("priority")
+                ticket = None
+        if ticket is None and not force_new and parent_id is None:
             ticket = await _live_ticket_row(db, user_id)
         is_new = ticket is None
+        eff_topic = (topic or inherited_topic or ("payment" if is_payment else "general")).strip() or "general"
+        eff_prio = (priority or inherited_prio or ("urgent" if is_payment else "normal")).strip() or "normal"
         if is_new:
             cursor = await db.execute(
-                "INSERT INTO tickets (user_id, topic, status, full_name, username, parent_id, created_epoch, updated_epoch)"
-                " VALUES (?, ?, 'open', ?, ?, ?, ?, ?)",
-                (user_id, "payment" if is_payment else "general", full_name, username, parent_id, now, now),
+                "INSERT INTO tickets (user_id, topic, priority, status, full_name, username, parent_id, created_epoch, updated_epoch)"
+                " VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?)",
+                (user_id, eff_topic, eff_prio, full_name, username, parent_id, now, now),
             )
             tid = int(cursor.lastrowid)
             if parent_id:
@@ -4254,7 +4268,7 @@ async def add_user_ticket_message(user_id: int, full_name: str, username: str, t
             "UPDATE tickets SET status = 'open', full_name = ?, username = ?, updated_epoch = ?, last_user_epoch = ?,"
             " closed_epoch = NULL, closed_by = '', closed_by_admin = NULL,"
             " topic = CASE WHEN ? THEN 'payment' ELSE topic END WHERE id = ?",
-            (full_name, username, now, now, int(bool(is_payment)), tid),
+            (full_name, username, now, now, int(bool(is_payment and not is_new and ticket.get("topic") == "general")), tid),
         )
         ticket = await _ticket_row(db, tid)
         await db.commit()
@@ -4383,6 +4397,16 @@ async def get_live_ticket(user_id: int) -> Optional[Dict[str, Any]]:
         return await _live_ticket_row(db, user_id)
 
 
+async def list_live_tickets(user_id: int) -> List[Dict[str, Any]]:
+    async with reader_connection() as db:
+        async with db.execute(
+            "SELECT * FROM tickets WHERE user_id = ? AND status IN ('open', 'answered') AND user_deleted_epoch IS NULL"
+            " ORDER BY id DESC",
+            (user_id,),
+        ) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+
 async def _ticket_page(where: str, args: tuple, order: str, offset: int, limit: int) -> tuple[List[Dict[str, Any]], int]:
     async with reader_connection() as db:
         async with db.execute(f"SELECT COUNT(*) FROM tickets t WHERE {where}", args) as cur:
@@ -4402,8 +4426,16 @@ async def list_user_tickets(user_id: int, offset: int = 0, limit: int = 6,
 
 
 async def list_tickets(status: str, offset: int = 0, limit: int = 8) -> tuple[List[Dict[str, Any]], int]:
-    # Waiting tickets: the longest wait first. The rest: the latest change first.
-    order = "COALESCE(t.last_user_epoch, t.updated_epoch)" if status == "open" else "t.updated_epoch DESC"
+    if status == "all":
+        return await _ticket_page("1=1", (), "t.id DESC", offset, limit)
+    # Waiting tickets: highest priority first, then longest wait first. The rest: latest change first.
+    if status == "open":
+        order = (
+            "CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END ASC, "
+            "COALESCE(t.last_user_epoch, t.updated_epoch) ASC"
+        )
+    else:
+        order = "t.updated_epoch DESC"
     return await _ticket_page("t.status = ?", (status,), order, offset, limit)
 
 
@@ -4411,7 +4443,12 @@ async def count_tickets() -> Dict[str, int]:
     async with reader_connection() as db:
         async with db.execute("SELECT status, COUNT(*) FROM tickets GROUP BY status") as cur:
             counts = {row[0]: int(row[1]) for row in await cur.fetchall()}
-    return {status: counts.get(status, 0) for status in ("open", "answered", "closed")}
+        async with db.execute("SELECT COUNT(*) FROM tickets WHERE status = 'open' AND priority = 'urgent'") as cur:
+            urgent = (await cur.fetchone())[0]
+    out = {status: counts.get(status, 0) for status in ("open", "answered", "closed")}
+    out["all"] = out["open"] + out["answered"] + out["closed"]
+    out["urgent"] = int(urgent or 0)
+    return out
 
 
 async def ticket_user_summary(user_id: int) -> tuple[int, int]:

@@ -1,13 +1,16 @@
 """Support tickets.
 
-A user writes → the message joins their live ticket (or starts one) → every admin gets it with buttons.
-An admin answers with a button or a quote-reply; the user answers the same way. Either side closes the ticket;
-an answered ticket closes itself after SUPPORT_AUTOCLOSE_HOURS of the user's silence. Nothing is ever deleted:
-the card shows the whole conversation page by page.
+A user creates a ticket by choosing a topic and priority (or appends to an existing open ticket) → every admin gets it
+with action buttons. An admin answers with a button or a quote-reply; the user answers the same way. Either side closes
+the ticket; an answered ticket closes itself after SUPPORT_AUTOCLOSE_HOURS of the user's silence. Nothing is ever
+deleted: the card shows the whole conversation page by page.
 
-Callbacks: tk:<id>:<page> card (page -1 = last), tk_my:<page>, tk_write:<id>, tk_close:<id> → tk_close_y:<id>,
-tk_reopen:<id>, tk_full:<id>:<page>, tk_files:<id>:<page>; admin: admin_tks, admin_tkl:<status>:<page>,
-admin_tku:<user>:<page>, admin_tkr:<id>, admin_tkc:<id> → admin_tkc_y:<id>, admin_tkx:<id>; legacy support_reply:<user>.
+Callbacks:
+- User wizard: tk_new → tk_topic:<topic> → tk_prio:<priority> → waiting_for_user_message
+- Card & actions: tk:<id>:<page>[:a] card (page -1 = last), tk_my:<page>, tk_write:<id>, tk_close:<id> → tk_close_y:<id>,
+  tk_reopen:<id>, tk_full:<id>:<page>, tk_files:<id>:<page>
+- Admin: admin_tks, admin_tkl:<status>:<page>, admin_tku:<user>:<page>, admin_tkr:<id>, admin_tkc:<id> → admin_tkc_y:<id>,
+  admin_tkx:<id>; legacy support_reply:<user>.
 """
 import html
 import logging
@@ -34,6 +37,7 @@ router = Router()
 
 
 class SupportStates(StatesGroup):
+    waiting_for_custom_topic = State()
     waiting_for_user_message = State()
     waiting_for_admin_reply = State()
     waiting_for_admin_close = State()
@@ -47,12 +51,42 @@ PAGE_MESSAGES = 5          # messages on one page of the ticket card
 SNIPPET = 300              # a longer message is cut on the card; «Показать полностью» sends it whole
 USER_LIST_PAGE = 6
 ADMIN_LIST_PAGE = 8
-TOPICS = {"general": "Вопрос", "payment": "Оплата"}
+MAX_LIVE_TICKETS = 5
+CUSTOM_TOPIC_MAX_LEN = 50
+
+TOPICS = {
+    "payment": "Оплата и возврат",
+    "radar": "Проблема с радаром",
+    "bug": "Техническая ошибка",
+    "general": "Вопрос",
+}
+TOPIC_ICONS = {
+    "payment": "tariffs",
+    "radar": "radar",
+    "bug": "bug",
+    "general": "question",
+}
+PRIORITIES = {
+    "normal": "Обычный",
+    "high": "Важный",
+    "urgent": "Срочный",
+}
+PRIORITY_ICONS = {
+    "normal": "prio_low",
+    "high": "prio_mid",
+    "urgent": "prio_high",
+}
+
 MEDIA_TITLES = {"photo": "фото", "document": "файл", "voice": "голосовое", "video": "видео"}
 USER_STATUS = {"open": "ждёт ответа", "answered": "есть ответ", "closed": "закрыто"}
 ADMIN_STATUS = {"open": "ждёт ответа", "answered": "отвечено, ждём пользователя", "closed": "закрыто"}
-STATUS_ICONS = {"open": "wait", "answered": "support", "closed": "ok"}
-ADMIN_LISTS = {"open": "Ждут ответа", "answered": "Отвечены", "closed": "Закрытые"}
+STATUS_ICONS = {"open": "wait", "answered": "support", "closed": "ok", "all": "inbox"}
+ADMIN_LISTS = {
+    "open": "Ждут ответа",
+    "answered": "Отвечены",
+    "closed": "Закрытые",
+    "all": "Все обращения",
+}
 # Admin notices made before tickets carried the user id in the text; a quote-reply to them still works.
 LEGACY_ID_RE = re.compile(r"🆔\s*ID:\s*(\d+)")
 HOURS_TEXT = "Поддержка работает с 09:00 до 23:00 (МСК)."
@@ -75,8 +109,23 @@ def _ago(epoch) -> str:
     return f"{int(seconds // 86400)} дн"
 
 
+def topic_label(topic: Optional[str]) -> str:
+    raw = (topic or "general").strip()
+    if raw in TOPICS:
+        return TOPICS[raw]
+    return html.escape(raw) if raw else "Вопрос"
+
+
+def priority_label(priority: Optional[str]) -> str:
+    return PRIORITIES.get((priority or "normal").strip(), "Обычный")
+
+
+def priority_icon(priority: Optional[str]) -> str:
+    return PRIORITY_ICONS.get((priority or "normal").strip(), "prio_low")
+
+
 def ticket_title(ticket: dict) -> str:
-    return f"#{ticket['id']} · {TOPICS.get(ticket['topic'], 'Вопрос')}"
+    return f"#{ticket['id']} · {topic_label(ticket.get('topic'))}"
 
 
 def _person(ticket: dict) -> str:
@@ -103,8 +152,6 @@ def _message_text(message: Message) -> str:
 def _author(row: dict, ticket: dict, as_admin: bool) -> str:
     if row["author"] == "user":
         return html.escape(ticket.get("full_name") or "Пользователь") if as_admin else "Вы"
-    if as_admin and row.get("author_name"):
-        return f"Поддержка · {html.escape(row['author_name'])}"
     return "Поддержка"
 
 
@@ -140,8 +187,10 @@ def _message_block(row: dict, ticket: dict, as_admin: bool) -> str:
 def render_ticket(ticket: dict, messages: list, page: int, as_admin: bool):
     rows, page, pages = page_slice(messages, page)
     statuses = ADMIN_STATUS if as_admin else USER_STATUS
+    prio = ticket.get("priority") or "normal"
     head = [
         f"{ui.e('support')} <b>Обращение {ticket_title(ticket)}</b>",
+        f"Приоритет: {ui.e(priority_icon(prio))} <b>{priority_label(prio)}</b>",
         f"{statuses[ticket['status']].capitalize()} · создано {_when(ticket['created_epoch'])}"
         + (f" · стр. {page + 1}/{pages}" if pages > 1 else ""),
     ]
@@ -152,41 +201,46 @@ def render_ticket(ticket: dict, messages: list, page: int, as_admin: bool):
     text = "\n".join(head) + "\n\n" + "\n\n".join(_message_block(r, ticket, as_admin) for r in rows)
 
     tid, live = ticket["id"], ticket["status"] != "closed"
+    mode_suffix = ":a" if as_admin else ""
     buttons = []
     if as_admin:
         buttons.append([ui.btn("Ответить", "write", callback_data=f"admin_tkr:{tid}", style="primary")]
                        + ([ui.btn("Закрыть", "ok", callback_data=f"admin_tkc:{tid}")] if live else []))
     elif live:
-        buttons.append([ui.btn("Ответить", "write", callback_data=f"tk_write:{tid}", style="primary"),
+        buttons.append([ui.btn(f"Дописать в #{tid}", "write", callback_data=f"tk_write:{tid}", style="primary"),
                         ui.btn("Вопрос решён", "ok", callback_data=f"tk_close:{tid}", style="success")])
     elif database.ticket_can_reopen(ticket):
-        buttons.append([ui.btn("Открыть снова", "refresh", callback_data=f"tk_reopen:{tid}")])
+        buttons.append([ui.btn("Открыть снова", "refresh", callback_data=f"tk_reopen:{tid}"),
+                        ui.btn("Новое обращение", "add", callback_data="tk_new")])
     else:
-        buttons.append([ui.btn("Новое обращение", "add", callback_data="support_start_ticket")])
+        buttons.append([ui.btn("Новое обращение", "add", callback_data="tk_new", style="primary")])
     nav = []
     if page > 0:
-        nav.append(ui.btn("«", callback_data=f"tk:{tid}:{page - 1}"))
+        nav.append(ui.btn("«", callback_data=f"tk:{tid}:{page - 1}{mode_suffix}"))
     if page < pages - 1:
-        nav.append(ui.btn("»", callback_data=f"tk:{tid}:{page + 1}"))
+        nav.append(ui.btn("»", callback_data=f"tk:{tid}:{page + 1}{mode_suffix}"))
     buttons.append(nav)
     extras = []
     if any(r["author"] != "system" and len(r["text"] or "") > SNIPPET for r in rows):
         extras.append(ui.btn("Показать полностью", "views", callback_data=f"tk_full:{tid}:{page}"))
     if any(r["media_type"] for r in rows):
-        extras.append(ui.btn("Вложения", "box", callback_data=f"tk_files:{tid}:{page}"))
+        extras.append(ui.btn("Вложения", "clip", callback_data=f"tk_files:{tid}:{page}"))
     buttons.append(extras)
     if as_admin:
         buttons.append([ui.btn("Пользователь", "profile", callback_data=f"admin_user:{ticket['user_id']}:0"),
                         ui.btn("Выгрузить .txt", "docs", callback_data=f"admin_tkx:{tid}")])
         buttons.append([ui.btn("Поддержка", "support", callback_data="admin_tks")])
     else:
-        buttons.append([ui.btn("Мои обращения", "note", callback_data="tk_my:0"), ui.home_btn()])
+        buttons.append([ui.btn("Мои обращения", "inbox", callback_data="tk_my:0"),
+                        ui.btn("Поддержка", "support", callback_data="open_support_stub")])
+        buttons.append([ui.home_btn()])
     return text, ui.kb(*buttons)
 
 
 def export_ticket(ticket: dict, messages: list) -> str:
     lines = [
-        f"Обращение #{ticket['id']} · {TOPICS.get(ticket['topic'], 'Вопрос')} · {ADMIN_STATUS[ticket['status']]}",
+        f"Обращение #{ticket['id']} · {topic_label(ticket.get('topic'))} · "
+        f"Приоритет: {priority_label(ticket.get('priority'))} · {ADMIN_STATUS[ticket['status']]}",
         f"Пользователь: {ticket.get('full_name') or ''} @{ticket.get('username') or '-'} id {ticket['user_id']}"
         + (" (аккаунт удалён)" if ticket.get("user_deleted_epoch") else ""),
         f"Создано: {_when(ticket['created_epoch'], True)} МСК",
@@ -226,7 +280,7 @@ def _admin_notice_kb(ticket: dict):
     tid = ticket["id"]
     return ui.kb(
         [ui.btn("Ответить", "write", callback_data=f"admin_tkr:{tid}", style="primary"),
-         ui.btn("История", "note", callback_data=f"tk:{tid}:-1")],
+         ui.btn("История", "note", callback_data=f"tk:{tid}:-1:a")],
         [ui.btn("Закрыть", "ok", callback_data=f"admin_tkc:{tid}"),
          ui.btn("Пользователь", "profile", callback_data=f"admin_user:{ticket['user_id']}:0")],
     )
@@ -234,9 +288,15 @@ def _admin_notice_kb(ticket: dict):
 
 async def send_ticket_to_admin(bot: Bot, admin_id: int, item: dict) -> list:
     """item: the ticket's fields plus text / media_type / file_id / message_epoch / is_new of the new user message."""
+    prio = item.get("priority") or "normal"
+    icon = priority_icon(prio)
     title = (f"Новое обращение {ticket_title(item)}" if item.get("is_new")
              else f"Обращение {ticket_title(item)} · новое сообщение")
-    header = f"{ui.e('support')} <b>{title}</b>\n{_person(item)} · {_when(item['message_epoch'])}\n\n"
+    header = (
+        f"{ui.e(icon)} <b>{title}</b>\n"
+        f"Приоритет: <b>{priority_label(prio)}</b>\n"
+        f"{_person(item)} · {_when(item['message_epoch'])}\n\n"
+    )
     text, kind = item["text"] or "", item["media_type"]
     limit = TICKET_CAPTION_TEXT if kind else TICKET_MESSAGE_TEXT
     body = header + (f"<blockquote>{html.escape(text[:limit])}</blockquote>" if text else "")
@@ -272,7 +332,7 @@ async def retry_undelivered_tickets(bot: Bot) -> int:
 
 async def tell_admins(bot: Bot, ticket: dict, text: str, except_id: Optional[int] = None) -> None:
     """A short note about a ticket to the other admins, so two of them do not answer the same person."""
-    markup = ui.kb([ui.btn("История", "note", callback_data=f"tk:{ticket['id']}:-1")])
+    markup = ui.kb([ui.btn("История", "note", callback_data=f"tk:{ticket['id']}:-1:a")])
     for admin_id in config.ADMIN_IDS:
         if admin_id == except_id:
             continue
@@ -286,7 +346,7 @@ async def tell_admins(bot: Bot, ticket: dict, text: str, except_id: Optional[int
 def _user_answer_kb(ticket: dict):
     tid = ticket["id"]
     return ui.kb(
-        [ui.btn("Ответить", "write", callback_data=f"tk_write:{tid}", style="primary"),
+        [ui.btn(f"Дописать в #{tid}", "write", callback_data=f"tk_write:{tid}", style="primary"),
          ui.btn("Вопрос решён", "ok", callback_data=f"tk_close:{tid}", style="success")],
         [ui.btn("Вся переписка", "note", callback_data=f"tk:{tid}:-1")],
     )
@@ -296,9 +356,14 @@ async def send_reply_to_user(bot: Bot, ticket: dict, message: Message, final: bo
     """Support's message to the user from the bot. Returns (delivered, error, sent messages)."""
     text = _message_text(message)
     kind, file_id = ticket_media(message)
-    title = f"Обращение {ticket_title(ticket)} закрыто поддержкой" if final else f"Ответ по обращению {ticket_title(ticket)}"
+    title = (
+        f"Обращение {ticket_title(ticket)} закрыто поддержкой"
+        if final
+        else f"Пришёл ответ в обращении {ticket_title(ticket)}"
+    )
     limit = TICKET_CAPTION_TEXT if kind else TICKET_MESSAGE_TEXT
-    body = f"{ui.e('support')} <b>{title}</b>\n\n{html.escape(text[:limit])}"
+    quote = f"\n\n<blockquote>{html.escape(text[:limit])}</blockquote>" if text else ""
+    body = f"{ui.e('support')} <b>{title}</b>{quote}"
     markup = _closed_user_kb(ticket) if final else _user_answer_kb(ticket)
     try:
         sent = await _send(bot, ticket["user_id"], body, markup, kind, file_id)
@@ -316,7 +381,7 @@ async def send_reply_to_user(bot: Bot, ticket: dict, message: Message, final: bo
 def _closed_user_kb(ticket: dict):
     return ui.kb(
         [ui.btn("Открыть снова", "refresh", callback_data=f"tk_reopen:{ticket['id']}"),
-         ui.btn("Новое обращение", "add", callback_data="support_start_ticket")],
+         ui.btn("Новое обращение", "add", callback_data="tk_new")],
         [ui.btn("Вся переписка", "note", callback_data=f"tk:{ticket['id']}:-1")],
     )
 
@@ -340,10 +405,10 @@ async def close_stale_tickets(bot: Bot) -> int:
     return len(closed)
 
 
-# ── User: support screen and writing ────────────────────────────────────
+# ── User: support screen and step-by-step ticket creation ───────────────
 
 async def support_screen(user_id: int):
-    live = await database.get_live_ticket(user_id)
+    live_tickets = await database.list_live_tickets(user_id)
     _rows, total = await database.list_user_tickets(user_id, 0, 1)
     text = (
         f"{ui.e('support')} <b>Поддержка</b>\n\n"
@@ -352,26 +417,87 @@ async def support_screen(user_id: int):
         "• Возвраты рассматриваем в течение 24 часов\n"
         f"• {ui.e('mail')} {legal_docs.SUPPORT_EMAIL}\n\n"
     )
-    if live:
-        text += f"<blockquote>У вас открыто обращение {ticket_title(live)} — {USER_STATUS[live['status']]}.</blockquote>"
-        first = [ui.btn(f"Дописать в #{live['id']}", "write", callback_data="support_start_ticket", style="primary"),
-                 ui.btn(f"Открыть #{live['id']}", "note", callback_data=f"tk:{live['id']}:-1")]
+    rows = []
+    if live_tickets:
+        if len(live_tickets) == 1:
+            live = live_tickets[0]
+            text += (
+                f"<blockquote>У вас открыто обращение <b>{ticket_title(live)}</b> "
+                f"({priority_label(live.get('priority'))}) — {USER_STATUS[live['status']]}.</blockquote>"
+            )
+        else:
+            lines = [
+                f"• <b>{ticket_title(t)}</b> ({priority_label(t.get('priority'))}) — {USER_STATUS[t['status']]}"
+                for t in live_tickets[:MAX_LIVE_TICKETS]
+            ]
+            text += "<blockquote><b>Открытые обращения:</b>\n" + "\n".join(lines) + "</blockquote>"
+        for idx, t in enumerate(live_tickets[:3]):
+            rows.append([
+                ui.btn(f"Дописать в #{t['id']}", "write", callback_data=f"tk_write:{t['id']}",
+                       style="primary" if idx == 0 else None),
+                ui.btn(f"Открыть #{t['id']}", "note", callback_data=f"tk:{t['id']}:-1"),
+            ])
+        rows.append([ui.btn("Новое обращение", "add", callback_data="tk_new")])
     else:
-        text += "Нажмите «Новое обращение» и опишите вопрос: оператор ответит в этом чате."
-        first = [ui.btn("Новое обращение", "add", callback_data="support_start_ticket", style="primary")]
-    return text, ui.kb(
-        first,
-        [ui.btn("Мои обращения", "note", callback_data="tk_my:0")] if total else [],
-        [ui.btn("Документы", "docs", callback_data="open_docs_menu"),
-         ui.btn("Тарифы", "tariffs", callback_data="open_subscription_menu")],
-        [ui.home_btn()],
+        text += "Нажмите «Новое обращение» — оператор ответит в этом чате."
+        rows.append([ui.btn("Новое обращение", "add", callback_data="tk_new", style="primary")])
+
+    if total:
+        rows.append([ui.btn("Мои обращения", "inbox", callback_data="tk_my:0")])
+    rows.append([ui.home_btn()])
+    return text, ui.kb(*rows)
+
+
+def _topic_step_screen():
+    text = (
+        f"{ui.e('tag')} <b>Новое обращение · Шаг 1 из 3</b>\n\n"
+        "Выберите тему обращения:"
     )
+    markup = ui.kb(
+        [ui.btn("Оплата и возврат", "tariffs", callback_data="tk_topic:payment")],
+        [ui.btn("Проблема с радаром / ссылкой", "radar", callback_data="tk_topic:radar")],
+        [ui.btn("Техническая ошибка / баг", "bug", callback_data="tk_topic:bug")],
+        [ui.btn("Общий вопрос / предложение", "question", callback_data="tk_topic:general")],
+        [ui.btn("Своя тема", "write", callback_data="tk_topic:custom")],
+        [ui.btn("« Назад", callback_data="open_support_stub")],
+    )
+    return text, markup
+
+
+def _priority_step_screen(topic: str):
+    text = (
+        f"{ui.e('flag')} <b>Новое обращение · Шаг 2 из 3</b>\n"
+        f"Тема: <b>{topic_label(topic)}</b>\n\n"
+        "Выберите приоритет:"
+    )
+    markup = ui.kb(
+        [ui.btn("Обычный", "prio_low", callback_data="tk_prio:normal")],
+        [ui.btn("Важный", "prio_mid", callback_data="tk_prio:high")],
+        [ui.btn("Срочный", "prio_high", callback_data="tk_prio:urgent", style="primary")],
+        [ui.btn("« Назад", callback_data="tk_new"),
+         ui.btn("Отмена", "cancel", callback_data="support_cancel")],
+    )
+    return text, markup
+
+
+def _write_new_screen(topic: str, priority: str):
+    text = (
+        f"{ui.e('write')} <b>Новое обращение · Шаг 3 из 3</b>\n"
+        f"• Тема: <b>{topic_label(topic)}</b>\n"
+        f"• Приоритет: <b>{priority_label(priority)}</b>\n\n"
+        "Напишите ваш вопрос или опишите проблему. Можно приложить скриншот, фото, файл или голосовое."
+    )
+    markup = ui.kb(
+        [ui.btn("« Назад", callback_data="tk_back_prio"),
+         ui.btn("Отмена", "cancel", callback_data="support_cancel")],
+    )
+    return text, markup
 
 
 def write_prompt(ticket: Optional[dict]) -> str:
     if ticket and ticket["status"] != "closed":
         return (f"{ui.e('write')} <b>Сообщение в обращение {ticket_title(ticket)}</b>\n\n"
-                "Напишите одним сообщением, можно приложить скриншот, фото или голосовое. "
+                "Напишите одним сообщением, можно приложить скриншот, фото, файл или голосовое. "
                 "Оно добавится к переписке.")
     if ticket and database.ticket_can_reopen(ticket):
         return (f"{ui.e('write')} <b>Сообщение в обращение {ticket_title(ticket)}</b>\n\n"
@@ -382,6 +508,79 @@ def write_prompt(ticket: Optional[dict]) -> str:
         "Оператор ответит прямо в этом чате.\n\n"
         f"{ui.e('mail')} Или на почту: {legal_docs.SUPPORT_EMAIL}"
     )
+
+
+@router.callback_query(F.data == "tk_new")
+async def cb_ticket_new(call: CallbackQuery, state: FSMContext):
+    live_tickets = await database.list_live_tickets(call.from_user.id)
+    if len(live_tickets) >= MAX_LIVE_TICKETS:
+        await call.answer(
+            f"У вас уже открыто {len(live_tickets)} обращений. Допишите в существующее или закройте решённые.",
+            show_alert=True,
+        )
+        return
+    await state.clear()
+    text, markup = _topic_step_screen()
+    await ui.show(call, text, markup)
+
+
+@router.callback_query(F.data.startswith("tk_topic:"))
+async def cb_ticket_topic(call: CallbackQuery, state: FSMContext):
+    code = call.data.split(":", 1)[1]
+    if code == "custom":
+        await state.set_state(SupportStates.waiting_for_custom_topic)
+        await ui.show(
+            call,
+            f"{ui.e('tag')} <b>Новое обращение · Своя тема</b>\n\n"
+            f"Напишите коротко тему обращения (до {CUSTOM_TOPIC_MAX_LEN} символов):",
+            ui.kb([ui.btn("« Назад", callback_data="tk_new"),
+                   ui.btn("Отмена", "cancel", callback_data="support_cancel")]),
+        )
+        return
+    topic = code if code in TOPICS else "general"
+    await state.clear()
+    await state.update_data(new_topic=topic, force_new=True)
+    text, markup = _priority_step_screen(topic)
+    await ui.show(call, text, markup)
+
+
+@router.message(SupportStates.waiting_for_custom_topic)
+async def handle_custom_topic(message: Message, state: FSMContext):
+    from handlers.searches import route_menu_text
+    if await route_menu_text(message, state):
+        return
+    raw = _message_text(message)
+    if not raw:
+        await message.answer("Напишите тему обращения текстом.")
+        return
+    topic = raw[:CUSTOM_TOPIC_MAX_LEN].strip()
+    await state.set_state(None)
+    await state.update_data(new_topic=topic, force_new=True)
+    text, markup = _priority_step_screen(topic)
+    await message.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "tk_back_prio")
+async def cb_ticket_back_prio(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    topic = data.get("new_topic") or "general"
+    await state.set_state(None)
+    await state.update_data(new_topic=topic, force_new=True)
+    text, markup = _priority_step_screen(topic)
+    await ui.show(call, text, markup)
+
+
+@router.callback_query(F.data.startswith("tk_prio:"))
+async def cb_ticket_prio(call: CallbackQuery, state: FSMContext):
+    prio = call.data.split(":", 1)[1]
+    if prio not in PRIORITIES:
+        prio = "normal"
+    data = await state.get_data()
+    topic = data.get("new_topic") or "general"
+    await state.set_state(SupportStates.waiting_for_user_message)
+    await state.update_data(new_topic=topic, new_priority=prio, force_new=True)
+    text, markup = _write_new_screen(topic, prio)
+    await ui.show(call, text, markup)
 
 
 @router.callback_query(F.data == "support_start_ticket")
@@ -400,33 +599,52 @@ async def cb_ticket_write(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(SupportStates.waiting_for_user_message)
     await state.update_data(ticket_id=ticket["id"])
-    await ui.show(call, write_prompt(ticket), ui.kb([ui.btn("Отмена", "cancel", callback_data="support_cancel")]))
+    await ui.show(
+        call,
+        write_prompt(ticket),
+        ui.kb([ui.btn("« К обращению", callback_data=f"tk:{ticket['id']}:-1"),
+               ui.btn("Отмена", "cancel", callback_data="support_cancel")]),
+    )
 
 
 @router.callback_query(F.data == "support_cancel")
 async def cb_support_cancel(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await ui.show(call, f"{ui.e('cancel')} <b>Сообщение не отправлено</b>", ui.kb([ui.home_btn()]))
+    text, markup = await support_screen(call.from_user.id)
+    await ui.show(call, text, markup)
 
 
-async def accept_user_message(message: Message, bot: Bot, ticket_id: Optional[int] = None, is_payment: bool = False):
+async def accept_user_message(
+    message: Message,
+    bot: Bot,
+    ticket_id: Optional[int] = None,
+    is_payment: bool = False,
+    topic: Optional[str] = None,
+    priority: Optional[str] = None,
+    force_new: bool = False,
+):
     user = message.from_user
     text = _message_text(message) or ("" if ticket_media(message)[0] else "(пустое сообщение)")
     media_type, file_id = ticket_media(message)
     ticket, message_id, is_new = await database.add_user_ticket_message(
-        user.id, user.full_name, user.username or "", text, media_type, file_id, is_payment, ticket_id,
+        user.id, user.full_name, user.username or "", text, media_type, file_id,
+        is_payment=is_payment, ticket_id=ticket_id, topic=topic, priority=priority, force_new=force_new,
     )
     item = {**ticket, "message_id": message_id, "text": text, "media_type": media_type, "file_id": file_id,
             "message_epoch": ticket["last_user_epoch"], "is_new": is_new}
     if not await deliver_ticket(bot, item):
         logger.warning("Сообщение в обращение #%s пока не доставлено, повторю позже", ticket["id"])
     log_user_event(user_id=user.id, username=user.username, first_name=user.first_name,
-                   action=f"Поддержка #{ticket['id']}: «{text[:80]}»", status="SUPPORT")
+                   action=f"Поддержка #{ticket['id']} ({ticket.get('priority', 'normal')}): «{text[:80]}»", status="SUPPORT")
     title = f"Обращение {ticket_title(ticket)} создано" if is_new else f"Сообщение добавлено в обращение {ticket_title(ticket)}"
+    meta = f"Тема: <b>{topic_label(ticket.get('topic'))}</b> · Приоритет: <b>{priority_label(ticket.get('priority'))}</b>\n\n"
     await message.answer(
-        f"{ui.e('ok')} <b>{title}</b>\n\nОтвет придёт в этот чат. {HOURS_TEXT}",
-        reply_markup=ui.kb([ui.btn(f"Открыть #{ticket['id']}", "note", callback_data=f"tk:{ticket['id']}:-1"),
-                            ui.home_btn()]),
+        f"{ui.e('ok')} <b>{title}</b>\n{meta}Ответ придёт в этот чат. {HOURS_TEXT}",
+        reply_markup=ui.kb(
+            [ui.btn(f"Дописать в #{ticket['id']}", "write", callback_data=f"tk_write:{ticket['id']}", style="primary"),
+             ui.btn(f"Открыть #{ticket['id']}", "note", callback_data=f"tk:{ticket['id']}:-1")],
+            [ui.home_btn()],
+        ),
         parse_mode="HTML",
     )
     return ticket
@@ -440,7 +658,15 @@ async def handle_user_support_message(message: Message, state: FSMContext, bot: 
         return
     data = await state.get_data()
     await state.clear()
-    await accept_user_message(message, bot, data.get("ticket_id"), bool(data.get("payment_support")))
+    await accept_user_message(
+        message,
+        bot,
+        ticket_id=data.get("ticket_id"),
+        is_payment=bool(data.get("payment_support")),
+        topic=data.get("new_topic"),
+        priority=data.get("new_priority"),
+        force_new=bool(data.get("force_new")),
+    )
 
 
 async def _user_ref(message: Message):
@@ -470,7 +696,11 @@ async def _ticket_for(call: CallbackQuery, ticket_id: int, owner_only: bool = Fa
 
 
 def _as_admin(call: CallbackQuery, ticket: dict) -> bool:
-    return config.is_admin(call.from_user.id) and ticket["user_id"] != call.from_user.id
+    if not config.is_admin(call.from_user.id):
+        return False
+    if (call.data or "").endswith(":a"):
+        return True
+    return ticket["user_id"] != call.from_user.id
 
 
 async def show_ticket(event, ticket: dict, page: int = -1, as_admin: bool = False) -> None:
@@ -481,22 +711,31 @@ async def show_ticket(event, ticket: dict, page: int = -1, as_admin: bool = Fals
 
 @router.callback_query(F.data.startswith("tk:"))
 async def cb_ticket(call: CallbackQuery, state: FSMContext):
-    _, tid, page = call.data.split(":")
-    ticket = await _ticket_for(call, int(tid))
+    parts = call.data.split(":")
+    tid, page = int(parts[1]), int(parts[2])
+    ticket = await _ticket_for(call, tid)
     if ticket:
         await state.clear()
-        await show_ticket(call, ticket, int(page), _as_admin(call, ticket))
+        await show_ticket(call, ticket, page, _as_admin(call, ticket))
 
 
 def ticket_row_label(ticket: dict, as_admin: bool) -> str:
+    topic = topic_label(ticket.get("topic"))
     if as_admin:
-        name = (ticket.get("full_name") or str(ticket["user_id"]))[:18]
-        return f"#{ticket['id']} · {name} · {TOPICS.get(ticket['topic'], 'Вопрос')} · {_ago(ticket['updated_epoch'])}"
-    return f"#{ticket['id']} · {TOPICS.get(ticket['topic'], 'Вопрос')} · {USER_STATUS[ticket['status']]} · {_when(ticket['created_epoch'])[:5]}"
+        name = (ticket.get("full_name") or str(ticket["user_id"]))[:16]
+        return f"#{ticket['id']} · {name} · {topic} · {_ago(ticket['updated_epoch'])}"
+    return f"#{ticket['id']} · {topic} · {USER_STATUS[ticket['status']]} · {_when(ticket['created_epoch'])[:5]}"
+
+
+def _row_icon(ticket: dict, as_admin: bool) -> str:
+    if as_admin and ticket.get("status") == "open":
+        return priority_icon(ticket.get("priority"))
+    return STATUS_ICONS[ticket["status"]]
 
 
 def _list_kb(rows: list, page: int, pages: int, nav_prefix: str, as_admin: bool, back):
-    buttons = [[ui.btn(ticket_row_label(t, as_admin), STATUS_ICONS[t["status"]], callback_data=f"tk:{t['id']}:-1")]
+    suffix = ":a" if as_admin else ""
+    buttons = [[ui.btn(ticket_row_label(t, as_admin), _row_icon(t, as_admin), callback_data=f"tk:{t['id']}:-1{suffix}")]
                for t in rows]
     nav = []
     if page > 0:
@@ -512,7 +751,7 @@ async def cb_my_tickets(call: CallbackQuery, state: FSMContext):
     page = max(0, int(call.data.split(":")[1]))
     rows, total = await database.list_user_tickets(call.from_user.id, page * USER_LIST_PAGE, USER_LIST_PAGE)
     pages = max(1, -(-total // USER_LIST_PAGE))
-    text = (f"{ui.e('note')} <b>Мои обращения</b>" + (f" · стр. {page + 1}/{pages}" if pages > 1 else "") + "\n\n"
+    text = (f"{ui.e('inbox')} <b>Мои обращения</b>" + (f" · стр. {page + 1}/{pages}" if pages > 1 else "") + "\n\n"
             + ("Выберите обращение, чтобы увидеть всю переписку." if total else "Обращений пока нет."))
     await ui.show(call, text, _list_kb(rows, page, pages, "tk_my", False,
                                        [ui.btn("Поддержка", "support", callback_data="open_support_stub"), ui.home_btn()]))
@@ -560,7 +799,7 @@ async def cb_ticket_reopen(call: CallbackQuery, bot: Bot):
 
 
 async def _page_rows(call: CallbackQuery):
-    _, tid, page = call.data.split(":")
+    _, tid, page = call.data.split(":")[:3]
     ticket = await _ticket_for(call, int(tid))
     if ticket is None:
         return None, []
@@ -606,11 +845,13 @@ async def cb_ticket_files(call: CallbackQuery, bot: Bot):
 
 async def admin_panel_text() -> tuple[str, dict]:
     counts = await database.count_tickets()
+    urgent_note = f" (Срочных: <b>{counts['urgent']}</b>)" if counts.get("urgent") else ""
     text = (
         f"{ui.e('support')} <b>Поддержка</b>\n\n"
-        f"Ждут ответа: <b>{counts['open']}</b>\n"
+        f"Ждут ответа: <b>{counts['open']}</b>{urgent_note}\n"
         f"Отвечены, ждём пользователя: <b>{counts['answered']}</b>\n"
-        f"Закрытые: <b>{counts['closed']}</b>\n\n"
+        f"Закрытые: <b>{counts['closed']}</b>\n"
+        f"Всего обращений: <b>{counts['all']}</b>\n\n"
         f"<blockquote>Отвеченное обращение закрывается само через {config.SUPPORT_AUTOCLOSE_HOURS} ч молчания "
         "пользователя. История не удаляется, даже если удалить пользователя.</blockquote>"
     )
@@ -628,6 +869,7 @@ async def cb_admin_support(call: CallbackQuery, state: FSMContext):
                 style="primary" if counts["open"] else None)],
         [ui.btn(f"Отвечены ({counts['answered']})", "support", callback_data="admin_tkl:answered:0"),
          ui.btn(f"Закрытые ({counts['closed']})", "ok", callback_data="admin_tkl:closed:0")],
+        [ui.btn(f"Все обращения ({counts['all']})", "inbox", callback_data="admin_tkl:all:0")],
         [ui.btn("Админка", "admin", callback_data="admin_refresh")],
     ))
 
@@ -635,6 +877,7 @@ async def cb_admin_support(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("admin_tkl:"))
 async def cb_admin_ticket_list(call: CallbackQuery):
     if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
         return
     _, status, page_raw = call.data.split(":")
     if status not in ADMIN_LISTS:
@@ -642,7 +885,12 @@ async def cb_admin_ticket_list(call: CallbackQuery):
     page = max(0, int(page_raw))
     rows, total = await database.list_tickets(status, page * ADMIN_LIST_PAGE, ADMIN_LIST_PAGE)
     pages = max(1, -(-total // ADMIN_LIST_PAGE))
-    hint = "Сверху те, кто ждёт дольше всех." if status == "open" else "Сверху последние изменения."
+    if status == "open":
+        hint = "Сверху срочные и те, кто ждёт дольше всех."
+    elif status == "all":
+        hint = "Все обращения в хронологическом порядке."
+    else:
+        hint = "Сверху последние изменения."
     text = (f"{ui.e(STATUS_ICONS[status])} <b>{ADMIN_LISTS[status]}</b> · {total}"
             + (f" · стр. {page + 1}/{pages}" if pages > 1 else "") + f"\n\n{hint if total else 'Пусто.'}")
     await ui.show(call, text, _list_kb(rows, page, pages, f"admin_tkl:{status}", True,
@@ -727,8 +975,11 @@ async def cb_admin_reply_start(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "admin_reply_cancel")
 async def cb_admin_reply_cancel(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
     await state.clear()
-    await ui.show(call, f"{ui.e('cancel')} <b>Ответ не отправлен</b>")
+    tid = data.get("ticket_id")
+    markup = ui.kb([ui.btn("К обращению", "note", callback_data=f"tk:{tid}:-1:a")]) if tid else ui.kb([ui.btn("Поддержка", "support", callback_data="admin_tks")])
+    await ui.show(call, f"{ui.e('cancel')} <b>Ответ не отправлен</b>", markup)
 
 
 async def answer_ticket(bot: Bot, admin_message: Message, ticket: dict, final: bool = False) -> tuple[bool, dict]:
@@ -750,7 +1001,7 @@ async def answer_ticket(bot: Bot, admin_message: Message, ticket: dict, final: b
         confirm = (f"{ui.e('warn')} <b>Не доставлено:</b> {html.escape(error)}\n"
                    f"Сообщение сохранено в истории {ticket_title(updated)}.")
     reply = await admin_message.answer(confirm, parse_mode="HTML", reply_markup=ui.kb(
-        [ui.btn("История", "note", callback_data=f"tk:{updated['id']}:-1")]))
+        [ui.btn("История", "note", callback_data=f"tk:{updated['id']}:-1:a")]))
     await database.save_ticket_refs(updated["id"], _refs([reply]))
     return delivered, updated
 
