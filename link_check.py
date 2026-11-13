@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 HOME = "home"          # avito.ru/ without a section: a recommendations feed, no search results
 SERVICE = "service"    # profile, favourites, messenger…: a page of the account, not a search
+NO_SEARCH = "no_search"  # /all, /moskva with no section and no query: every listing of a region in a row
 
 # First path segment of Avito's own pages. No city or category on Avito has these slugs.
 SERVICE_SECTIONS = frozenset({
@@ -30,11 +31,14 @@ PROBLEM_TEXT = {
     SERVICE: ("Это служебная страница Авито, а не поиск",
               "Профиль, избранное, сообщения и подобные страницы не содержат выдачи. Откройте на avito.ru "
               "нужный раздел или найдите товар через поиск, затем скопируйте адрес из браузера."),
+    NO_SEARCH: ("В ссылке нет ни раздела, ни запроса",
+                "По ней идут все объявления региона подряд, радар успеет показать лишь малую часть. Выберите на "
+                "avito.ru раздел или введите запрос в поиске, затем скопируйте адрес из браузера."),
 }
 
 
 def link_problem(url: str) -> Optional[str]:
-    """HOME / SERVICE when the address can never be a search, else None."""
+    """HOME / SERVICE when the address can never be a search, NO_SEARCH for a bare region, else None."""
     raw = (url or "").strip()
     if not raw.lower().startswith(("http://", "https://")):
         raw = "https://" + raw
@@ -47,6 +51,11 @@ def link_problem(url: str) -> Optional[str]:
         return HOME
     if parts[0].lower() in SERVICE_SECTIONS:
         return SERVICE
+    if len(parts) == 1:
+        # Only a region (/all, /moskva): a search needs a section in the path, a text or a category in the query.
+        query = parse_qs(parsed.query)
+        if not query.get("q") and not any("categor" in key.lower() for key in query):
+            return NO_SEARCH
     return None
 
 
@@ -59,8 +68,9 @@ def is_home_with_query(url: str) -> bool:
 
 
 def keeps_running(url: str) -> bool:
-    """Running radars are paused only when the link surely brings nothing."""
-    return link_problem(url) is None or is_home_with_query(url)
+    """Running radars are paused only when the link surely brings nothing. A bare region does bring lots, so it is
+    refused only for new radars and link changes."""
+    return link_problem(url) in (None, NO_SEARCH) or is_home_with_query(url)
 
 
 def problem_message(problem: str) -> str:
@@ -70,7 +80,7 @@ def problem_message(problem: str) -> str:
 
 def card_warning(url: str) -> str:
     problem = link_problem(url)
-    if problem is None or is_home_with_query(url):
+    if problem in (None, NO_SEARCH) or is_home_with_query(url):
         return ""
     return f"{ui.e('warn')} <b>{PROBLEM_TEXT[problem][0]}.</b> Радар ничего не пришлёт: смените ссылку.\n\n"
 

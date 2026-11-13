@@ -32,6 +32,14 @@ class TestLinkProblem(unittest.TestCase):
         ):
             self.assertIsNone(link_check.link_problem(url), url)
 
+    def test_bare_region_is_refused_for_new_radars_only(self):
+        for url in ("https://www.avito.ru/all?radius=0&s=104", "https://www.avito.ru/moskva", "avito.ru/rossiya?s=104&q="):
+            self.assertEqual(link_check.link_problem(url), link_check.NO_SEARCH, url)
+            self.assertTrue(link_check.keeps_running(url), url)   # a running radar is not paused
+            self.assertEqual(link_check.card_warning(url), "", url)
+        self.assertIsNone(link_check.link_problem("https://www.avito.ru/all?categoryId=9&s=104"))
+        self.assertIn("ни раздела, ни запроса", searches.search_url_error("https://www.avito.ru/all?radius=0&s=104") or "")
+
     def test_running_home_page_with_a_query_is_left_alone(self):
         self.assertTrue(link_check.keeps_running("https://www.avito.ru/?q=iphone&s=104"))
         self.assertFalse(link_check.keeps_running("https://www.avito.ru/?bt=1&s=104"))
