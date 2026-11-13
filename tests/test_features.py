@@ -229,6 +229,79 @@ class TestRadarEditing(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await reports.send_due_reminders(bot, now=until + 60)
         self.assertIn("2 новых лота", bot.send_message.await_args.args[1])
 
+    async def _sent_lots(self, user_id: int, lots: list[tuple[str, int, str, int]], sent_at: float) -> None:
+        """lots: (item_id, search_id, radar_title, cheap)."""
+        async with database.writer_connection() as db:
+            for item_id, search_id, radar_title, cheap in lots:
+                await db.execute(
+                    "INSERT INTO notification_dedupe (user_id, item_id, status, first_queued_at, sent_at, updated_at, cheap) "
+                    "VALUES (?, ?, 'sent', ?, ?, ?, ?)",
+                    (user_id, item_id, sent_at, sent_at, sent_at, cheap),
+                )
+                await db.execute(
+                    "INSERT INTO notification_dedupe_radars (user_id, item_id, search_id, radar_title, matched_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (user_id, item_id, search_id, radar_title, sent_at),
+                )
+            await db.commit()
+
+    async def test_weekly_digest_goes_to_paid_users_with_lots(self):
+        now = time.time()
+        paid, trial, switched_off, silent_week = 777010, 777011, 777012, 777013
+        for user_id in (paid, trial, switched_off, silent_week):
+            await database.get_or_create_user(user_id)
+        for user_id in (paid, switched_off, silent_week):
+            await database.grant_subscription(user_id, days=30, tariff_plan="pro")
+        await database.activate_trial(trial)
+        self.assertFalse(await database.toggle_weekly_digest(switched_off))
+
+        await self._sent_lots(paid, [("a1", 51, "iPhone 13", 1), ("a2", 51, "iPhone 13", 0),
+                                     ("a3", 52, "PS5 <b>", 0)], now - 3600)
+        await self._sent_lots(paid, [("old", 52, "PS5 <b>", 1)], now - 8 * 86400)  # outside the week
+        await self._sent_lots(trial, [("t1", 61, "Trial", 0)], now - 3600)
+        await self._sent_lots(switched_off, [("s1", 71, "Off", 0)], now - 3600)
+
+        bot = AsyncMock()
+        with patch.object(reports, "WEEKLY_DIGEST_PAUSE", 0):
+            self.assertEqual(await reports.send_weekly_digests(bot, now=now), 1)
+        call = bot.send_message.await_args
+        self.assertEqual(call.args[0], paid)
+        text = call.args[1]
+        self.assertIn("Новых лотов: <b>3</b>", text)
+        self.assertIn("Ниже рынка: <b>1</b>", text)
+        self.assertIn("Самый живой радар: «iPhone 13», 2 лота", text)
+
+        # One radar: no "busiest" line; no cheap lots: no "below the market" line; titles are escaped.
+        text = reports.weekly_digest_text({"lots": 4, "cheap": 0, "radars": 1, "top_title": "PS5 <b>", "top_lots": 4})
+        self.assertNotIn("Самый живой", text)
+        self.assertNotIn("Ниже рынка", text)
+        self.assertIn("PS5 &lt;b&gt;", reports.weekly_digest_text(
+            {"lots": 4, "cheap": 0, "radars": 2, "top_title": "PS5 <b>", "top_lots": 3}))
+
+    async def test_weekly_digest_runs_once_on_its_day_and_marks_cheap_lots(self):
+        def msk(day: int, hour: int) -> float:  # 2026-11-16 is a Monday
+            return datetime(2026, 11, day, hour, 30, tzinfo=timezone.utc).timestamp() - 3 * 3600
+
+        self.assertIsNone(reports.weekly_digest_due(msk(15, 12), ""))            # Sunday
+        self.assertIsNone(reports.weekly_digest_due(msk(16, 9), ""))             # Monday, too early
+        self.assertEqual(reports.weekly_digest_due(msk(16, 10), ""), "2026-11-16")
+        self.assertIsNone(reports.weekly_digest_due(msk(16, 15), "2026-11-16"))  # already sent today
+        self.assertEqual(reports.weekly_digest_due(msk(23, 11), "2026-11-16"), "2026-11-23")
+
+        self.assertEqual(database._below_market('{"item": {"market_percent": 35, "market_median": 40000}}'), 1)
+        self.assertEqual(database._below_market('{"item": {"market_percent": null}}'), 0)
+        self.assertEqual(database._below_market("{}"), 0)
+
+    async def test_profile_switch_turns_weekly_digest_off_and_on(self):
+        user_id = 777014
+        await database.get_or_create_user(user_id)
+        await database.grant_subscription(user_id, days=30, tariff_plan="pro")
+        await self.dispatch_callback("weekly_toggle", user_id=user_id)
+        self.assertEqual((await database.get_user(user_id))["weekly_digest"], 0)
+        self.assertNotIn(user_id, {int(u["user_id"]) for u in await database.get_weekly_digest_users()})
+        await self.dispatch_callback("weekly_toggle", user_id=user_id)
+        self.assertIn(user_id, {int(u["user_id"]) for u in await database.get_weekly_digest_users()})
+
     async def test_daily_report_renders(self):
         text = await reports.build_daily_report(reset=False)
         self.assertIn("Отчёт за сутки", text)

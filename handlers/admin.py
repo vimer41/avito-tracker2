@@ -2615,6 +2615,20 @@ async def cmd_admin_race(message: Message):
     logger.info("Admin %s started /race for %s min via %s", message.from_user.id, minutes, label)
 
 
+@router.message(Command("weekly"))
+async def cmd_weekly_preview(message: Message):
+    """/weekly — the weekly digest as paid users get it, built from the admin's own lots of the last 7 days."""
+    if not config.is_admin(message.from_user.id):
+        return
+    import reports
+    now = time.time()
+    stats = (await database.get_weekly_stats(now - reports.WEEK, now)).get(message.from_user.id)
+    if not stats or not stats["lots"]:
+        await message.answer("За 7 дней вам не пришло ни одного лота. Пользователю в таком случае сводка не уходит.")
+        return
+    await message.answer(reports.weekly_digest_text(stats), parse_mode="HTML")
+
+
 @router.message(Command("ready"))
 async def cmd_admin_ready(message: Message):
     if not config.is_admin(message.from_user.id):

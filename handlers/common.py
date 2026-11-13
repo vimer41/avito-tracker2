@@ -288,11 +288,16 @@ async def cmd_help(event):
 
 @router.message(F.text.in_(ui.menu_texts("profile")))
 @router.callback_query(F.data == "refresh_profile")
+@router.callback_query(F.data == "weekly_toggle")
 @router.message(Command("profile"))
 async def cmd_profile(event):
     user_id = event.from_user.id
     if isinstance(event, CallbackQuery):
-        await event.answer("Обновлено")
+        if event.data == "weekly_toggle":
+            enabled = await database.toggle_weekly_digest(user_id)
+            await event.answer("Сводка за неделю включена" if enabled else "Сводка за неделю выключена")
+        else:
+            await event.answer("Обновлено")
 
     user = await database.get_or_create_user(user_id)
     searches = await database.get_user_searches(user_id)
@@ -340,6 +345,9 @@ async def cmd_profile(event):
     rows.append([ui.btn(f"Ночной режим: {night}", "moon", callback_data="night_mode")])
     group = "вкл" if await database.get_mirror_chat(user_id) else "выкл"
     rows.append([ui.btn(f"Лоты в группу или канал: {group}", "users", callback_data="group_delivery")])
+    if user.get("is_allowed") and not is_adm:  # the weekly digest goes to paid users only
+        digest = "вкл" if int(user.get("weekly_digest", 1) or 0) else "выкл"
+        rows.append([ui.btn(f"Сводка за неделю: {digest}", "stats", callback_data="weekly_toggle")])
     if await referrals.get_owner_link(user_id):
         rows.append([ui.btn("Партнёрская программа", "link", callback_data="ref_me")])
     rows.append([ui.btn("Обновить", "refresh", callback_data="refresh_profile"), ui.home_btn()])

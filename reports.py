@@ -148,6 +148,77 @@ async def reminder_worker(bot: Bot) -> None:
         await asyncio.sleep(config.REMINDER_CHECK_INTERVAL)
 
 
+# ── Weekly digest for paid users ────────────────────────────────────────
+
+WEEK = 7 * DAY
+WEEKLY_DIGEST_KEY = "weekly_digest_sent"  # bot_settings: MSK date of the last run
+WEEKLY_DIGEST_POLL_SECONDS = 600
+WEEKLY_DIGEST_PAUSE = 0.05  # between users, far below Telegram's limit
+
+
+def weekly_digest_text(stats: dict) -> str:
+    lines = [f"{ui.e('stats')} <b>Итоги недели</b>", "", f"Новых лотов: <b>{int(stats['lots'])}</b>"]
+    if stats.get("cheap"):
+        lines.append(f"Ниже рынка: <b>{int(stats['cheap'])}</b>")
+    # With one radar "the busiest" says nothing new.
+    if stats.get("top_title") and int(stats.get("radars") or 0) > 1:
+        lots = config.plural(int(stats["top_lots"]), "лот", "лота", "лотов")
+        lines.append(f"Самый живой радар: «{html.escape(str(stats['top_title']))}», {lots}")
+    lines += ["", "<blockquote>Сводка приходит раз в неделю. Отключить её можно в профиле.</blockquote>"]
+    return "\n".join(lines)
+
+
+def weekly_digest_due(now: float, last_sent: Optional[str]) -> Optional[str]:
+    """The MSK date to stamp when the digest should go out now, else None: once on its weekday, from its hour."""
+    msk = datetime.fromtimestamp(now + 3 * 3600, tz=timezone.utc)
+    if msk.weekday() != config.WEEKLY_DIGEST_WEEKDAY or msk.hour < config.WEEKLY_DIGEST_HOUR:
+        return None
+    stamp = msk.strftime("%Y-%m-%d")
+    return None if stamp == (last_sent or "") else stamp
+
+
+async def send_weekly_digests(bot: Bot, now: Optional[float] = None) -> int:
+    """One message to every paid user who got lots in the last 7 days. Trials, expired users, admins and
+    users with the switch off get nothing; a week without lots brings no message."""
+    now = time.time() if now is None else now
+    stats = await database.get_weekly_stats(now - WEEK, now)
+    sent = 0
+    for user in await database.get_weekly_digest_users():
+        user_id = int(user["user_id"])
+        row = stats.get(user_id)
+        if config.is_admin(user_id) or not row or not row["lots"]:
+            continue
+        night_mode, night_from, night_to = await database.get_night_settings(user_id)
+        quiet = night_mode != database.NIGHT_OFF and config.is_quiet_hour_msk(night_from, night_to, now)
+        try:
+            await bot.send_message(
+                user_id, weekly_digest_text(row), parse_mode="HTML", disable_notification=quiet,
+                reply_markup=ui.kb([ui.btn("Радары", "radars", callback_data="list_searches")]),
+            )
+            sent += 1
+        except TelegramForbiddenError:
+            pass
+        except Exception as exc:
+            logger.warning("Сводка за неделю не отправлена %s: %s", user_id, exc)
+        await asyncio.sleep(WEEKLY_DIGEST_PAUSE)
+    return sent
+
+
+async def weekly_digest_worker(bot: Bot) -> None:
+    while True:
+        try:
+            stamp = weekly_digest_due(time.time(), await database.get_bot_setting(WEEKLY_DIGEST_KEY, ""))
+            if stamp:
+                # Stamped before sending: a crash in the middle must not give anyone the digest twice.
+                await database.set_bot_setting(WEEKLY_DIGEST_KEY, stamp)
+                logger.info("Отправлено сводок за неделю: %s", await send_weekly_digests(bot))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Сбой рассылки сводки за неделю")
+        await asyncio.sleep(WEEKLY_DIGEST_POLL_SECONDS)
+
+
 def _fmt_seconds(value) -> str:
     if value is None:
         return "нет данных"
@@ -401,4 +472,5 @@ def start_report_services(bot: Bot) -> list[asyncio.Task]:
         asyncio.create_task(reminder_worker(bot), name="subscription-reminders"),
         asyncio.create_task(daily_report_worker(bot), name="daily-report"),
         asyncio.create_task(stats_at_worker(bot), name="stats-at"),
+        asyncio.create_task(weekly_digest_worker(bot), name="weekly-digest"),
     ]

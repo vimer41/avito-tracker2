@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 import tempfile
@@ -625,6 +626,8 @@ async def init_db():
             "referred_by": "INTEGER",
             "ref_link_id": "INTEGER",
             "referred_at": "TIMESTAMP",
+            # Weekly digest for paid users (reports.send_weekly_digests); the profile has the switch.
+            "weekly_digest": "INTEGER NOT NULL DEFAULT 1",
         })
         await db.execute("""
             CREATE TABLE IF NOT EXISTS admin_actions (
@@ -1020,6 +1023,9 @@ async def init_db():
                 PRIMARY KEY (user_id, item_id)
             );
         """)
+        # 1 = the lot was clearly cheaper than its page (market_percent): the event with the lot's data lives
+        # a day, this row lives 7, and the weekly digest counts such lots.
+        await ensure_columns(db, "notification_dedupe", {"cheap": "INTEGER NOT NULL DEFAULT 0"})
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS notification_dedupe_radars (
@@ -2934,14 +2940,15 @@ async def enqueue_group_events(
             await db.execute(
                 """
                 INSERT INTO notification_dedupe (
-                    user_id, item_id, event_id, status, first_queued_at, sent_at, updated_at
-                ) VALUES (?, ?, ?, 'queued', ?, NULL, ?)
+                    user_id, item_id, event_id, status, first_queued_at, sent_at, updated_at, cheap
+                ) VALUES (?, ?, ?, 'queued', ?, NULL, ?, ?)
                 ON CONFLICT(user_id, item_id) DO UPDATE SET
                     event_id = excluded.event_id,
                     status = 'queued',
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    cheap = excluded.cheap
                 """,
-                (uid, iid, event_id, queued_at, now),
+                (uid, iid, event_id, queued_at, now, _below_market(item_json)),
             )
 
             for sid, rtitle in unseen_radars:
@@ -3749,6 +3756,69 @@ async def count_sent_lots(user_id: int, since_epoch: float, until_epoch: float) 
         ) as cur:
             row = await cur.fetchone()
     return int(row[0]) if row else 0
+
+
+_MARKET_PERCENT_RE = re.compile(r'"market_percent":\s*(\d+)')
+
+
+def _below_market(item_json: str) -> int:
+    """1 when the queued lot carries a market_percent mark (radar_filters fills it for clearly cheaper lots)."""
+    match = _MARKET_PERCENT_RE.search(item_json or "")
+    return 1 if match and int(match.group(1)) > 0 else 0
+
+
+async def get_weekly_stats(since_epoch: float, until_epoch: float) -> Dict[int, Dict[str, Any]]:
+    """Per user for the weekly digest: lots delivered, how many were below the market, radars that brought
+    lots and the busiest of them. Sent rows of notification_dedupe live 7 days: the window cannot be longer."""
+    window = (float(since_epoch), float(until_epoch))
+    stats: Dict[int, Dict[str, Any]] = {}
+    async with reader_connection() as db:
+        async with db.execute(
+            "SELECT user_id, COUNT(*), COALESCE(SUM(cheap), 0) FROM notification_dedupe "
+            "WHERE status = 'sent' AND sent_at >= ? AND sent_at < ? GROUP BY user_id",
+            window,
+        ) as cur:
+            for row in await cur.fetchall():
+                stats[int(row[0])] = {"lots": int(row[1]), "cheap": int(row[2]), "radars": 0, "top_title": "", "top_lots": 0}
+        async with db.execute(
+            """
+            SELECT d.user_id, r.search_id, COALESCE(s.title, MAX(r.radar_title)), COUNT(*)
+            FROM notification_dedupe d
+            JOIN notification_dedupe_radars r ON r.user_id = d.user_id AND r.item_id = d.item_id
+            LEFT JOIN searches s ON s.id = r.search_id
+            WHERE d.status = 'sent' AND d.sent_at >= ? AND d.sent_at < ?
+            GROUP BY d.user_id, r.search_id
+            """,
+            window,
+        ) as cur:
+            for row in await cur.fetchall():
+                entry = stats.get(int(row[0]))
+                if entry is None:
+                    continue
+                entry["radars"] += 1
+                if int(row[3]) > entry["top_lots"]:
+                    entry["top_title"], entry["top_lots"] = str(row[2] or "Радар"), int(row[3])
+    return stats
+
+
+async def get_weekly_digest_users() -> List[Dict[str, Any]]:
+    """Users with a live paid subscription (a trial has is_allowed = 0) who keep the weekly digest on."""
+    async with reader_connection() as db:
+        async with db.execute(
+            "SELECT * FROM users WHERE is_allowed = 1 AND weekly_digest = 1 "
+            "AND (subscription_until IS NULL OR subscription_until > datetime('now'))"
+        ) as cursor:
+            return [dict(r) for r in await cursor.fetchall()]
+
+
+async def toggle_weekly_digest(user_id: int) -> bool:
+    """Flips the user's weekly digest switch; returns the new state."""
+    async with writer_connection() as db:
+        await db.execute("UPDATE users SET weekly_digest = 1 - weekly_digest WHERE user_id = ?", (int(user_id),))
+        await db.commit()
+        async with db.execute("SELECT weekly_digest FROM users WHERE user_id = ?", (int(user_id),)) as cursor:
+            row = await cursor.fetchone()
+    return bool(row and row[0])
 
 
 async def grant_subscription_in_transaction(db, user_id: int, days: int, tariff_plan: Optional[str] = None,

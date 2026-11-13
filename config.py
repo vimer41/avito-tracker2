@@ -238,6 +238,9 @@ NOTIFICATION_DIGEST_MIN = positive_int_setting("NOTIFICATION_DIGEST_MIN", "4")
 # Daily admin report time (MSK) and renewal reminders.
 DAILY_REPORT_HOUR = 9
 REMINDER_CHECK_INTERVAL = 300
+# Weekly digest for paid users: MSK weekday (0 = Monday) and hour.
+WEEKLY_DIGEST_WEEKDAY = 0
+WEEKLY_DIGEST_HOUR = 10
 # Support tickets: an answered ticket closes itself after this much silence from the user;
 # a closed one can be reopened (button or reply) within SUPPORT_REOPEN_DAYS, later a new one starts.
 SUPPORT_AUTOCLOSE_HOURS = 72
