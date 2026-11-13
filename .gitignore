@@ -45,3 +45,8 @@ DEPLOY_*.md
 
 # Local full description (not for the public repo)
 README.local.md
+
+# Local test runs and measurement reports
+data_local/
+tools/*_report.txt
+radars_*.txt

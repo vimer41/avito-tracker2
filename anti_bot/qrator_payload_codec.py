@@ -4,13 +4,64 @@
 from __future__ import annotations
 
 import argparse
+import re
 import struct
 from collections.abc import Sequence
+from typing import Optional
 
 
 DELTA = 0x9E3779B9
 ROUNDS = 32
 DEFAULT_KEY = (1901231474, 1081891380, 1433695566, 978402641)
+_INT_LITERAL = r"(?:0x[0-9a-fA-F]+|-?\d+)"
+_KEY_ARRAY_RE = re.compile(
+    rf"\[\s*({_INT_LITERAL})\s*,\s*({_INT_LITERAL})\s*,\s*({_INT_LITERAL})\s*,\s*({_INT_LITERAL})\s*\]"
+)
+# The delta as obfuscators write it: 0x9e3779b9 / 2654435769, or the negated form -0x61c88647 / -1640531527.
+_XTEA_DELTA_RE = re.compile(r"0x9e3779b9|2654435769|0x61c88647|1640531527", re.IGNORECASE)
+
+
+def _parse_js_uint32(token: str) -> Optional[int]:
+    try:
+        raw = int(token, 0)
+    except ValueError:
+        return None
+    if raw < -0x80000000 or raw > 0xFFFFFFFF:
+        return None
+    return raw & 0xFFFFFFFF
+
+
+def extract_xtea_key_from_js(script_text: str) -> Optional[tuple[int, int, int, int]]:
+    """Best-effort extraction of the 4-word XTEA key from a downloaded Qrator JS bundle.
+
+    Takes the 4-element 32-bit integer array nearest to an XTEA delta constant; returns None when the
+    delta or a plausible key literal is not visible (heavily obfuscated or changed cipher). Without the
+    delta nothing is guessed: any hash-constant array would pass for a key and replace the working one.
+    """
+    if not isinstance(script_text, str) or not script_text:
+        return None
+
+    candidates: list[tuple[int, tuple[int, int, int, int]]] = []
+    delta_positions = [m.start() for m in _XTEA_DELTA_RE.finditer(script_text)]
+    if not delta_positions:
+        return None
+
+    for match in _KEY_ARRAY_RE.finditer(script_text):
+        words = tuple(_parse_js_uint32(match.group(i)) for i in range(1, 5))
+        if any(w is None for w in words):
+            continue
+        parsed = (int(words[0]), int(words[1]), int(words[2]), int(words[3]))  # type: ignore[arg-type]
+        # Filter out trivial coordinate/flag arrays like [0, 1, 2, 3] or [1920, 1080, 24, 24].
+        if sum(1 for w in parsed if w > 0xFFFF) < 3 or len(set(parsed)) < 3:
+            continue
+        distance = min(abs(match.start() - pos) for pos in delta_positions)
+        if distance <= 4096:
+            candidates.append((distance, parsed))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
 
 
 def _validate_key(key: Sequence[int]) -> tuple[int, int, int, int]:

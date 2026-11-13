@@ -225,8 +225,6 @@ def _default_headers() -> dict[str, str]:
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         "Accept-Encoding": "gzip, deflate, br, zstd",
         "Connection": "keep-alive",
-        "Pragma": "no-cache",
-        "Cache-Control": "no-cache, no-store, max-age=0, must-revalidate",
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "none",
@@ -234,6 +232,40 @@ def _default_headers() -> dict[str, str]:
         "Upgrade-Insecure-Requests": "1",
         "User-Agent": ua,
     }
+
+
+def _navigation_headers(referer: Optional[str] = None) -> Optional[dict[str, str]]:
+    """Headers for same-origin follow-up navigations (HTTP 30x / SSR redirects)."""
+    if not referer:
+        return None
+    return {
+        "Referer": referer,
+        "Sec-Fetch-Site": "same-origin",
+    }
+
+
+_SESSION_WARMUP_COOKIES = frozenset({"u", "v", "srv_id", "ft", "_adcc"})
+
+
+def _has_session_cookies(cookie_jar) -> bool:
+    try:
+        return any(getattr(c, "name", None) in _SESSION_WARMUP_COOKIES for c in cookie_jar)
+    except Exception:
+        return False
+
+
+_WARMUP_AT: dict[str, float] = {}  # channel key -> monotonic time of its last homepage warm-up
+
+
+def _warmup_due(key: str) -> bool:
+    """One homepage warm-up per channel per AVITO_SESSION_WARMUP_GAP. A blocked channel recreates its session
+    on every 403; without the gap it would open the home page before each scan and double its requests."""
+    now = time.monotonic()
+    last = _WARMUP_AT.get(key)
+    if last is not None and now - last < float(getattr(config, "AVITO_SESSION_WARMUP_GAP", 600.0)):
+        return False
+    _WARMUP_AT[key] = now
+    return True
 
 
 _PROXY_STATUS_RE = re.compile(r"CONNECT tunnel failed, response (\d{3})|HTTP code (\d{3}) from proxy", re.I)
@@ -263,11 +295,18 @@ def classify_proxy_error(exc: BaseException) -> Optional[tuple[str, Optional[int
     return None
 
 
-def apply_cache_busting(url: str) -> str:
+def apply_cache_busting(
+    url: str,
+    *,
+    mode: Optional[str] = None,
+    window_seconds: Optional[float] = None,
+    now: Optional[float] = None,
+) -> str:
     """
-    Добавляет динамический timestamp (_t) к URL каталога Авито,
-    чтобы пробивать кэш CDN (Qrator / Nginx edge) и получать
-    свежие объявления без 30-60 секундного лага кэша.
+    Добавляет динамический timestamp (_t) к URL каталога Авито по режиму:
+    - "ms" (по умолчанию): свежие миллисекунды на каждый запрос, окно не учитывается
+    - "bucket": один timestamp на окно window секунд (окно 0 = 15 с)
+    - "off": чистый URL без _t
     """
     try:
         parsed = urlparse(url)
@@ -275,8 +314,21 @@ def apply_cache_busting(url: str) -> str:
             return url
         if any(parsed.path.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".js", ".css", ".ico")):
             return url
+        active_mode = (mode if mode is not None else getattr(config, "AVITO_CACHE_BUST_MODE", "ms")).strip().lower()
+        active_window = float(
+            window_seconds if window_seconds is not None else getattr(config, "AVITO_CACHE_BUST_WINDOW", 0.0)
+        )
         qs = parse_qs(parsed.query, keep_blank_values=True)
-        qs["_t"] = [str(int(time.time() * 1000))]
+        if active_mode == "off":
+            qs.pop("_t", None)
+            return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+        ts_now = time.time() if now is None else float(now)
+        if active_mode == "bucket":  # the mode decides; a missing window means 15 s, not a silent "ms"
+            window = active_window if active_window > 0 else 15.0
+            ts_value = int(math.floor(ts_now / window) * window * 1000)
+        else:
+            ts_value = int(ts_now * 1000)
+        qs["_t"] = [str(ts_value)]
         new_query = urlencode(qs, doseq=True)
         return urlunparse(parsed._replace(query=new_query))
     except Exception:
@@ -373,6 +425,7 @@ class AvitoParser:
         self._last_saved_cookies: list = []
         self._cookies_saved_at = 0.0
         self._cookie_write: Optional[Future] = None
+        self._session_warmed = False
         self._load_cookies()
 
         # SSR redirects of Avito: link -> canonical address. Shared by every channel: the target does not depend on
@@ -748,6 +801,7 @@ class AvitoParser:
 
             accepted = handle_anti_bot_challenge(
                 temp_session, response, actual_url, cancel_event=cancel_event, deadline=deadline,
+                profile_key=self._proxy_key,
             )
             check_cancelled(cancel_event)
             if accepted:
@@ -759,6 +813,47 @@ class AvitoParser:
             except Exception:
                 pass
 
+    async def _maybe_warm_up_async(
+        self,
+        client: "ProxyClient",
+        async_session,
+        deadline: float,
+        request_counter: list[int],
+        max_requests: int,
+    ) -> None:
+        """One-time homepage GET for empty cookie sessions so initial cookies (_adcc, u, v, srv_id) settle before search."""
+        if not getattr(config, "AVITO_SESSION_WARMUP", False) or self._session_warmed:
+            return
+        if _has_session_cookies(async_session.cookies.jar):
+            self._session_warmed = True
+            return
+        if request_counter[0] + 1 >= max_requests or time.monotonic() >= deadline or not client.is_available():
+            return
+        self._session_warmed = True
+        if not _warmup_due(self._proxy_key):
+            return
+        home_url = "https://www.avito.ru/"
+        try:
+            await client.wait_for_rate_slot(deadline=deadline)
+            request_counter[0] += 1
+            remaining = max(0.001, deadline - time.monotonic())
+            timeout = (
+                min(float(config.AVITO_CONNECT_TIMEOUT), remaining),
+                min(float(config.AVITO_READ_TIMEOUT), remaining),
+            )
+            req_t0 = time.monotonic()
+            response = await async_session.request("GET", home_url, timeout=timeout, allow_redirects=False)
+            client.record_raw_http_response(
+                response.status_code,
+                max(0.0, time.monotonic() - req_t0),
+                size_bytes=_response_size(response),
+                ttfb_seconds=_response_ttfb(response),
+            )
+            # A challenge on the home page is not solved here: the search request right after gets the same
+            # challenge and solves it on the main path, with its attempt limit, cancellation and accounting.
+        except Exception as exc:
+            logger.debug("🌐 прогрев сессии [%s]: %s", client.proxy_id, type(exc).__name__)
+
     async def _get_page_response_async_client(
         self,
         async_session,
@@ -766,9 +861,12 @@ class AvitoParser:
         deadline: float,
         request_counter: list[int],
         max_requests: int,
+        *,
+        referer: Optional[str] = None,
     ):
         assert self.proxy_client is not None
         client = self.proxy_client
+        nav_referer = referer
         for _ in range(5):
             if time.monotonic() >= deadline:
                 raise RequestBudgetExceeded("Scan deadline exceeded")
@@ -784,8 +882,12 @@ class AvitoParser:
             )
             req_t0 = time.monotonic()
             req_url = apply_cache_busting(url)
+            req_kwargs: dict = {"timeout": timeout, "allow_redirects": False}
+            nav_headers = _navigation_headers(nav_referer)
+            if nav_headers:
+                req_kwargs["headers"] = nav_headers
             try:
-                response = await async_session.request("GET", req_url, timeout=timeout, allow_redirects=False)
+                response = await async_session.request("GET", req_url, **req_kwargs)
             except Exception:
                 METRICS.record_transport_time(client.proxy_id, client.masked_url, time.monotonic() - req_t0)
                 raise
@@ -803,6 +905,7 @@ class AvitoParser:
             location = response.headers.get("Location") or response.headers.get("location")
             if not location:
                 return response, clean_url, text
+            # A browser keeps the original Referer (or none) across HTTP 30x, so nav_referer stays as passed.
             url = urljoin(url, location)
         raise ValueError("Avito redirect limit exceeded")
 
@@ -829,6 +932,7 @@ class AvitoParser:
         ssr_redirects = 0
 
         def _create_async_session():
+            self._session_warmed = False
             proxies = {"http": client.proxy_url, "https": client.proxy_url} if client.proxy_url else None
             sess = requests.AsyncSession(
                 impersonate=BROWSER_PROFILE,
@@ -842,15 +946,17 @@ class AvitoParser:
             self._load_cookies_into_jar(sess.cookies)
             return sess
 
+        nav_referer: Optional[str] = None
         try:
             async_session = await client.get_or_create_async_session(_create_async_session, lane=self._lane)
+            await self._maybe_warm_up_async(client, async_session, op_deadline, request_counter, max_requests)
             while True:
                 if not client.is_available():
                     self.last_failure = self.last_failure or FetchFailure("cooldown", retry_after=client.cooldown_remaining())
                     return None
                 try:
                     response, actual_url, page_html = await self._get_page_response_async_client(
-                        async_session, target, op_deadline, request_counter, max_requests
+                        async_session, target, op_deadline, request_counter, max_requests, referer=nav_referer
                     )
                     challenged = self._needs_challenge(response, page_html, async_session)
                     retry_after = parse_retry_after(response.headers)
@@ -863,6 +969,7 @@ class AvitoParser:
                         )
                         await client.reset_async_session(self._lane)
                         if await client.maybe_fresh_session():
+                            self._session_warmed = False
                             self._cookies_saved_at = time.monotonic()  # the jar of this scan must not bring them back
                         self.last_failure = FetchFailure(
                             "rate_limit" if response.status_code == 429 else "forbidden",
@@ -951,6 +1058,7 @@ class AvitoParser:
                             self.last_failure = redirect_failure(match, ssr_redirects)
                             return None
                         redirect_path = match.group(1).replace(r"\u0026", "&")
+                        nav_referer = actual_url
                         target = urljoin(actual_url, redirect_path)
                         self._validate_avito_url(target)
                         ssr_redirects += 1
@@ -1066,13 +1174,38 @@ class AvitoParser:
                         pass
                 raise
 
-    def _get_page_response(self, url: str, cancel_event: Event | None):
+    def _maybe_warm_up_sync(self, cancel_event: Event | None) -> None:
+        if not getattr(config, "AVITO_SESSION_WARMUP", False) or self._session_warmed:
+            return
+        if _has_session_cookies(self.session.cookies.jar):
+            self._session_warmed = True
+            return
+        max_reqs = min(int(config.AVITO_MAX_REQUESTS_PER_FETCH), int(config.AVITO_MAX_REQUESTS_PER_SCAN))
+        if self._operation_requests + 1 >= max_reqs:
+            return
+        self._session_warmed = True
+        if not _warmup_due(self._proxy_key):
+            return
+        try:
+            self.session.get("https://www.avito.ru/", timeout=20, allow_redirects=False)
+            check_cancelled(cancel_event)
+        except PowSearchCancelled:
+            raise
+        except Exception as exc:
+            logger.debug("🌐 прогрев сессии: %s", type(exc).__name__)
+
+    def _get_page_response(self, url: str, cancel_event: Event | None, *, referer: Optional[str] = None):
         """Follow a finite number of redirects, validating each target before sending cookies."""
+        nav_referer = referer
         for _ in range(5):
             check_cancelled(cancel_event)
             self._validate_avito_url(url)
             req_url = apply_cache_busting(url)
-            response = self.session.get(req_url, timeout=20, allow_redirects=False)
+            nav_headers = _navigation_headers(nav_referer)
+            if nav_headers:
+                response = self.session.get(req_url, headers=nav_headers, timeout=20, allow_redirects=False)
+            else:
+                response = self.session.get(req_url, timeout=20, allow_redirects=False)
             check_cancelled(cancel_event)
             clean_url = remove_cache_busting(url)
             if self._is_firewall(response) or extract_pow_challenge(response, self.session):
@@ -1082,6 +1215,7 @@ class AvitoParser:
             location = response.headers.get("Location") or response.headers.get("location")
             if not location:
                 return response, clean_url
+            # A browser keeps the original Referer (or none) across HTTP 30x, so nav_referer stays as passed.
             url = urljoin(url, location)
         raise ValueError("Avito redirect limit exceeded")
 
@@ -1093,17 +1227,19 @@ class AvitoParser:
             if self.is_blocked():
                 self.last_failure = FetchFailure("cooldown", retry_after=self.block_remaining())
                 return None
+            self._maybe_warm_up_sync(cancel_event)
             target = self._canonical_cache.get(url, url)
             human = self._human_url(url)
             challenge_attempts = 0
             ssr_redirects = 0
+            nav_referer: Optional[str] = None
             while True:
                 check_cancelled(cancel_event)
                 if self.is_blocked():
                     self.last_failure = self.last_failure or FetchFailure("cooldown", retry_after=self.block_remaining())
                     return None
                 try:
-                    response, actual_url = self._get_page_response(target, cancel_event)
+                    response, actual_url = self._get_page_response(target, cancel_event, referer=nav_referer)
                     challenged = self._is_recognized_challenge(response, self.session)
                     if response.status_code in (403, 429) and (parse_retry_after(response.headers) or not challenged):
                         self._register_block(response.status_code, response.headers, response=response)
@@ -1119,6 +1255,7 @@ class AvitoParser:
                         logger.debug("🛡 %s: проверка HTTP %s (попытка %d/2)", human, response.status_code, challenge_attempts)
                         accepted = handle_anti_bot_challenge(
                             self.session, response, actual_url, cancel_event=cancel_event, deadline=deadline,
+                            profile_key=self._proxy_key,
                         )
                         check_cancelled(cancel_event)
                         if not accepted:
@@ -1139,6 +1276,7 @@ class AvitoParser:
                             self.last_failure = redirect_failure(match, ssr_redirects)
                             return None
                         redirect_path = match.group(1).replace(r"\u0026", "&")
+                        nav_referer = actual_url
                         target = urljoin(actual_url, redirect_path)
                         self._validate_avito_url(target)
                         ssr_redirects += 1

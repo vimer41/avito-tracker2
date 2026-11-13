@@ -176,6 +176,16 @@ AVITO_STALL_TIMEOUT = positive_float_setting("AVITO_STALL_TIMEOUT", "6.0")
 AVITO_COLLECTION_DEADLINE = positive_float_setting("AVITO_COLLECTION_DEADLINE", "20.0")
 AVITO_MAX_REQUESTS_PER_SCAN = positive_int_setting("AVITO_MAX_REQUESTS_PER_SCAN", "8")
 AVITO_MAX_PAGES_PER_SCAN = min(5, positive_int_setting("AVITO_MAX_PAGES_PER_SCAN", "2"))
+# Cache-busting (_t) for catalog GETs: "ms" (fresh ms every request), "bucket" (rotated every AVITO_CACHE_BUST_WINDOW s), or "off".
+AVITO_CACHE_BUST_MODES = ("ms", "bucket", "off")
+AVITO_CACHE_BUST_MODE = (os.getenv("AVITO_CACHE_BUST_MODE", "ms").strip().lower() or "ms")
+if AVITO_CACHE_BUST_MODE not in AVITO_CACHE_BUST_MODES:
+    raise ValueError(f"AVITO_CACHE_BUST_MODE должен быть одним из: {', '.join(AVITO_CACHE_BUST_MODES)}")
+AVITO_CACHE_BUST_WINDOW = non_negative_float_setting("AVITO_CACHE_BUST_WINDOW", "15")  # used by "bucket" only
+# Warm up empty cookie sessions with one homepage GET before hitting a search URL (off in offline test mode),
+# at most once per AVITO_SESSION_WARMUP_GAP seconds per channel.
+AVITO_SESSION_WARMUP = os.getenv("AVITO_SESSION_WARMUP", "0" if TESTING else "1").strip() == "1"
+AVITO_SESSION_WARMUP_GAP = non_negative_float_setting("AVITO_SESSION_WARMUP_GAP", "600")
 
 # --- Доставка и outbox ---
 # Tariffs differ only by scan interval (TARIFF_SCAN_INTERVAL): a found lot goes out at once, with no

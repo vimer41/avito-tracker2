@@ -400,6 +400,118 @@ class TestParserProtection(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(task, timeout=3)
             self.assertTrue(stopped.is_set())
 
+    def test_windows_user_agent_and_clean_navigation_headers(self):
+        with patch.object(manager.sys, "platform", "linux"):
+            ua = manager.get_browser_user_agent()
+        self.assertIn("Windows NT 10.0; Win64; x64", ua)
+        self.assertIn(f"Firefox/{manager.BROWSER_VERSION}.0", ua)
+        headers = parser_module._default_headers()
+        self.assertNotIn("Pragma", headers)
+        self.assertNotIn("Cache-Control", headers)
+        self.assertEqual(headers["Sec-Fetch-Site"], "none")
+
+    def test_qrator_xtea_key_extraction_and_rotation(self):
+        from anti_bot.qrator_payload_codec import DEFAULT_KEY, decode_field, extract_xtea_key_from_js
+
+        rotated = (0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00)
+        js_body = f"var d=0x9e3779b9;var w=[{rotated[0]},{rotated[1]},{rotated[2]},{rotated[3]}];"
+        self.assertEqual(extract_xtea_key_from_js(js_body), rotated)
+        self.assertIsNone(extract_xtea_key_from_js("var coords=[1920,1080,24,24];"))
+        # The negated delta is recognised; without any delta a hash-constant array is not taken for a key.
+        self.assertEqual(extract_xtea_key_from_js(js_body.replace("0x9e3779b9", "-0x61c88647")), rotated)
+        self.assertIsNone(extract_xtea_key_from_js("var h=[0x67452301,0xefcdab89,0x98badcfe,0x10325476];"))
+
+        challenge = FakeResponse(429, '<script src="/0123456789abcdefabcd.js"></script>', headers={"server": "QRATOR"})
+
+        def solved_f_cookie(dynamic_key: bool) -> str:
+            session = FakeSession([FakeResponse(200, js_body), FakeResponse(200), FakeResponse(200)])
+            session.post.return_value = FakeResponse(payload="ok-token")
+            with patch.object(manager.time, "sleep"), patch.object(manager, "QRATOR_DYNAMIC_KEY", dynamic_key):
+                self.assertTrue(
+                    manager.solve_qrator_challenge(session, challenge, "https://www.avito.ru/test", profile_key="p-abc")
+                )
+            return session.cookies.get("f")
+
+        # Off (default): the found key is only logged, the built-in one still encrypts.
+        self.assertEqual(len(decode_field(solved_f_cookie(False), "f", DEFAULT_KEY).split(";")), 141)
+        # On: the key from the script is used.
+        self.assertEqual(len(decode_field(solved_f_cookie(True), "f", rotated).split(";")), 141)
+        self.assertEqual(DEFAULT_KEY[0], 1901231474)
+
+    def test_qrator_profile_import_and_deterministic_selection(self):
+        from anti_bot.generate_qrator_variants import (
+            DEFAULT_BASE_F,
+            DEFAULT_BASE_S,
+            generate_variants,
+            import_captured_profile,
+            load_f_base,
+            load_s_base,
+            select_qrator_profile,
+        )
+
+        f_vals = load_f_base(DEFAULT_BASE_F)
+        s_raw = load_s_base(DEFAULT_BASE_S)
+        sample = generate_variants(f_vals, s_raw, count=1, timestamp=1700000000, seed=42)[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            profiles_dir = Path(tmp)
+            p1 = import_captured_profile(str(sample["f"]), str(sample["s"]), out_dir=profiles_dir, label="win11")
+            p2 = import_captured_profile("1920;1080;" + ";".join(["1"] * 139), s_raw, out_dir=profiles_dir, label="alt")
+            self.assertTrue(p1.exists() and p2.exists())
+            sel_a = select_qrator_profile("proxy-1", profiles_dir=profiles_dir)
+            sel_b = select_qrator_profile("proxy-1", profiles_dir=profiles_dir)
+            self.assertEqual(sel_a, sel_b)
+
+    def test_cache_busting_modes(self):
+        base = "https://www.avito.ru/moskva?q=test&s=104"
+        self.assertEqual(parser_module.apply_cache_busting(base + "&_t=123", mode="off"), base)
+        b1 = parser_module.apply_cache_busting(base, mode="bucket", window_seconds=15.0, now=1005.0)
+        b2 = parser_module.apply_cache_busting(base, mode="bucket", window_seconds=15.0, now=1019.0)
+        b3 = parser_module.apply_cache_busting(base, mode="bucket", window_seconds=15.0, now=1020.0)
+        self.assertEqual(b1, b2)
+        self.assertNotEqual(b2, b3)
+        ms = parser_module.apply_cache_busting(base, mode="ms", window_seconds=0.0, now=1001.234)
+        self.assertIn("_t=1001234", ms)
+        # The mode decides: "ms" ignores a window, "bucket" without a window uses 15 s.
+        self.assertIn("_t=1001234", parser_module.apply_cache_busting(base, mode="ms", window_seconds=15.0, now=1001.234))
+        self.assertIn("_t=990000", parser_module.apply_cache_busting(base, mode="bucket", window_seconds=0.0, now=1001.234))
+
+    def test_redirect_and_ssr_redirect_send_same_origin_referer(self):
+        session = FakeSession([
+            FakeResponse(302, headers={"Location": "/step1"}),
+            FakeResponse(200, '<script>{"isSuspenseRedirect":true,"redirect":"/final"}</script>'),
+            FakeResponse(200, "<html><body>catalog</body></html>"),
+        ])
+        parser = self.make_parser(session)
+        html = parser.fetch_page("https://www.avito.ru/search")
+        self.assertIn("catalog", html)
+        self.assertNotIn("headers", session.get.call_args_list[0].kwargs)
+        # HTTP 30x: a browser adds no Referer. Only the page-driven SSR redirect carries one.
+        self.assertNotIn("headers", session.get.call_args_list[1].kwargs)
+        self.assertEqual(
+            session.get.call_args_list[2].kwargs["headers"],
+            {"Referer": "https://www.avito.ru/step1", "Sec-Fetch-Site": "same-origin"},
+        )
+
+    def test_session_warmup_runs_once_on_empty_cookies_when_enabled(self):
+        import config
+
+        session = FakeSession([
+            FakeResponse(200, "<html>home</html>"),
+            FakeResponse(200, "<html><body>catalog</body></html>"),
+            FakeResponse(200, "<html><body>catalog2</body></html>"),
+        ])
+        parser = self.make_parser(session)
+        with patch.object(config, "AVITO_SESSION_WARMUP", True), patch.dict(parser_module._WARMUP_AT, clear=True):
+            self.assertIn("catalog", parser.fetch_page("https://www.avito.ru/search"))
+            self.assertIn("catalog2", parser.fetch_page("https://www.avito.ru/search"))
+            self.assertEqual(session.get.call_count, 3)
+            self.assertEqual(session.get.call_args_list[0].args[0], "https://www.avito.ru/")
+            # A new session of the same channel inside the gap (a blocked IP recreates it on every 403)
+            # goes straight to the search.
+            again = FakeSession([FakeResponse(200, "<html><body>catalog3</body></html>")])
+            self.assertIn("catalog3", self.make_parser(again).fetch_page("https://www.avito.ru/search"))
+            self.assertEqual(again.get.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

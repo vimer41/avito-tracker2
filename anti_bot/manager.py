@@ -51,8 +51,12 @@ from anti_bot.generate_qrator_variants import (
     DEFAULT_BASE_S,
     generate_variants,
     load_f_base,
+    load_qrator_profiles,
     load_s_base,
+    profile_canvas_seed,
+    select_qrator_profile,
 )
+from anti_bot.qrator_payload_codec import DEFAULT_KEY, extract_xtea_key_from_js
 from logger_setup import log_event
 from runtime_metrics import METRICS
 from anti_bot.pow_budget import (
@@ -67,6 +71,12 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://www.avito.ru"
 BROWSER_VERSION = "147"
 BROWSER_PROFILE = f"firefox{BROWSER_VERSION}"
+# Keep UA aligned with the Windows fingerprint in anti_bot/base.txt even on a Linux VPS.
+DEFAULT_UA_PLATFORM = os.getenv("AVITO_UA_PLATFORM", "Windows NT 10.0; Win64; x64").strip() or "Windows NT 10.0; Win64; x64"
+# A key found in Qrator's script replaces DEFAULT_KEY only with AVITO_QRATOR_DYNAMIC_KEY=1. Off: the find is
+# only logged, because a wrong guess would break every Qrator solve that works with the built-in key.
+QRATOR_DYNAMIC_KEY = os.getenv("AVITO_QRATOR_DYNAMIC_KEY", "0").strip() == "1"
+_REPORTED_KEY_SCRIPTS: set[str] = set()
 POW_GET_URL = f"{BASE_URL}/web/3/firewallPow/get"
 POW_VERIFY_URL = f"{BASE_URL}/web/3/firewallPow/verify"
 FIREWALL_CAPTCHA_GET_URL = f"{BASE_URL}/web/5/firewallCaptcha/get"
@@ -85,14 +95,8 @@ GEETEST_PROCESS_TIMEOUT = 45.0
 
 
 def get_browser_user_agent() -> str:
-    """User-Agent с той же версией, что и TLS/HTTP-профиль curl_cffi."""
-    if sys.platform.startswith("win"):
-        platform_token = "Windows NT 10.0; Win64; x64"
-    elif sys.platform == "darwin":
-        platform_token = "Macintosh; Intel Mac OS X 10.15"
-    else:
-        platform_token = "X11; Linux x86_64"
-    return f"Mozilla/5.0 ({platform_token}; rv:{BROWSER_VERSION}.0) Gecko/20100101 Firefox/{BROWSER_VERSION}.0"
+    """User-Agent с той же версией и платформой, что и TLS/Qrator-профиль."""
+    return f"Mozilla/5.0 ({DEFAULT_UA_PLATFORM}; rv:{BROWSER_VERSION}.0) Gecko/20100101 Firefox/{BROWSER_VERSION}.0"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -165,10 +169,11 @@ def solve_qrator_challenge(
     timeout: int = 15,
     *,
     cancel_event: Event | None = None,
+    profile_key: str | None = None,
 ) -> bool:
     """
     Best-effort обмен QRATOR с эталонным отпечатком (JS не исполняется):
-    1. Загружает JS-скрипт отпечатка и favicon
+    1. Загружает JS-скрипт отпечатка и favicon (проверяет XTEA-ключ в скрипте)
     2. Генерирует XTEA-зашифрованные поля 'f' и 's' на базе эталонных отпечатков
     3. Отправляет /web/2/ft и сохраняет куки 'f' и 'ft'
     4. Запрашивает проверочный пиксель /web/1/u
@@ -183,6 +188,7 @@ def solve_qrator_challenge(
     if not script_url:
         logger.warning("QRATOR challenge has no supported fingerprint script")
         return False
+    xtea_key = DEFAULT_KEY
     try:
         script_resp = session.get(
             script_url,
@@ -193,6 +199,19 @@ def solve_qrator_challenge(
         if script_resp.status_code != 200:
             logger.warning("QRATOR script rejected: HTTP %s", script_resp.status_code)
             return False
+        script_text = getattr(script_resp, "text", "") or ""
+        extracted_key = extract_xtea_key_from_js(script_text)
+        if extracted_key and extracted_key != DEFAULT_KEY:
+            script_sha = hashlib.sha256(script_text.encode("utf-8", "ignore")).hexdigest()[:12]
+            if script_sha not in _REPORTED_KEY_SCRIPTS:  # once per script version, not on every solve
+                _REPORTED_KEY_SCRIPTS.add(script_sha)
+                logger.warning(
+                    "В скрипте Qrator (%s) найден другой ключ XTEA: %s — %s",
+                    script_sha, extracted_key,
+                    "применён" if QRATOR_DYNAMIC_KEY else "не применён (AVITO_QRATOR_DYNAMIC_KEY=0)",
+                )
+            if QRATOR_DYNAMIC_KEY:
+                xtea_key = extracted_key
     except Exception as e:
         logger.debug(f"Ошибка загрузки Qrator JS скрипта: {e}")
         return False
@@ -220,14 +239,18 @@ def solve_qrator_challenge(
 
     # 3. Синтетические поля 'f' и 's'; валидность определяет только сервер.
     try:
-        f_base = load_f_base(DEFAULT_BASE_F)
-        s_base = load_s_base(DEFAULT_BASE_S)
-        variants = generate_variants(
-            f_base,
-            s_base,
-            count=1,
-            timestamp=int(time.time()),
-        )
+        if load_qrator_profiles():
+            f_base, s_base, _profile_label = select_qrator_profile(profile_key)
+        else:
+            f_base = load_f_base(DEFAULT_BASE_F)
+            s_base = load_s_base(DEFAULT_BASE_S)
+        variant_kwargs: dict[str, Any] = {"count": 1, "timestamp": int(time.time())}
+        seed = profile_canvas_seed(profile_key)
+        if seed is not None:
+            variant_kwargs["seed"] = seed
+        if xtea_key != DEFAULT_KEY:
+            variant_kwargs["key"] = xtea_key
+        variants = generate_variants(f_base, s_base, **variant_kwargs)
         f_value = variants[0]["f"]
         s_value = variants[0]["s"]
     except Exception as e:
@@ -627,6 +650,7 @@ def handle_anti_bot_challenge(
     *,
     cancel_event: Event | None = None,
     deadline: float | None = None,
+    profile_key: str | None = None,
 ) -> bool:
     """
     Универсальный обработчик защиты Авито.
@@ -638,12 +662,15 @@ def handle_anti_bot_challenge(
     check_cancelled(cancel_event)
     # 1. QRATOR 302/429
     if is_qrator_challenge_response(response):
-        return _timed_solve("qrator", solve_qrator_challenge, session, response, page_url, cancel_event=cancel_event)
+        qrator_kwargs: dict[str, Any] = {"cancel_event": cancel_event}
+        if profile_key is not None:
+            qrator_kwargs["profile_key"] = profile_key
+        return _timed_solve("qrator", solve_qrator_challenge, session, response, page_url, **qrator_kwargs)
 
     # 2. Firewall PoW (439, 429 или в куках)
     pow_challenge = extract_pow_challenge(response, session)
     if pow_challenge:
-                return _timed_solve("pow", solve_pow_challenge, session, pow_challenge, referer=page_url, cancel_event=cancel_event)
+        return _timed_solve("pow", solve_pow_challenge, session, pow_challenge, referer=page_url, cancel_event=cancel_event)
 
     # 3. GeeTest v4 Captcha
     if is_geetest_challenge(response):
