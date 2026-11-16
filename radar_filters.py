@@ -92,15 +92,7 @@ def price_label(price_min: int, price_max: int) -> str:
 
 
 def filter_reason(item: Any, radar: dict) -> Optional[str]:
-    """Which filter of this radar drops the lot, None when the lot passes.
-
-    A lot without a price passes the price filter: losing a real lot costs more than one extra message.
-    """
-    price = item.raw_price or 0
-    price_min = int(radar.get("price_min") or 0)
-    price_max = int(radar.get("price_max") or 0)
-    if price and ((price_min and price < price_min) or (price_max and price > price_max)):
-        return "price"
+    """Which filter of this radar drops the lot, None when the lot passes."""
     if radar.get("delivery_only") and not item.delivery:
         return "delivery"
     if radar.get("hide_promoted") and item.is_promotion:
@@ -137,10 +129,6 @@ def title_matches(title: str, query: str) -> bool:
 def summary(radar: dict) -> str:
     """One line for the radar card."""
     parts = []
-    price_min = int(radar.get("price_min") or 0)
-    price_max = int(radar.get("price_max") or 0)
-    if price_min or price_max:
-        parts.append(f"цена {price_label(price_min, price_max)}")
     words = parse_words(radar.get("must_words"))
     if words:
         parts.append(f"обязательных слов: {len(words)}")

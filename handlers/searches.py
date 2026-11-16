@@ -46,7 +46,6 @@ class SearchStates(StatesGroup):
     waiting_for_custom_age = State()
     waiting_for_rename = State()
     waiting_for_new_url = State()
-    waiting_for_price = State()
     waiting_for_must_words = State()
     waiting_for_reply_template = State()
 
@@ -185,7 +184,7 @@ async def btn_add_search(event, state: FSMContext):
             "Пришлите ссылку на поиск Авито — бот будет проверять её и присылать каждое новое объявление.\n\n"
             "<b>Как получить ссылку</b>\n"
             "1. Найдите товар на avito.ru\n"
-            "2. Задайте город, цену и другие фильтры\n"
+            "2. Выставьте на сайте все фильтры: город, цену, продавцов (частные / компании), состояние и другие параметры\n"
             "3. Скопируйте адрес страницы и отправьте сюда\n\n"
             "<blockquote><code>https://www.avito.ru/moskva/telefony?q=iphone</code></blockquote>\n"
             "Фильтры сохраняются в ссылке. Сортировку менять не нужно: бот сам смотрит самые новые объявления."
@@ -198,7 +197,7 @@ async def btn_add_search(event, state: FSMContext):
             f"{ui.e('radar')} <b>Новый радар</b>\n\n"
             "Пришлите ссылку на поиск Авито:\n"
             "1. Откройте <b>avito.ru</b> и найдите нужный товар.\n"
-            "2. Выставьте фильтры: город, цена, состояние.\n"
+            "2. Выставьте на сайте все фильтры: город, цену, продавцов (частные / компании), состояние и т.д.\n"
             "3. Скопируйте ссылку из адресной строки и отправьте сюда.\n\n"
             "<blockquote>Пример: <code>https://www.avito.ru/moskva/telefony?q=iphone</code></blockquote>"
         )
@@ -1123,7 +1122,6 @@ def _yes_no(value) -> str:
 
 def build_filters_screen(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
     search_id = s["id"]
-    price_min, price_max = int(s.get("price_min") or 0), int(s.get("price_max") or 0)
     words = radar_filters.parse_words(s.get("must_words"))
     template = (s.get("reply_template") or "").strip()
     cur_age = s.get("max_age_minutes")
@@ -1133,24 +1131,22 @@ def build_filters_screen(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
         cur_age = 30
     text = (
         f"{ui.e('sliders')} <b>Фильтры радара</b>\n«{html.escape(s['title'])}»\n\n"
-        f"<b>Цена:</b> {radar_filters.price_label(price_min, price_max)}\n"
         f"<b>Обязательные слова:</b> {html.escape(', '.join(words)) or 'нет'}\n"
         f"<b>Свежесть лотов:</b> до {cur_age} мин.\n"
         f"<b>Только с Авито Доставкой:</b> {_yes_no(s.get('delivery_only'))}\n"
         f"<b>Скрывать продвинутые:</b> {_yes_no(s.get('hide_promoted'))}\n"
         f"<b>Сообщение продавцу:</b> {html.escape(template) or 'нет'}\n\n"
-        "<blockquote>Лот придёт, если проходит все условия. Лот без цены проходит фильтр цены. "
-        "Лот, отсеянный сейчас, не придёт и после смены фильтра.</blockquote>"
+        "<blockquote>Фильтры по цене, продавцам (частные / компании), состоянию и др. ставятся на сайте avito.ru "
+        "перед копированием ссылки. Лот придёт, если проходит все условия; отсеянный лот не придёт и после смены фильтра.</blockquote>"
     )
     markup = ui.kb(
-        [ui.btn("Цена", "price", callback_data=f"flt_price:{search_id}"),
-         ui.btn("Обязательные слова", "scope", callback_data=f"flt_must:{search_id}")],
-        [ui.btn(f"Свежесть: до {cur_age} мин", "time", callback_data=f"set_age:{search_id}"),
-         ui.btn(f"Только с доставкой: {_yes_no(s.get('delivery_only'))}", "box",
-                callback_data=f"flt_tog:delivery_only:{search_id}")],
-        [ui.btn(f"Скрывать продвинутые: {_yes_no(s.get('hide_promoted'))}", "ban",
-                callback_data=f"flt_tog:hide_promoted:{search_id}"),
-         ui.btn("Сообщение продавцу", "write", callback_data=f"flt_tpl:{search_id}")],
+        [ui.btn("Обязательные слова", "scope", callback_data=f"flt_must:{search_id}"),
+         ui.btn(f"Свежесть: до {cur_age} мин", "time", callback_data=f"set_age:{search_id}")],
+        [ui.btn(f"Только с доставкой: {_yes_no(s.get('delivery_only'))}", "box",
+                callback_data=f"flt_tog:delivery_only:{search_id}"),
+         ui.btn(f"Скрывать продвинутые: {_yes_no(s.get('hide_promoted'))}", "ban",
+                callback_data=f"flt_tog:hide_promoted:{search_id}")],
+        [ui.btn("Сообщение продавцу", "write", callback_data=f"flt_tpl:{search_id}")],
         [ui.btn("« К радару", callback_data=f"open_search:{search_id}")],
     )
     return text, markup
@@ -1180,7 +1176,7 @@ async def _save_filter_value(message: Message, state: FSMContext, **fields) -> N
     await ui.show(message, text, markup)
 
 
-@router.callback_query(F.data.startswith(("flt_open:", "flt_back:")))
+@router.callback_query(F.data.startswith(("flt_open:", "flt_back:", "flt_price:")))
 async def cb_filters_open(call: CallbackQuery, state: FSMContext):
     await state.clear()
     s = await _own_search(call, int(call.data.split(":")[1]))
@@ -1203,31 +1199,6 @@ async def cb_filter_toggle(call: CallbackQuery):
     await database.update_search_filters(s["id"], call.from_user.id, **{field: s[field]})
     text, markup = build_filters_screen(s)
     await ui.show(call, text, markup)
-
-
-@router.callback_query(F.data.startswith("flt_price:"))
-async def cb_filter_price(call: CallbackQuery, state: FSMContext):
-    await _ask_filter_value(
-        call, state, SearchStates.waiting_for_price,
-        f"{ui.e('price')} <b>Диапазон цены</b>\n\n"
-        "Пришлите, например: <code>10000-50000</code>, <code>от 10к</code> или <code>до 1.5 млн</code>.\n"
-        "Убрать фильтр: <code>нет</code>.",
-    )
-
-
-@router.message(SearchStates.waiting_for_price, F.text)
-async def process_filter_price(message: Message, state: FSMContext):
-    if await route_menu_text(message, state):
-        return
-    parsed = radar_filters.parse_price_range(message.text)
-    if parsed is None:
-        await message.answer(
-            f"{ui.e('warn')} Не понял диапазон. Пример: <code>10000-50000</code>, "
-            "<code>от 10к</code>, <code>до 50 тыс</code> или <code>нет</code>.",
-            parse_mode="HTML",
-        )
-        return
-    await _save_filter_value(message, state, price_min=parsed[0], price_max=parsed[1])
 
 
 @router.callback_query(F.data.startswith("flt_must:"))

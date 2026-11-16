@@ -41,16 +41,11 @@ class FilterReasonTests(unittest.TestCase):
     def test_empty_radar_passes_everything(self):
         self.assertIsNone(radar_filters.filter_reason(lot(), {}))
 
-    def test_price_bounds(self):
+    def test_price_bounds_are_ignored(self):
         radar = {"price_min": 10000, "price_max": 20000}
-        self.assertEqual(radar_filters.filter_reason(lot(price=9999), radar), "price")
-        self.assertEqual(radar_filters.filter_reason(lot(price=20001), radar), "price")
-        self.assertIsNone(radar_filters.filter_reason(lot(price=20000), radar))
-
-    def test_lot_without_a_price_passes_the_price_filter(self):
-        item = lot()
-        item.raw_price = None
-        self.assertIsNone(radar_filters.filter_reason(item, {"price_min": 10000}))
+        self.assertIsNone(radar_filters.filter_reason(lot(price=9999), radar))
+        self.assertIsNone(radar_filters.filter_reason(lot(price=25000), radar))
+        self.assertEqual(radar_filters.summary(radar), "нет")
 
     def test_delivery_and_promotion(self):
         self.assertEqual(radar_filters.filter_reason(lot(), {"delivery_only": 1}), "delivery")
@@ -187,16 +182,17 @@ class SavedFiltersTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((await database.claim_notification_event())["_user_allowed"])
 
     async def test_filtered_lot_is_remembered_and_never_queued(self):
-        await database.update_search_filters(self.search_id, self.user_id, price_max=20000)
-        await self._fanout([self._fresh("cheap", 15000), self._fresh("dear", 25000)])
+        await database.update_search_filters(self.search_id, self.user_id, delivery_only=1)
+        await self._fanout([self._fresh("with_deliv", 15000, delivery="Авито Доставка"),
+                            self._fresh("no_deliv", 25000)])
         claimed = await database.claim_notification_event()
-        self.assertIn("cheap", claimed["payload_json"])
+        self.assertIn("with_deliv", claimed["payload_json"])
         self.assertIsNone(await database.claim_notification_event())
-        self.assertIn("dear", await database.get_seen_items_with_prices(self.search_id))
+        self.assertIn("no_deliv", await database.get_seen_items_with_prices(self.search_id))
 
     async def test_delivery_rechecks_filters_set_after_the_lot_was_queued(self):
-        await self._fanout([self._fresh("late", 15000)])
-        await database.update_search_filters(self.search_id, self.user_id, price_max=10000)
+        await self._fanout([self._fresh("late", 15000, is_promotion=True)])
+        await database.update_search_filters(self.search_id, self.user_id, hide_promoted=1)
         claimed = await database.claim_notification_event()
         self.assertTrue(claimed["_fast_claimed"])
         self.assertIsNone(await scheduler._prepare_delivery(claimed))

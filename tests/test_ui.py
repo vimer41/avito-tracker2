@@ -128,6 +128,33 @@ class TestInterfaceFlows(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await self.dispatch_callback(f"rm_stop_i:{search_id}:0")
         self.assertEqual((await database.get_search(search_id))["stop_words"], [])
 
+    def _last_screen(self):
+        return [m for m in self.session.calls if type(m).__name__ in ("SendMessage", "EditMessageText")][-1]
+
+    async def test_filters_screen_has_no_price_button_and_points_to_avito(self):
+        search_id = await database.add_search(self.user_id, "Радар", "https://www.avito.ru/moskva?q=x&s=104")
+        await self.dispatch_callback(f"flt_open:{search_id}")
+        sent = self._last_screen()
+        self.assertNotIn("<b>Цена:</b>", sent.text)
+        self.assertIn("avito.ru", sent.text)
+        callbacks = self.callback_values()
+        self.assertFalse(any(v.startswith("flt_price:") for v in callbacks if v))
+        labels = [b.text for row in sent.reply_markup.inline_keyboard for b in row]
+        self.assertFalse(any("Цена" in label for label in labels))
+
+    async def test_help_and_add_prompt_explain_avito_site_filters(self):
+        for theme in ("emoji", "clean"):
+            with patch.object(config, "UI_THEME", theme):
+                await self.dispatch_callback("open_help_menu")
+                help_text = self._last_screen().text
+                self.assertIn("частные", help_text)
+                self.assertIn("состояние", help_text)
+                self.assertIn("avito.ru", help_text)
+                await self.dispatch_callback("add_search_prompt")
+                add_text = self._last_screen().text
+                self.assertIn("частные", add_text)
+                self.assertIn("состояние", add_text)
+
 
 if __name__ == "__main__":
     unittest.main()
