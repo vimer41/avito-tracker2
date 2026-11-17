@@ -126,17 +126,10 @@ async def main():
         dp.include_router(main_router)
 
         # A deploy must not discard unread Telegram updates.
-        for _attempt in range(3):
-            try:
-                await bot.delete_webhook(drop_pending_updates=False)
-                break
-            except (TelegramNetworkError, TelegramServerError) as exc:
-                if _attempt == 2:
-                    logger.warning("Не удалось выполнить delete_webhook при старте (%s); запускаю polling", exc)
-                    break
-                logger.warning("Временная ошибка Telegram при delete_webhook (попытка %s/3): %s", _attempt + 1, exc)
-                await asyncio.sleep(1.5)
-        await setup_bot_profile(bot)
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+        except (TelegramNetworkError, TelegramServerError) as exc:
+            logger.warning("Не удалось выполнить delete_webhook при старте (%s); продолжаю запуск", exc)
         recovery = await database.recover_outbox_on_startup()
         if any(recovery.values()):
             logger.info("Восстановление очереди уведомлений при старте: %s", recovery)
@@ -171,9 +164,16 @@ async def main():
             net_mode=config.NET_MODE,
             pid=os.getpid(),
         )
+        background_tasks.append(asyncio.create_task(setup_bot_profile(bot), name="bot-profile"))
         background_tasks.append(asyncio.create_task(reports.announce_release(bot, version), name="release-note"))
         background_tasks.append(asyncio.create_task(link_check.warn_bad_links(bot), name="bad-links"))
-        await dp.start_polling(bot)
+        while True:
+            try:
+                await dp.start_polling(bot)
+                break
+            except (TelegramNetworkError, TelegramServerError) as exc:
+                logger.warning("Сбой Telegram Bot API при запуске polling (%s); повтор через 5 с", exc)
+                await asyncio.sleep(5)
     finally:
         logger.info("Завершение работы бота...")
         for task in background_tasks:

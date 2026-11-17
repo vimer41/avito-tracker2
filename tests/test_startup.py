@@ -38,7 +38,7 @@ class TestStartupCleanup(unittest.IsolatedAsyncioTestCase):
         err = TelegramServerError(method=DeleteWebhook(drop_pending_updates=False), message="Bad Gateway")
         bot = SimpleNamespace(delete_webhook=AsyncMock(side_effect=err), session=SimpleNamespace(close=AsyncMock(), middleware=Mock()))
         dp = Mock()
-        dp.start_polling = AsyncMock()
+        dp.start_polling = AsyncMock(side_effect=[err, None])
         pool = SimpleNamespace(reload_async=AsyncMock())
         with patch.object(bot_module, "start_health_server", new=AsyncMock(return_value=runner)), \
                 patch.object(bot_module.database, "init_db", new=AsyncMock()), \
@@ -57,8 +57,8 @@ class TestStartupCleanup(unittest.IsolatedAsyncioTestCase):
                 patch.object(bot_module, "start_background_services", return_value=[]), \
                 patch.object(bot_module.asyncio, "sleep", new=AsyncMock()):
             await bot_module.main()
-        self.assertEqual(bot.delete_webhook.await_count, 3)
-        dp.start_polling.assert_awaited_once_with(bot)
+        bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)
+        self.assertEqual(dp.start_polling.await_count, 2)
 
 
 if __name__ == "__main__":
