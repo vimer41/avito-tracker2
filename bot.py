@@ -8,7 +8,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramNetworkError, TelegramServerError
 from aiogram.types import BotCommand
 from aiogram.fsm.storage.memory import MemoryStorage
 
@@ -130,10 +130,11 @@ async def main():
             try:
                 await bot.delete_webhook(drop_pending_updates=False)
                 break
-            except TelegramNetworkError as exc:
+            except (TelegramNetworkError, TelegramServerError) as exc:
                 if _attempt == 2:
-                    raise
-                logger.warning("Временная ошибка сети Telegram при delete_webhook (попытка %s/3): %s", _attempt + 1, exc)
+                    logger.warning("Не удалось выполнить delete_webhook при старте (%s); запускаю polling", exc)
+                    break
+                logger.warning("Временная ошибка Telegram при delete_webhook (попытка %s/3): %s", _attempt + 1, exc)
                 await asyncio.sleep(1.5)
         await setup_bot_profile(bot)
         recovery = await database.recover_outbox_on_startup()
