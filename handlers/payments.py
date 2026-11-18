@@ -146,8 +146,10 @@ async def rub_check(call: CallbackQuery, bot: Bot):
 
 @router.message(Command(config.RUB_TEST_COMMAND))
 async def rub_test_checkout(message: Message):
-    """Hidden checkout test: 1 ₽ for 1 hour of «Полный». Not listed anywhere, works only when typed."""
+    """Hidden checkout test: 1 ₽ for 1 hour of «Полный». Restricted to admins unless RUB_TEST_ENABLED=1."""
     if not config.PLATEGA_ENABLED or message.chat.type != "private":
+        return
+    if not (config.RUB_TEST_ENABLED or config.is_admin(message.from_user.id)):
         return
     await message.answer(
         f"{ui.e('card')} <b>Тест оплаты — {config.RUB_TEST_PRICE} ₽</b>\n\n"
@@ -230,6 +232,31 @@ async def successful_payment(message: Message, bot: Bot):
         await notify_admins(bot, f"⚠️ <b>Нужна сверка подтверждённого платежа</b>\nID: <code>{message.from_user.id}</code>\n"
                             f"Charge: <code>{html.escape(payment.telegram_payment_charge_id)}</code>\n{html.escape(str(exc))}", message.from_user.id)
         return
+    except Exception as exc:
+        logger.critical(
+            "Stars confirmed payment DB failure: user=%s charge=%s payload=%s amount=%s err=%s",
+            message.from_user.id,
+            payment.telegram_payment_charge_id,
+            payment.invoice_payload,
+            payment.total_amount,
+            exc,
+            exc_info=True,
+        )
+        await message.answer(
+            "Telegram подтвердил оплату, но возникла временная ошибка при записи подписки. "
+            "Не переживайте — администраторы уже получили уведомление с номером платежа. Можете также написать в /paysupport."
+        )
+        await notify_admins(
+            bot,
+            f"🚨 <b>СБОЙ ЗАЧИСЛЕНИЯ ОПЛАЧЕННОГО STARS-ПЛАТЕЖА</b>\n"
+            f"ID: <code>{message.from_user.id}</code>\n"
+            f"Сумма: <b>{payment.total_amount} ⭐</b>\n"
+            f"Charge: <code>{html.escape(payment.telegram_payment_charge_id)}</code>\n"
+            f"Payload: <code>{html.escape(payment.invoice_payload)}</code>\n"
+            f"Ошибка: <code>{html.escape(type(exc).__name__)}: {html.escape(str(exc)[:200])}</code>",
+            message.from_user.id,
+        )
+        return
     # The transaction is committed before any notification; re-delivery cannot add days twice.
     if not order["applied"]:
         await message.answer("Этот платёж уже обработан. Текущая подписка доступна в /profile; вопросы — /paysupport.")
@@ -297,8 +324,8 @@ async def payment_support(event, state: FSMContext):
     await state.update_data(
         payment_support=True,
         force_new=True,
-        ticket_topic="payment",
-        ticket_priority="high",
+        new_topic="payment",
+        new_priority="urgent",
     )
     back_cb = "open_subscription_menu" if isinstance(event, CallbackQuery) else "support_cancel"
     back_label = "« Назад к тарифам" if isinstance(event, CallbackQuery) else "Отмена"

@@ -6,7 +6,7 @@ from aiogram import Bot, Router, F
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import CommandStart, Command
 from aiogram.enums import ChatMemberStatus, ChatType
-from aiogram.types import CallbackQuery, ChatMemberUpdated, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import CallbackQuery, ChatMemberUpdated, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 
 import config
@@ -179,7 +179,7 @@ async def cmd_start(event, state: FSMContext):
     if not isinstance(event, CallbackQuery):
         # /start ref_<code>: only a user the bot has never seen is bound to the link's owner.
         try:
-            bound = await referrals.bind_from_start(user.id, user.username, first_name, event.text)
+            bound = await referrals.bind_from_start(user.id, user.username, first_name, getattr(event, "text", None))
         except Exception:
             logger.exception("Referral binding failed: user=%s", user.id)
             bound = None
@@ -247,6 +247,7 @@ async def cmd_help(event):
             f"Пробный период — {radars_word(config.TRIAL_RADARS)} на {config.TRIAL_TEXT} за подписку на канал\n\n"
             f"{ui.e('time')} <b>Когда приходит лот</b>\n"
             "<blockquote expandable>Бот проверяет ссылку с частотой вашего тарифа и присылает лот сразу, как найдёт. "
+            "Если одну и ту же ссылку отслеживают пользователи с разными тарифами, более медленный тариф получает лот с задержкой до своего интервала (честная скорость 20/30/40 с). "
             "Авито сначала проверяет объявление на модерации, поэтому в лоте может стоять «3 минуты назад» — "
             "это время публикации, а не появления в поиске. При сбоях на Авито или в сети бывает дольше. "
             "Лоты старше лимита радара не приходят, по умолчанию 5 минут.</blockquote>"
@@ -275,6 +276,7 @@ async def cmd_help(event):
         f"{plan_summary('pro')}\n\n"
         f"{ui.e('time')} <b>4. Когда приходит лот</b>\n"
         "Бот проверяет ссылку с частотой вашего тарифа и присылает лот, как только найдёт его. "
+        "Если одну ссылку мониторят несколько человек на разных тарифах, более медленный тариф получает уведомление с задержкой до своего интервала (честная разница 20/30/40 с). "
         "Новое объявление Авито сначала проверяет на модерации и только потом показывает в поиске. "
         "Бот пришлёт лот сразу, как только тот пройдёт модерацию. При этом в лоте может стоять время "
         "«3 минуты назад» или больше: Авито считает его от публикации, а не от появления в поиске. "
@@ -435,11 +437,15 @@ async def cb_activate_trial(call: CallbackQuery):
         await call.answer(res["message"], show_alert=True)
         return
     until = database.format_subscription_date(res.get("until"))
+    pending_url = trial_gate.pop_pending_url(call.from_user.id)
+    pending_hint = (
+        f"\n\nВы прислали ссылку:\n<code>{html.escape(pending_url[:300])}</code>\nСкопируйте и отправьте её сюда — первый радар запустится сразу."
+        if pending_url else "\nПришлите ссылку на поиск Авито, и первый радар заработает."
+    )
     text = (
         f"{ui.e('trial')} <b>Пробный период включён</b>\n\n"
         f"Действует до {until}: {radars_word(config.TRIAL_RADARS)}, остальное как на тарифе «Полный», "
-        f"проверка раз в {config.plan_interval('pro')} с.\n"
-        "Пришлите ссылку на поиск Авито, и первый радар заработает."
+        f"проверка раз в {config.plan_interval('pro')} с.{pending_hint}"
     )
     await ui.show(call, text, ui.kb(
         [ui.btn("Добавить радар", "radar", callback_data="add_search_prompt", style="primary")],
@@ -691,8 +697,31 @@ async def cb_support_stub(call: CallbackQuery):
 
 # ── Чёрный список продавцов (Бан в 1 клик) ─────────────────────────────
 
+BLACKLIST_PER_PAGE = 12
+
+
+@router.callback_query(F.data.in_({"page_noop", "noop"}))
+async def cb_page_noop(call: CallbackQuery):
+    await call.answer()
+
+
+@router.message(Command("cancel"))
+@router.message(F.text.in_(ui.CANCEL_TEXTS))
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        f"{ui.e('cancel')} <b>Ввод отменён.</b>",
+        reply_markup=ui.kb([ui.home_btn()]),
+        parse_mode="HTML",
+    )
+
+
 @router.callback_query(F.data == "manage_blacklist")
-async def cb_manage_blacklist(call: CallbackQuery):
+@router.callback_query(F.data.startswith("manage_blacklist:"))
+async def cb_manage_blacklist(call: CallbackQuery, page: Optional[int] = None):
+    if page is None:
+        parts = (call.data or "").split(":")
+        page = int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else 0
     blocked = await database.get_user_blocked_sellers_list(call.from_user.id)
     back_row = [ui.btn("« Профиль", callback_data="refresh_profile"), ui.home_btn()]
     if not blocked:
@@ -702,27 +731,35 @@ async def cb_manage_blacklist(call: CallbackQuery):
         )
         await ui.show(call, text, ui.kb(back_row))
         return
+    total_pages = max(1, (len(blocked) + BLACKLIST_PER_PAGE - 1) // BLACKLIST_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * BLACKLIST_PER_PAGE
+    slice_rows = blocked[start:start + BLACKLIST_PER_PAGE]
+    page_info = f" · стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
     text = (
-        f"{ui.e('ban')} <b>Чёрный список</b> · {len(blocked)}\n\n"
+        f"{ui.e('ban')} <b>Чёрный список</b> · {len(blocked)}{page_info}\n\n"
         "Объявления этих продавцов не приходят. Нажмите на продавца, чтобы вернуть его."
     )
-    if len(blocked) > 12:
-        text += f"\n<i>Показаны первые 12 из {len(blocked)}.</i>"
     rows = [
         [ui.btn(b["seller_name"][:30] if (ui.clean() and ui.custom_id("cancel")) else f"✖ {b['seller_name'][:30]}",
-                "cancel", callback_data=f"unban_seller:{b['id']}")]
-        for b in blocked[:12]
+                "cancel", callback_data=f"unban_seller:{b['id']}:{page}")]
+        for b in slice_rows
     ]
+    nav = ui.page_nav(page, total_pages, "manage_blacklist:{page}")
+    if nav:
+        rows.append(nav)
     rows.append(back_row)
     await ui.show(call, text, ui.kb(*rows))
 
 
 @router.callback_query(F.data.startswith("unban_seller:"))
 async def cb_unban_seller(call: CallbackQuery):
-    block_id = int(call.data.split(":")[1])
+    parts = call.data.split(":")
+    block_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else 0
     await database.remove_blocked_seller_by_id(call.from_user.id, block_id)
     await call.answer("Продавец убран из чёрного списка")
-    await cb_manage_blacklist(call)
+    await cb_manage_blacklist(call, page=page)
 
 
 @router.callback_query(F.data.startswith("ban_seller:"))

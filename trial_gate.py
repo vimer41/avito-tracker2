@@ -20,6 +20,31 @@ logger = logging.getLogger(__name__)
 SUBSCRIBED_STATUSES = (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER)
 ALERT_INTERVAL = 3600
 _alerted_at = 0.0
+PENDING_URLS_MAX = 1000
+PENDING_URLS_TTL = 3600.0
+_PENDING_URLS: dict[int, tuple[str, float]] = {}
+
+
+def remember_pending_url(user_id: int, url_text: str) -> None:
+    """Remember a user's Avito link sent right before trial activation so they do not lose it."""
+    now = time.monotonic()
+    if len(_PENDING_URLS) >= PENDING_URLS_MAX:
+        cutoff = now - PENDING_URLS_TTL
+        for uid in [k for k, (_, ts) in _PENDING_URLS.items() if ts < cutoff]:
+            _PENDING_URLS.pop(uid, None)
+        if len(_PENDING_URLS) >= PENDING_URLS_MAX:
+            _PENDING_URLS.pop(next(iter(_PENDING_URLS)), None)
+    _PENDING_URLS[int(user_id)] = (url_text, now)
+
+
+def pop_pending_url(user_id: int) -> str | None:
+    item = _PENDING_URLS.pop(int(user_id), None)
+    if item is None:
+        return None
+    url_text, saved_at = item
+    if time.monotonic() - saved_at > PENDING_URLS_TTL:
+        return None
+    return url_text
 
 
 def offer() -> tuple[str, InlineKeyboardMarkup]:

@@ -173,16 +173,20 @@ async def create_link(owner_id: int, admin_id: int, days: Optional[int], percent
 async def extend_link(link_id: int, days: Optional[int]) -> dict:
     """Turns the link on for `days` more (from its end if it is still on, else from now); None = no end.
     Works for an expired or switched-off link too: the code and everyone bound to it stay the same."""
-    link = await get_link(link_id)
-    if not link:
-        raise ReferralError("Ссылка не найдена.")
-    if days:
-        start = link["expires_at"] if is_active(link) and link.get("expires_at") else now_sql()
-        base = datetime.strptime(str(start)[:19], "%Y-%m-%d %H:%M:%S")
-        expires = (base + timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
-    else:
-        expires = None
     async with database.writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT * FROM ref_links WHERE id = ?", (int(link_id),)) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            await db.commit()
+            raise ReferralError("Ссылка не найдена.")
+        link = dict(row)
+        if days:
+            start = link["expires_at"] if is_active(link) and link.get("expires_at") else now_sql()
+            base = datetime.strptime(str(start)[:19], "%Y-%m-%d %H:%M:%S")
+            expires = (base + timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            expires = None
         await db.execute("UPDATE ref_links SET expires_at = ?, revoked_at = NULL, revoked_by = NULL WHERE id = ?",
                          (expires, int(link_id)))
         await db.commit()
@@ -211,9 +215,11 @@ async def set_percent(link_id: int, percent: int) -> dict:
 async def bind_from_start(user_id: int, username: Optional[str], first_name: Optional[str],
                           text: Optional[str]) -> Optional[dict]:
     """Creates a NEW user bound to the link from `/start ref_<code>`. Returns the link when bound.
-    An existing user, the owner himself, an admin, an unknown, expired or switched-off link → None."""
+    An existing user, a purged user, the owner himself, an admin, an unknown, expired or switched-off link → None."""
     code = parse_start_code(text)
     if not code or config.is_admin(user_id):
+        return None
+    if await database.is_user_purged(user_id):
         return None
     link = await get_link_by_code(code)
     if not is_active(link) or int(link["owner_id"]) == int(user_id):
@@ -289,7 +295,7 @@ async def accrue_in_transaction(db, source: str, order_id: int, buyer_id: int, p
                 "order_id": int(order_id), "amount": amount, "currency": currency, "reward_kop": reward_kop,
                 "available_at": available_at}
     except Exception:
-        logger.exception("Referral reward not written: source=%s order=%s", source, order_id)
+        logger.critical("Referral reward not written: source=%s order=%s buyer=%s", source, order_id, buyer_id, exc_info=True)
         return None
 
 
@@ -354,10 +360,36 @@ async def summary(owner_id: int) -> dict[str, Any]:
     }
 
 
-async def record_payout(owner_id: int, amount_kop: int, admin_id: int, note: str = "") -> dict:
+async def record_payout(
+    owner_id: int,
+    amount_kop: int,
+    admin_id: int,
+    note: str = "",
+    *,
+    check_balance: bool = True,
+) -> dict:
     if int(amount_kop) <= 0:
         raise ReferralError("Сумма должна быть больше нуля.")
     async with database.writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        if check_balance:
+            now = now_sql()
+            async with db.execute(_REWARDS_SQL + " WHERE r.owner_id = ?", (int(owner_id),)) as cur:
+                reward_rows = [dict(r) for r in await cur.fetchall()]
+            ready_kop = 0
+            for r in reward_rows:
+                state, kop = reward_state(r, now)
+                if state == STATE_READY:
+                    ready_kop += kop
+            async with db.execute(
+                "SELECT COALESCE(SUM(amount_kop), 0) FROM ref_payouts WHERE owner_id = ?",
+                (int(owner_id),),
+            ) as cur:
+                paid_out_kop = int((await cur.fetchone())[0] or 0)
+            available_kop = max(0, ready_kop - paid_out_kop)
+            if int(amount_kop) > available_kop:
+                await db.rollback()
+                raise ReferralError(f"Сумма превышает доступный к выводу остаток ({fmt_rub(available_kop)}).")
         cursor = await db.execute("INSERT INTO ref_payouts (owner_id, amount_kop, admin_id, note) VALUES (?, ?, ?, ?)",
                                   (int(owner_id), int(amount_kop), int(admin_id), str(note or "")[:200]))
         payout_id = cursor.lastrowid
@@ -405,7 +437,11 @@ async def notify_reward(bot, reward: Optional[dict]) -> None:
         logger.info("Referral reward notice failed: owner=%s error=%s", reward["owner_id"], type(exc).__name__)
 
 
-def owner_name(row: dict) -> str:
+def owner_name_plain(row: dict) -> str:
     if row.get("username"):
-        return "@" + html.escape(row["username"])
-    return html.escape(row.get("first_name") or str(row.get("owner_id")))
+        return "@" + str(row["username"])
+    return str(row.get("first_name") or row.get("owner_id"))
+
+
+def owner_name(row: dict) -> str:
+    return html.escape(owner_name_plain(row))

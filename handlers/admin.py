@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 import html
 import json
 import logging
@@ -37,6 +38,14 @@ class AdminStates(StatesGroup):
 
 _LAST_USER_FILTER: dict[int, str] = {}
 _LAST_SEARCH_QUERY: dict[int, str] = {}
+
+
+@router.callback_query(F.data == "admin_noop")
+async def cb_admin_noop(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    await call.answer()
 
 
 @router.callback_query(F.data == "admin_probe")
@@ -103,7 +112,7 @@ async def cb_admin_approve(call: CallbackQuery, bot: Bot):
     else:
         await call.message.edit_text(
             f"✅ <b>Доступ успешно одобрен!</b>\n\n"
-            f"Пользователь: <b>{html.escape(user.get('first_name') or '')}</b> ({username_str}) теперь имеет полный доступ к мониторингу.",
+            f"Пользователь: <b>{html.escape(user.get('first_name') or '')}</b> ({html.escape(username_str)}) теперь имеет полный доступ к мониторингу.",
             parse_mode="HTML"
         )
         await call.answer("Доступ одобрен")
@@ -721,12 +730,18 @@ async def cb_admin_reset_trial_prompt(call: CallbackQuery):
         return
     parts = call.data.split(":")
     target_id, page = int(parts[1]), int(parts[2])
+    has_active = await database.is_user_allowed(target_id)
+    warn_line = (
+        "\n\n⚠️ <b>Внимание:</b> текущая активная подписка/VIP будет заменена на пробный период!"
+        if has_active else ""
+    )
     text = (
         f"🎁 <b>Активация триала ({config.TRIAL_TEXT})</b>\n\n"
         f"Пользователь: <code>{target_id}</code>\n\n"
         f"Пользователю будет выдан бесплатный пробный доступ на <b>{config.TRIAL_TEXT}</b> "
         f"({config.TRIAL_RADARS} радар, проверка раз в {config.plan_interval('pro')} с, как на «Полном»). "
         "Пользователь получит мгновенное уведомление в чат."
+        f"{warn_line}"
     )
     kb = ui.kb(
         [ui.btn(f"Активировать триал {config.TRIAL_HOURS} ч", "trial", callback_data=f"admin_confirm_trial:{target_id}:{page}", style="success")],
@@ -1030,10 +1045,10 @@ def parse_item_id(text: str) -> str | None:
     from urllib.parse import urlsplit
 
     raw = (text or "").strip()
-    if raw.isdigit() and len(raw) >= 5:
+    if raw.isdigit() and 5 <= len(raw) <= 24:
         return raw
     path = urlsplit(raw if "://" in raw else f"https://{raw}").path
-    found = re.findall(r"(\d{6,})", path)
+    found = re.findall(r"(\d{6,24})", path)
     return found[-1] if found else None
 
 
@@ -1920,7 +1935,8 @@ async def _filtered_users(user_filter: str):
     all_users = await database.get_all_users()
     ever_ids = await database.get_ever_subscribed_user_ids()
     paid_ids = await database.get_paid_user_ids()
-    allowed = {u["user_id"]: await database.is_user_allowed(u["user_id"]) for u in all_users}
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    allowed = {u["user_id"]: database.is_user_row_allowed(u, now_utc) for u in all_users}
     keep = {
         "ever": lambda uid: uid in ever_ids,
         "paid": lambda uid: uid in paid_ids,
@@ -1969,19 +1985,30 @@ async def msg_admin_broadcast(message: Message, state: FSMContext):
 
     if await route_menu_text(message, state):
         return
+    plain_text = (message.text or "").strip()
+    if not plain_text:
+        await message.answer("Поддерживаются текстовые сообщения до 4000 символов.")
+        return
+    if len(plain_text) > 4000:
+        await message.answer(
+            f"Сообщение слишком длинное ({len(plain_text)} символов). Сократите до 4000 символов, чтобы не повредить форматирование."
+        )
+        return
     text = (message.html_text or "").strip()
-    if not text:
-        await message.answer("Нужен текст. Пришлите сообщение словами.")
+    if len(text) > 4000:
+        await message.answer(
+            "Текст с форматированием превысил лимит Telegram (4000 символов). Сократите сообщение или уберите часть ссылок/тегов."
+        )
         return
     data = await state.get_data()
     user_filter = data.get("bc_filter") or "all"
     users = [u for u in (await _filtered_users(user_filter))[0] if not config.is_admin(u["user_id"])]
-    await state.update_data(bc_text=text[:4000])
+    await state.update_data(bc_text=text)
     kb = ui.kb(
         [ui.btn(f"Отправить {len(users)} чел.", "mail", callback_data="admin_bc_go", style="success")],
         [ui.btn("Отмена", "cancel", callback_data=f"admin_page:0:{user_filter}")],
     )
-    await message.answer(text[:4000], parse_mode="HTML", disable_web_page_preview=True)
+    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
     await message.answer(
         f"☝️ Так увидят сообщение <b>{len(users)}</b> чел. ({USER_FILTERS[user_filter]}). Отправить?",
         reply_markup=kb, parse_mode="HTML",
@@ -1992,6 +2019,9 @@ async def msg_admin_broadcast(message: Message, state: FSMContext):
 async def cb_admin_broadcast_go(call: CallbackQuery, state: FSMContext, bot: Bot):
     if not config.is_admin(call.from_user.id):
         await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    if BROADCAST_TASKS:
+        await call.answer("Другая рассылка ещё выполняется.", show_alert=True)
         return
     data = await state.get_data()
     await state.clear()
@@ -2016,6 +2046,9 @@ async def _run_broadcast(bot: Bot, admin_id: int, user_ids: list[int], text: str
     for user_id in user_ids:
         for _ in range(3):
             try:
+                if not config.TESTING:
+                    from scheduler import pace_global_bot_api
+                    await pace_global_bot_api()
                 await bot.send_message(user_id, text, parse_mode="HTML", disable_web_page_preview=True)
                 sent += 1
                 break
@@ -2062,8 +2095,12 @@ async def cb_admin_money(event):
     def period(key: str, title: str) -> str:
         orders, stars, payers = revenue[key]
         rub_orders, rubles, rub_payers = revenue_rub[key]
-        return (f"{title}: <b>{rubles} ₽</b> ({rub_orders} опл.) · <b>{stars} ⭐</b> ({orders} опл.) · "
-                f"платили {payers + rub_payers} чел.")
+        payer_text = (
+            f"платили {stats['total_payers']} чел."
+            if key == "all" and "total_payers" in stats
+            else f"чел.: {rub_payers} ₽ / {payers} ⭐"
+        )
+        return f"{title}: <b>{rubles} ₽</b> ({rub_orders} опл.) · <b>{stars} ⭐</b> ({orders} опл.) · {payer_text}"
 
     plans = ", ".join(
         f"«{config.plan_title(p)}» {n} шт. на {s} {'₽' if kind == 'rub' else '⭐'}" for p, kind, n, s in stats["by_plan"]
@@ -2232,20 +2269,38 @@ async def cmd_admin_backup(event):
     else:
         message = event
 
+    import gzip
     import os
-    from aiogram.types import BufferedInputFile
+    import shutil
+    from aiogram.types import FSInputFile
 
-    backup_path = database.create_database_backup_file()
+    backup_path = await asyncio.to_thread(database.create_database_backup_file)
     if not backup_path or not os.path.exists(backup_path):
         await message.answer("❌ Не удалось создать резервную копию базы данных.")
         return
 
+    send_path = backup_path
     try:
-        with open(backup_path, "rb") as f:
-            data = f.read()
+        raw_size = os.path.getsize(backup_path)
+        if raw_size > 48 * 1024 * 1024:
+            gz_path = f"{backup_path}.gz"
 
-        filename = os.path.basename(backup_path)
-        file_to_send = BufferedInputFile(data, filename=filename)
+            def _compress() -> str:
+                with open(backup_path, "rb") as src, gzip.open(gz_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                return gz_path
+
+            send_path = await asyncio.to_thread(_compress)
+
+        send_size = os.path.getsize(send_path)
+        if send_size > 49 * 1024 * 1024:
+            await message.answer(
+                f"❌ Размер резервной копии после сжатия ({send_size / (1024 * 1024):.1f} MB) превышает лимит Telegram (50 MB)."
+            )
+            return
+
+        filename = os.path.basename(send_path)
+        file_to_send = FSInputFile(send_path, filename=filename)
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -2258,7 +2313,7 @@ async def cmd_admin_backup(event):
             document=file_to_send,
             caption=(
                 "💾 <b>Резервная копия базы данных SQLite (WAL-безопасная)</b>\n\n"
-                f"📦 Размер: <b>{len(data):,} байт</b> ({len(data) / 1024:.1f} KB)\n"
+                f"📦 Размер: <b>{send_size:,} байт</b> ({send_size / 1024:.1f} KB)\n"
                 "Файл полностью консистентен и готов к восстановлению или анализу."
             ),
             reply_markup=kb,
@@ -2266,11 +2321,12 @@ async def cmd_admin_backup(event):
         )
         logger.info(f"👑 [АДМИН] Администратор ID:{user_id} выгрузил бэкап базы данных ({filename})")
     finally:
-        if os.path.exists(backup_path):
-            try:
-                os.remove(backup_path)
-            except Exception:
-                pass
+        for path in {backup_path, send_path}:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
 
 # ── Выгрузка системных логов ──────────────────────────────────────────
@@ -2552,6 +2608,23 @@ async def _race_watch(message: Message, proc, log_path) -> None:
         )
 
 
+async def shutdown_admin_tasks() -> None:
+    """Cancel background admin broadcasts and terminate running race benchmarks cleanly."""
+    for task in list(BROADCAST_TASKS):
+        task.cancel()
+    if BROADCAST_TASKS:
+        await asyncio.gather(*list(BROADCAST_TASKS), return_exceptions=True)
+    race_task = _RACE.get("task")
+    if race_task is not None:
+        race_task.cancel()
+    proc = _RACE.get("proc")
+    if proc is not None and proc.returncode is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
 @router.message(Command("race"))
 async def cmd_admin_race(message: Message):
     """/race [минуты, по умолчанию 5, до 30] [часть адреса прокси] — сайт против мобильного API через прокси бота; /race stop — остановить."""
@@ -2676,79 +2749,95 @@ async def cb_admin_log_get(call: CallbackQuery):
         await _send_load_report(call.message, 60)
         return
 
-    import io
     import os
+    import tempfile
     import zipfile
     from datetime import datetime
     from pathlib import Path
-    from aiogram.types import BufferedInputFile
+    from aiogram.types import FSInputFile
 
     base_dir = config.BASE_DIR
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # 1. Выгрузка ВСЕХ логов единым ZIP-архивом
     if target == "all_zip":
-        def build_zip() -> tuple[bytes, int, int, int]:
-            zip_buffer = io.BytesIO()
+        def build_zip_file() -> tuple[str, int, int, int]:
+            fd, tmp_zip = tempfile.mkstemp(prefix="avito_radar_logs_", suffix=".zip")
+            os.close(fd)
             total, count, skipped_files = 0, 0, 0
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                # Общий bot.log
-                bot_log = base_dir / "bot.log"
-                if bot_log.exists() and bot_log.is_file():
-                    sz = bot_log.stat().st_size
-                    if sz > 0:
-                        zf.write(bot_log, arcname="bot.log")
-                        total += sz
-                        count += 1
+            try:
+                with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                    # Общий bot.log
+                    bot_log = base_dir / "bot.log"
+                    if bot_log.exists() and bot_log.is_file():
+                        sz = bot_log.stat().st_size
+                        if sz > 0:
+                            zf.write(bot_log, arcname="bot.log")
+                            total += sz
+                            count += 1
 
-                # Файлы из папки logs/: свежие первыми, за ZIP_LOG_HOURS и не больше ZIP_LOG_MAX_BYTES —
-                # архив должен пройти в Telegram; вся история (30 дней) остаётся на сервере.
-                logs_dir = base_dir / "logs"
-                if logs_dir.exists() and logs_dir.is_dir():
-                    cutoff = datetime.now().timestamp() - ZIP_LOG_HOURS * 3600
-                    candidates = sorted(
-                        (p for p in logs_dir.iterdir() if p.is_file() and p.stat().st_size > 0),
-                        key=lambda p: p.stat().st_mtime, reverse=True,
-                    )
-                    for p in candidates:
-                        sz = p.stat().st_size
-                        if p.stat().st_mtime < cutoff or total + sz > ZIP_LOG_MAX_BYTES:
-                            skipped_files += 1
-                            continue
-                        # .gz is already packed: stored as is instead of deflating it again.
-                        zf.write(p, arcname=f"logs/{p.name}",
-                                 compress_type=zipfile.ZIP_STORED if p.suffix == ".gz" else zipfile.ZIP_DEFLATED)
-                        total += sz
-                        count += 1
-            return zip_buffer.getvalue(), total, count, skipped_files
+                    # Файлы из папки logs/: свежие первыми, за ZIP_LOG_HOURS и не больше ZIP_LOG_MAX_BYTES —
+                    # архив должен пройти в Telegram; вся история (30 дней) остаётся на сервере.
+                    logs_dir = base_dir / "logs"
+                    if logs_dir.exists() and logs_dir.is_dir():
+                        cutoff = datetime.now().timestamp() - ZIP_LOG_HOURS * 3600
+                        candidates = sorted(
+                            (p for p in logs_dir.iterdir() if p.is_file() and p.stat().st_size > 0),
+                            key=lambda p: p.stat().st_mtime, reverse=True,
+                        )
+                        for p in candidates:
+                            sz = p.stat().st_size
+                            if p.stat().st_mtime < cutoff or total + sz > ZIP_LOG_MAX_BYTES:
+                                skipped_files += 1
+                                continue
+                            # .gz is already packed: stored as is instead of deflating it again.
+                            zf.write(p, arcname=f"logs/{p.name}",
+                                     compress_type=zipfile.ZIP_STORED if p.suffix == ".gz" else zipfile.ZIP_DEFLATED)
+                            total += sz
+                            count += 1
+            except Exception:
+                try:
+                    os.remove(tmp_zip)
+                except OSError:
+                    pass
+                raise
+            return tmp_zip, total, count, skipped_files
 
         # Off the event loop: packing tens of megabytes takes seconds.
-        zip_bytes, total_raw_size, files_count, skipped = await asyncio.to_thread(build_zip)
-        if files_count == 0:
-            await call.message.answer("⚠️ Файлы логов в системе пока отсутствуют или пусты.")
+        tmp_zip_path, total_raw_size, files_count, skipped = await asyncio.to_thread(build_zip_file)
+        try:
+            if files_count == 0:
+                await call.message.answer("⚠️ Файлы логов в системе пока отсутствуют или пусты.")
+                return
+
+            zip_size = os.path.getsize(tmp_zip_path)
+            zip_filename = f"avito_radar_logs_{timestamp}.zip"
+            file_to_send = FSInputFile(tmp_zip_path, filename=zip_filename)
+
+            compression_pct = round((1 - zip_size / max(total_raw_size, 1)) * 100)
+
+            await call.message.answer_document(
+                document=file_to_send,
+                caption=(
+                    f"📦 <b>Архив логов за {ZIP_LOG_HOURS} ч</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🗂 Файлов в архиве: <b>{files_count}</b>\n"
+                    f"📊 Исходный размер: <b>{total_raw_size / 1024:.1f} KB</b>\n"
+                    f"🗜 Размер архива: <b>{zip_size / 1024:.1f} KB</b> (сжатие {compression_pct}%)\n"
+                    f"📅 Дата выгрузки: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+                    + (f"\n🕰 Не вошли {skipped} старых файлов: история за {logger_setup.LOG_KEEP_DAYS} дн. "
+                       "лежит на сервере в logs/" if skipped else "")
+                ),
+                parse_mode="HTML"
+            )
+            logger.info(f"👑 [АДМИН] Администратор ID:{user_id} выгрузил полный ZIP-архив логов ({zip_filename})")
             return
-
-        zip_filename = f"avito_radar_logs_{timestamp}.zip"
-        file_to_send = BufferedInputFile(zip_bytes, filename=zip_filename)
-
-        compression_pct = round((1 - len(zip_bytes) / max(total_raw_size, 1)) * 100)
-
-        await call.message.answer_document(
-            document=file_to_send,
-            caption=(
-                f"📦 <b>Архив логов за {ZIP_LOG_HOURS} ч</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"🗂 Файлов в архиве: <b>{files_count}</b>\n"
-                f"📊 Исходный размер: <b>{total_raw_size / 1024:.1f} KB</b>\n"
-                f"🗜 Размер архива: <b>{len(zip_bytes) / 1024:.1f} KB</b> (сжатие {compression_pct}%)\n"
-                f"📅 Дата выгрузки: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
-                + (f"\n🕰 Не вошли {skipped} старых файлов: история за {logger_setup.LOG_KEEP_DAYS} дн. "
-                   "лежит на сервере в logs/" if skipped else "")
-            ),
-            parse_mode="HTML"
-        )
-        logger.info(f"👑 [АДМИН] Администратор ID:{user_id} выгрузил полный ZIP-архив логов ({zip_filename})")
-        return
+        finally:
+            if os.path.exists(tmp_zip_path):
+                try:
+                    os.remove(tmp_zip_path)
+                except OSError:
+                    pass
 
     # 2. Выгрузка конкретного файла логов
     log_map = {
@@ -2769,38 +2858,55 @@ async def cb_admin_log_get(call: CallbackQuery):
         return
 
     raw_size = log_path.stat().st_size
+    tmp_single_zip: str | None = None
 
-    # Если файл больше 40 МБ, сжимаем его в ZIP во избежание ограничений Telegram (50 MB)
-    if raw_size > 40 * 1024 * 1024:
-        zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(log_path, arcname=log_path.name)
-        zip_buf.seek(0)
-        file_bytes = zip_buf.getvalue()
-        send_name = f"{log_path.stem}_{timestamp}.zip"
-        file_to_send = BufferedInputFile(file_bytes, filename=send_name)
-        caption = (
-            f"{desc}\n\n"
-            f"📦 <i>Файл сжат в ZIP из-за большого размера (>40 МБ)</i>\n"
-            f"📊 Исходный: <b>{raw_size / (1024*1024):.1f} MB</b> | Архив: <b>{len(file_bytes) / (1024*1024):.1f} MB</b>"
-        )
-    else:
-        with open(log_path, "rb") as f:
-            file_bytes = f.read()
-        send_name = f"{log_path.stem}_{timestamp}{log_path.suffix}"
-        file_to_send = BufferedInputFile(file_bytes, filename=send_name)
-        caption = (
-            f"{desc}\n\n"
-            f"📦 Размер: <b>{raw_size / 1024:.1f} KB</b>\n"
-            f"📅 Выгружен: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
-        )
+    try:
+        # Если файл больше 40 МБ, сжимаем его в ZIP в фоновом потоке во избежание ограничений Telegram (50 MB)
+        if raw_size > 40 * 1024 * 1024:
+            def _pack_single() -> str:
+                fd, tmp_path = tempfile.mkstemp(prefix="avito_log_", suffix=".zip")
+                os.close(fd)
+                try:
+                    with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                        zf.write(log_path, arcname=log_path.name)
+                except Exception:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    raise
+                return tmp_path
 
-    await call.message.answer_document(
-        document=file_to_send,
-        caption=caption,
-        parse_mode="HTML"
-    )
-    logger.info(f"👑 [АДМИН] Администратор ID:{user_id} выгрузил лог {send_name}")
+            tmp_single_zip = await asyncio.to_thread(_pack_single)
+            zip_size = os.path.getsize(tmp_single_zip)
+            send_name = f"{log_path.stem}_{timestamp}.zip"
+            file_to_send = FSInputFile(tmp_single_zip, filename=send_name)
+            caption = (
+                f"{desc}\n\n"
+                f"📦 <i>Файл сжат в ZIP из-за большого размера (>40 МБ)</i>\n"
+                f"📊 Исходный: <b>{raw_size / (1024*1024):.1f} MB</b> | Архив: <b>{zip_size / (1024*1024):.1f} MB</b>"
+            )
+        else:
+            send_name = f"{log_path.stem}_{timestamp}{log_path.suffix}"
+            file_to_send = FSInputFile(log_path, filename=send_name)
+            caption = (
+                f"{desc}\n\n"
+                f"📦 Размер: <b>{raw_size / 1024:.1f} KB</b>\n"
+                f"📅 Выгружен: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+            )
+
+        await call.message.answer_document(
+            document=file_to_send,
+            caption=caption,
+            parse_mode="HTML"
+        )
+        logger.info(f"👑 [АДМИН] Администратор ID:{user_id} выгрузил лог {send_name}")
+    finally:
+        if tmp_single_zip and os.path.exists(tmp_single_zip):
+            try:
+                os.remove(tmp_single_zip)
+            except OSError:
+                pass
 
 
 # ── Поиск пользователей администратором ───────────────────────────────
@@ -2897,13 +3003,14 @@ async def _render_user_search_page(query: str, page: int = 0) -> tuple[str | Non
         f"Запрос: <code>{html.escape(query)}</code>\n\n"
     )
     rows = []
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     for idx, u in enumerate(page_users, start=start_idx + 1):
         u_id = u["user_id"]
         uname = f"@{u['username']}" if u.get("username") else f"ID: {u_id}"
         fname_raw = u.get("first_name") or "Без имени"
         fname = html.escape(fname_raw)
         plan = config.plan_title(u.get("tariff_plan"))
-        has_access = await database.is_user_allowed(u_id)
+        has_access = database.is_user_row_allowed(u, now_utc)
         status_icon = "🟢" if has_access else "🔴"
         text += f"{idx}. {status_icon} <b>{fname}</b> ({html.escape(uname)}) — <i>[{plan}]</i> [ID: <code>{u_id}</code>]\n"
         rows.append([InlineKeyboardButton(

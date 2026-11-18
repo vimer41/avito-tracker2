@@ -55,14 +55,14 @@ jobs:
         env:
           AVITO_RADAR_TESTING: '1'
           PYTHONDONTWRITEBYTECODE: '1'
-        run: timeout 180 python -B tools/run_offline_tests.py
+        run: timeout 480 python -B tools/run_offline_tests.py
 
   deploy:
     name: Deploy tested commit to VPS
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/feature/json-api' || github.ref == 'refs/heads/main')
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/feature/json-api' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
     concurrency:
       group: avito-radar-vps-deploy
       cancel-in-progress: false

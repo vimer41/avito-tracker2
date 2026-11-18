@@ -166,7 +166,7 @@ SMART_DIRECT_BLOCK_RATIO = positive_float_setting("SMART_DIRECT_BLOCK_RATIO", "0
 SMART_HOLD_SECONDS = positive_float_setting("SMART_HOLD_SECONDS", "600")
 # A reserve proxy is chosen by its record over this many last answers, however old they are.
 PROXY_QUALITY_WINDOW = positive_int_setting("PROXY_QUALITY_WINDOW", "50")
-CHALLENGE_WORKERS = positive_int_setting("CHALLENGE_WORKERS", "1")
+CHALLENGE_WORKERS = positive_int_setting("CHALLENGE_WORKERS", "3")
 COOKIE_SAVE_INTERVAL = non_negative_float_setting("COOKIE_SAVE_INTERVAL", "30")
 
 AVITO_CONNECT_TIMEOUT = positive_float_setting("AVITO_CONNECT_TIMEOUT", "3.0")
@@ -178,7 +178,7 @@ AVITO_MAX_REQUESTS_PER_SCAN = positive_int_setting("AVITO_MAX_REQUESTS_PER_SCAN"
 AVITO_MAX_PAGES_PER_SCAN = min(5, positive_int_setting("AVITO_MAX_PAGES_PER_SCAN", "2"))
 # Cache-busting (_t) for catalog GETs: "ms" (fresh ms every request), "bucket" (rotated every AVITO_CACHE_BUST_WINDOW s), or "off".
 AVITO_CACHE_BUST_MODES = ("ms", "bucket", "off")
-AVITO_CACHE_BUST_MODE = (os.getenv("AVITO_CACHE_BUST_MODE", "ms").strip().lower() or "ms")
+AVITO_CACHE_BUST_MODE = (os.getenv("AVITO_CACHE_BUST_MODE", "off").strip().lower() or "off")
 if AVITO_CACHE_BUST_MODE not in AVITO_CACHE_BUST_MODES:
     raise ValueError(f"AVITO_CACHE_BUST_MODE должен быть одним из: {', '.join(AVITO_CACHE_BUST_MODES)}")
 AVITO_CACHE_BUST_WINDOW = non_negative_float_setting("AVITO_CACHE_BUST_WINDOW", "15")  # used by "bucket" only
@@ -188,8 +188,8 @@ AVITO_SESSION_WARMUP = os.getenv("AVITO_SESSION_WARMUP", "0" if TESTING else "1"
 AVITO_SESSION_WARMUP_GAP = non_negative_float_setting("AVITO_SESSION_WARMUP_GAP", "600")
 
 # --- Доставка и outbox ---
-# Tariffs differ only by scan interval (TARIFF_SCAN_INTERVAL): a found lot goes out at once, with no
-# per-tariff delivery delay (the old TARIFF_DELAY_* settings are gone).
+# Each URL is polled at its fastest subscriber's interval; slower plans on a shared URL wait tariff_hold
+# (tariff_interval - fastest_interval) so they do not free-ride on faster subscribers.
 
 # --- Тарифы ---
 # Internal keys stay as stored in the DB and old orders: lite = «Базовый», standart = «Средний», pro = «Полный».
@@ -403,7 +403,7 @@ SALE_PERIOD_MONTHS: tuple[int, ...] = tuple(
     m for m in (int(x) for x in os.getenv("SALE_PERIOD_MONTHS", "1").replace(" ", "").split(",") if x.isdigit())
     if m in PERIOD_MONTHS
 ) or (1,)
-PERIOD_DISCOUNT_PERCENT: dict[int, int] = {1: 0, 3: positive_int_setting("PERIOD_3M_DISCOUNT", "10")}
+PERIOD_DISCOUNT_PERCENT: dict[int, int] = {1: 0, 3: int(non_negative_float_setting("PERIOD_3M_DISCOUNT", "10"))}
 if not all(0 <= PERIOD_DISCOUNT_PERCENT[m] < 100 for m in PERIOD_MONTHS):
     raise ValueError("PERIOD_3M_DISCOUNT must be below 100")
 
@@ -460,11 +460,13 @@ if max(PRICE_RUB.values()) > PAYMENT_LIMIT_RUB:
 
 
 # Hidden checkout test: /arseniytest1ruble sells 1 hour of «Полный» for 1 ₽ through Platega.
+# Disabled for regular users by default (set RUB_TEST_ENABLED=1 to open); always open to admins.
 RUB_TEST_PLAN = "rubtest"
 RUB_TEST_PRICE = 1
 RUB_TEST_SECONDS = 3600
 RUB_TEST_GRANTS = "pro"
 RUB_TEST_COMMAND = "arseniytest1ruble"
+RUB_TEST_ENABLED = os.getenv("RUB_TEST_ENABLED", "0").strip() == "1"
 
 # Referral program (referrals.py): links are issued by an admin to one owner.
 REF_PERCENT = int(os.getenv("REF_PERCENT", "15"))
@@ -559,7 +561,7 @@ PROXY_URL = parse_proxy(RAW_PROXY)
 PROXY_URLS: list[str] = []
 
 # Значение ADMIN_IDS имеет приоритет; ADMIN_ID поддерживается для совместимости.
-raw_admin_ids = os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or "986832959,455386428"
+raw_admin_ids = os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or ("986832959,455386428" if TESTING else "")
 try:
     ADMIN_IDS = list(dict.fromkeys(int(aid.strip()) for aid in raw_admin_ids.split(",") if aid.strip()))
 except ValueError as exc:

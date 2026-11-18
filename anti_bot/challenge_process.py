@@ -331,20 +331,21 @@ def start_background() -> None:
 
 
 def shutdown() -> None:
-    """Kills idle workers; a busy one is killed by its caller's cancellation or exits with the bot."""
+    """Stops all challenge worker processes cleanly, both idle and busy."""
+    global _idle
     with _lock:
         idle = _idle
-    if idle is None:
-        return
-    taken = []
-    while True:
-        try:
-            taken.append(idle.get_nowait())
-        except queue.Empty:
-            break
-    for worker in taken:
+        workers = list(_workers)
+        _workers.clear()
+        _idle = None
+    if idle is not None:
+        while True:
+            try:
+                idle.get_nowait()
+            except queue.Empty:
+                break
+    for worker in workers:
         worker.kill("stop")
-        idle.put(worker)
 
 
 def pids() -> list[int]:

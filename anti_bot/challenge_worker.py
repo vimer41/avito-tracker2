@@ -59,6 +59,8 @@ def _task_pow(challenge_id, complexity, timeout, max_iterations):
 
 
 def _task_geetest(captcha_id, user_agent, profile):
+    if _warm_thread is not None and _warm_thread.is_alive():
+        return {"_warming": True}
     from anti_bot import geetest_solve
 
     _wait_warm()

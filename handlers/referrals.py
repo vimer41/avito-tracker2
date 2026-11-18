@@ -146,7 +146,7 @@ async def cb_ref_list(call: CallbackQuery):
     rows = []
     for link in links:
         mark = "🟢" if referrals.is_active(link) else "⚪️"
-        rows.append([ui.btn(f"{mark} {referrals.owner_name(link)} · {link['percent']}% · пришло {link['came']}",
+        rows.append([ui.btn(f"{mark} {referrals.owner_name_plain(link)} · {link['percent']}% · пришло {link['came']}",
                             callback_data=f"ref_adm_link:{link['id']}")])
     total_pages = max(1, -(-total // PAGE_SIZE))
     rows.append(ui.page_nav(page, total_pages, "ref_adm:{page}"))
@@ -324,6 +324,27 @@ async def cb_ref_pay(call: CallbackQuery, state: FSMContext):
     ), ui.kb([ui.btn("Отмена", "cancel", callback_data=f"ref_adm_link:{link_id}")]))
 
 
+_PENDING_PAYOUT_NOTES: dict[tuple[int, int, int], str] = {}
+
+
+async def _finish_payout(bot, admin_id: int, link: dict, amount: int, note: str, *, target_event) -> None:
+    await database.log_admin_action(admin_id, link["owner_id"], "ref_payout",
+                                    f"#{link['id']} {referrals.fmt_rub(amount)} {note}")
+    text, markup = await _link_card(bot, link["id"])
+    notice_prefix = f"{ui.e('ok')} Выплата {referrals.fmt_rub(amount)} записана.\n\n"
+    if isinstance(target_event, CallbackQuery):
+        await ui.show(target_event, notice_prefix + text, markup)
+    else:
+        await target_event.answer(notice_prefix + text, reply_markup=markup, parse_mode="HTML")
+    try:
+        await bot.send_message(link["owner_id"], (
+            f"{ui.e('ok')} <b>Выплата {referrals.fmt_rub(amount)} отправлена</b>\n\n"
+            "Вознаграждение по партнёрской программе. Баланс — в «Профиль» → «Партнёрская программа»."
+        ), parse_mode="HTML")
+    except Exception as exc:
+        logger.info("Referral payout notice failed: owner=%s error=%s", link["owner_id"], type(exc).__name__)
+
+
 @router.message(RefAdminStates.waiting_for_payout)
 async def msg_ref_pay(message: Message, state: FSMContext):
     if not config.is_admin(message.from_user.id):
@@ -346,19 +367,45 @@ async def msg_ref_pay(message: Message, state: FSMContext):
         await message.answer("Ссылка не найдена.")
         return
     note = parts[1] if len(parts) > 1 else ""
-    await referrals.record_payout(link["owner_id"], amount, message.from_user.id, note)
-    await database.log_admin_action(message.from_user.id, link["owner_id"], "ref_payout",
-                                    f"#{link['id']} {referrals.fmt_rub(amount)} {note}")
-    text, markup = await _link_card(message.bot, link["id"])
-    await message.answer(f"{ui.e('ok')} Выплата {referrals.fmt_rub(amount)} записана.\n\n" + text,
-                         reply_markup=markup, parse_mode="HTML")
     try:
-        await message.bot.send_message(link["owner_id"], (
-            f"{ui.e('ok')} <b>Выплата {referrals.fmt_rub(amount)} отправлена</b>\n\n"
-            "Вознаграждение по партнёрской программе. Баланс — в «Профиль» → «Партнёрская программа»."
-        ), parse_mode="HTML")
-    except Exception as exc:
-        logger.info("Referral payout notice failed: owner=%s error=%s", link["owner_id"], type(exc).__name__)
+        await referrals.record_payout(link["owner_id"], amount, message.from_user.id, note)
+    except referrals.ReferralError as exc:
+        if len(_PENDING_PAYOUT_NOTES) > 500:
+            _PENDING_PAYOUT_NOTES.clear()
+        _PENDING_PAYOUT_NOTES[(message.from_user.id, int(link["id"]), int(amount))] = note
+        await message.answer(
+            f"{ui.e('warn')} <b>{html.escape(str(exc))}</b>\n\n"
+            f"Сумма: <b>{referrals.fmt_rub(amount)}</b> · ссылка #{link['id']}.\n"
+            "Если вы перевели средства авансом, подтвердите запись выплаты в долг.",
+            reply_markup=ui.kb(
+                [ui.btn("Записать авансом", "ok", callback_data=f"ref_adm_payf:{link['id']}:{amount}", style="danger")],
+                [ui.btn("Отмена", "cancel", callback_data=f"ref_adm_link:{link['id']}")],
+            ),
+            parse_mode="HTML",
+        )
+        return
+    await _finish_payout(message.bot, message.from_user.id, link, amount, note, target_event=message)
+
+
+@router.callback_query(F.data.startswith("ref_adm_payf:"))
+async def cb_ref_pay_force(call: CallbackQuery):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
+    try:
+        _, raw_id, raw_amount = call.data.split(":", 2)
+        link_id = int(raw_id)
+        amount = int(raw_amount)
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные", show_alert=True)
+        return
+    link = await referrals.get_link(link_id)
+    if not link:
+        await call.answer("Ссылка не найдена", show_alert=True)
+        return
+    note = _PENDING_PAYOUT_NOTES.pop((call.from_user.id, link_id, amount), "")
+    await referrals.record_payout(link["owner_id"], amount, call.from_user.id, note, check_balance=False)
+    await _finish_payout(call.bot, call.from_user.id, link, amount, note, target_event=call)
 
 
 @router.callback_query(F.data == "ref_adm_rate")

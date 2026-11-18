@@ -10,18 +10,18 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramNetworkError, TelegramServerError
 from aiogram.types import BotCommand
-from aiogram.fsm.storage.memory import MemoryStorage
 
 import config  # first: loads .env before other modules read the environment
 import anti_bot.challenge_process as challenge_process
 import database
+from fsm_storage import SQLiteFSMStorage
 import link_check
 import reports
 import ui
 from handlers import main_router
 from middlewares import AccessControlMiddleware, ActionLoggingMiddleware
 from proxy_pool import close_proxy_pool, get_proxy_pool
-from scheduler import start_background_services, close_image_session
+from scheduler import start_background_services, close_image_session, shutdown_mirror_tasks
 
 # Принудительная поддержка UTF-8 в консоли Windows (для эмодзи)
 if sys.platform == "win32":
@@ -117,7 +117,7 @@ async def main():
         )
         await ui.load()
         bot.session.middleware(ui.PremiumEmojiFallback())
-        dp = Dispatcher(storage=MemoryStorage())
+        dp = Dispatcher(storage=SQLiteFSMStorage())
         dp.message.middleware(ActionLoggingMiddleware())
         dp.callback_query.middleware(ActionLoggingMiddleware())
         access_middleware = AccessControlMiddleware()
@@ -179,7 +179,15 @@ async def main():
         for task in background_tasks:
             task.cancel()
         await asyncio.gather(*background_tasks, return_exceptions=True)
+        await shutdown_mirror_tasks()
+        if "rub_payments" in sys.modules:
+            await sys.modules["rub_payments"].shutdown()
+        shutdown_admin = getattr(sys.modules.get("handlers.admin"), "shutdown_admin_tasks", None)
+        if callable(shutdown_admin):
+            await shutdown_admin()
         await close_image_session()
+        if "platega" in sys.modules:
+            await sys.modules["platega"].close_session()
         await close_proxy_pool()
         challenge_process.shutdown()
         await database.close_db()

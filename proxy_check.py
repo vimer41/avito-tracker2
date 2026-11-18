@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+from pathlib import Path
 import statistics
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -95,27 +97,34 @@ async def probe_channel(
     deadline_seconds gives each scan longer than a live one; stop_on_failure ends at the first failed scan
     (a blocked throwaway client would only answer «cooldown» to the next one)."""
     target = AvitoParser.normalize_url(target_url or DEFAULT_PROBE_URL)
-    client = ProxyClient(proxy_url)
-    parser = AvitoParser(proxy_client=client)
-    result = ProbeResult(proxy_id=client.proxy_id, masked_url=client.masked_url, target_url=target)
-    try:
-        for _ in range(max(1, attempts)):
-            started = time.monotonic()
-            collection = await collect_source(parser, target, max_pages=1, deadline_seconds=deadline_seconds)
-            elapsed_ms = int((time.monotonic() - started) * 1000)
-            if collection is not None:
-                result.attempts.append(ProbeAttempt(True, elapsed_ms, items=len(collection.items)))
-                continue
-            failure = parser.last_failure
-            result.attempts.append(ProbeAttempt(
-                False,
-                elapsed_ms,
-                failure=failure.kind if failure else "unknown",
-                status=failure.status if failure else None,
-            ))
-            if stop_on_failure:
-                break
-    finally:
-        parser.close()
-        await client.close()
-    return result
+    with tempfile.TemporaryDirectory(prefix="avito-probe-") as tmp_dir:
+        client = ProxyClient(proxy_url)
+        client.cookie_file = Path(tmp_dir) / "probe_cookies.json"
+        parser = AvitoParser(proxy_client=client)
+        result = ProbeResult(proxy_id=client.proxy_id, masked_url=client.masked_url, target_url=target)
+        try:
+            for _ in range(max(1, attempts)):
+                started = time.monotonic()
+                collection = await collect_source(parser, target, max_pages=1, deadline_seconds=deadline_seconds)
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                if collection is not None:
+                    result.attempts.append(ProbeAttempt(True, elapsed_ms, items=len(collection.items)))
+                    continue
+                failure = parser.last_failure
+                result.attempts.append(ProbeAttempt(
+                    False,
+                    elapsed_ms,
+                    failure=failure.kind if failure else "unknown",
+                    status=failure.status if failure else None,
+                ))
+                if stop_on_failure:
+                    break
+        finally:
+            parser.close()
+            if parser._cookie_write is not None:
+                try:
+                    parser._cookie_write.result(timeout=5)
+                except Exception:
+                    pass
+            await client.close()
+        return result

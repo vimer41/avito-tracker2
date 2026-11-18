@@ -109,11 +109,15 @@ def _ago(epoch) -> str:
     return f"{int(seconds // 86400)} дн"
 
 
-def topic_label(topic: Optional[str]) -> str:
+def topic_label_plain(topic: Optional[str]) -> str:
     raw = (topic or "general").strip()
     if raw in TOPICS:
         return TOPICS[raw]
-    return html.escape(raw) if raw else "Вопрос"
+    return raw or "Вопрос"
+
+
+def topic_label(topic: Optional[str]) -> str:
+    return html.escape(topic_label_plain(topic))
 
 
 def priority_label(priority: Optional[str]) -> str:
@@ -239,7 +243,7 @@ def render_ticket(ticket: dict, messages: list, page: int, as_admin: bool):
 
 def export_ticket(ticket: dict, messages: list) -> str:
     lines = [
-        f"Обращение #{ticket['id']} · {topic_label(ticket.get('topic'))} · "
+        f"Обращение #{ticket['id']} · {topic_label_plain(ticket.get('topic'))} · "
         f"Приоритет: {priority_label(ticket.get('priority'))} · {ADMIN_STATUS[ticket['status']]}",
         f"Пользователь: {ticket.get('full_name') or ''} @{ticket.get('username') or '-'} id {ticket['user_id']}"
         + (" (аккаунт удалён)" if ticket.get("user_deleted_epoch") else ""),
@@ -720,7 +724,7 @@ async def cb_ticket(call: CallbackQuery, state: FSMContext):
 
 
 def ticket_row_label(ticket: dict, as_admin: bool) -> str:
-    topic = topic_label(ticket.get("topic"))
+    topic = topic_label_plain(ticket.get("topic"))
     if as_admin:
         name = (ticket.get("full_name") or str(ticket["user_id"]))[:16]
         return f"#{ticket['id']} · {name} · {topic} · {_ago(ticket['updated_epoch'])}"
@@ -975,6 +979,9 @@ async def cb_admin_reply_start(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "admin_reply_cancel")
 async def cb_admin_reply_cancel(call: CallbackQuery, state: FSMContext):
+    if not config.is_admin(call.from_user.id):
+        await call.answer("У вас нет прав администратора", show_alert=True)
+        return
     data = await state.get_data()
     await state.clear()
     tid = data.get("ticket_id")

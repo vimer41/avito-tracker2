@@ -1,5 +1,6 @@
 """Platega API: create a payment, read its status, refund it (docs.platega.io)."""
 
+import asyncio
 import json
 from typing import Any
 
@@ -9,6 +10,32 @@ import config
 
 BASE_URL = "https://app.platega.io"
 TIMEOUT = aiohttp.ClientTimeout(total=20)
+_SESSIONS: dict[int, tuple[asyncio.AbstractEventLoop, aiohttp.ClientSession]] = {}
+
+
+def _get_session() -> aiohttp.ClientSession:
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    # Clean closed loops/sessions so test suites running multiple loops don't retain stale entries.
+    for old_key, (old_loop, old_sess) in list(_SESSIONS.items()):
+        if old_loop.is_closed() or old_sess.closed:
+            _SESSIONS.pop(old_key, None)
+    entry = _SESSIONS.get(key)
+    if entry is not None and entry[0] is loop and not entry[1].closed:
+        return entry[1]
+    session = aiohttp.ClientSession(timeout=TIMEOUT)
+    _SESSIONS[key] = (loop, session)
+    return session
+
+
+async def close_session() -> None:
+    for key, (loop, session) in list(_SESSIONS.items()):
+        _SESSIONS.pop(key, None)
+        if not session.closed and not loop.is_closed():
+            try:
+                await session.close()
+            except Exception:
+                pass
 
 
 class PlategaError(Exception):
@@ -24,18 +51,18 @@ class PlategaError(Exception):
 async def _request(method: str, path: str, body: dict | None = None) -> dict[str, Any]:
     headers = {"X-MerchantId": config.PLATEGA_MERCHANT_ID, "X-Secret": config.PLATEGA_SECRET}
     try:
-        async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
-            async with session.request(method, BASE_URL + path, json=body, headers=headers) as response:
-                text = await response.text()
-                if response.status != 200:
-                    try:
-                        error = json.loads(text)
-                    except json.JSONDecodeError:
-                        error = {}
-                    error = error if isinstance(error, dict) else {}
-                    raise PlategaError(f"HTTP {response.status}: {text[:300]}", status=response.status,
-                                       code=str(error.get("code") or ""), message=str(error.get("message") or ""))
-                return json.loads(text)
+        session = _get_session()
+        async with session.request(method, BASE_URL + path, json=body, headers=headers) as response:
+            text = await response.text()
+            if response.status != 200:
+                try:
+                    error = json.loads(text)
+                except json.JSONDecodeError:
+                    error = {}
+                error = error if isinstance(error, dict) else {}
+                raise PlategaError(f"HTTP {response.status}: {text[:300]}", status=response.status,
+                                   code=str(error.get("code") or ""), message=str(error.get("message") or ""))
+            return json.loads(text)
     except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError) as exc:
         raise PlategaError(f"{type(exc).__name__}: {exc}") from exc
 

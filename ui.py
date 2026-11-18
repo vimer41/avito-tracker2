@@ -254,7 +254,7 @@ def kb(*rows: Iterable[InlineKeyboardButton]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows if r])
 
 
-def page_nav(page: int, total_pages: int, callback_fmt: str, noop_data: str = "admin_noop") -> list[InlineKeyboardButton]:
+def page_nav(page: int, total_pages: int, callback_fmt: str, noop_data: str = "page_noop") -> list[InlineKeyboardButton]:
     """Unified [←] [1 / N] [→] pagination row for multi-page lists."""
     if total_pages <= 1:
         return []
@@ -398,7 +398,7 @@ _EMOJI = re.compile(
     "(?:[\U0001F000-\U0001FAFF⌀-⏿Ⓜ■-➿⬀-⯿〰〽㊗㊙]"
     "(?:️|⃣|[\U0001F3FB-\U0001F3FF])*(?:‍\S(?:️)?)*)"
 )
-_TG_EMOJI = re.compile(r"(<tg-emoji[^>]*>.*?</tg-emoji>)", re.S)
+_PROTECTED_HTML = re.compile(r"(<tg-emoji[^>]*>.*?</tg-emoji>|<blockquote[^>]*>.*?</blockquote>|<[^>]+>)", re.S | re.I)
 # «<b>Статус:</b>» at a line start, after an optional icon tag.
 _BOLD_LABEL = re.compile(r"(?m)^((?:<tg-emoji[^>]*>.*?</tg-emoji>\s*)?)<b>([^<\n]{1,40}):</b>")
 # Emoji written straight into older screens that have an icon of their own in the clean pack.
@@ -442,7 +442,7 @@ def drop_colour_emoji(text: str, *, icons: bool = False) -> str:
         cid = custom_id(slot) if icons and slot else None
         return f'<tg-emoji emoji-id="{cid}">{char}</tg-emoji>' if cid else ""
 
-    parts = _TG_EMOJI.split(text)
+    parts = _PROTECTED_HTML.split(text)
     out = "".join(part if i % 2 else _EMOJI.sub(swap, part) for i, part in enumerate(parts))
     out = re.sub(r"«<tg-emoji[^>]*>[^<]*</tg-emoji>\s*", "«", out)  # «Проверить каналы», not «[icon] Проверить…»
     out = re.sub(r"<(b|i)>[ \t]+", r"<\1>", out)  # «<b> Авто</b>» left by a removed emoji

@@ -217,6 +217,8 @@ class TestScreens(ReferralBase):
 
         await self.dispatch_callback(f"ref_adm_pay:{link['id']}", config.ADMIN_ID)
         await self.dispatch_message(user_id=config.ADMIN_ID, text="1 500,50 карта")
+        self.assertIn(f"ref_adm_payf:{link['id']}:150050", self.callback_values())
+        await self.dispatch_callback(f"ref_adm_payf:{link['id']}:150050", config.ADMIN_ID)
         self.assertEqual((await referrals.payouts(BUYER))[0]["amount_kop"], 150050)
 
         await self.dispatch_callback("ref_adm:0", config.ADMIN_ID)

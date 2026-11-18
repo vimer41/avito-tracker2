@@ -129,7 +129,7 @@ class AccessControlMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         # Административные действия никогда не обходят проверку роли.
-        if isinstance(event, CallbackQuery) and event.data and event.data.startswith(("admin_", "support_reply:")):
+        if isinstance(event, CallbackQuery) and event.data and event.data.startswith(("admin_", "support_reply:", "ref_adm", "bulk_")):
             if not config.is_admin(user_id):
                 await event.answer("У вас нет прав администратора", show_alert=True)
                 return
@@ -144,7 +144,7 @@ class AccessControlMiddleware(BaseMiddleware):
                 "open_subscription_menu", "activate_trial_btn", "trial_check", "support_start_ticket", "support_cancel",
                 "start_approved", "refresh_profile", "open_help_menu", "cancel_fsm", "ref_me", "open_support_stub",
                 "payment_terms", "payment_support", "other_payment_methods",
-                "open_docs_menu", "doc_agreement", "doc_privacy",
+                "open_docs_menu", "doc_agreement", "doc_privacy", "page_noop", "noop",
             }
             if event.data in allowed_exact or any(event.data.startswith(prefix) for prefix in allowed_callbacks):
                 return await handler(event, data)
@@ -152,9 +152,11 @@ class AccessControlMiddleware(BaseMiddleware):
         if isinstance(event, Message) and event.text:
             public_commands = {
                 "/start", "/help", "/profile", "/subscribe", "/tariffs", "/cancel",
-                "/paysupport", f"/{config.RUB_TEST_COMMAND}", "/terms", "/agreement", "/privacy", "/policy", "/offer", "/docs",
+                "/paysupport", "/terms", "/agreement", "/privacy", "/policy", "/offer", "/docs",
             }
-            command = (event.text.split(maxsplit=1) or [""])[0].split("@", 1)[0]
+            if config.RUB_TEST_ENABLED or config.is_admin(user_id):
+                public_commands.add(f"/{config.RUB_TEST_COMMAND}")
+            command = (event.text.split(maxsplit=1) or [""])[0].split("@", 1)[0].lower()
             public_menu = ui.menu_texts("tariffs", "support", "profile", "help", "docs") | ui.CANCEL_TEXTS
             if command in public_commands or event.text.strip() in public_menu:
                 state = data.get("state")
@@ -179,11 +181,22 @@ class AccessControlMiddleware(BaseMiddleware):
 
         # 3. Проверяем, есть ли доступ
         if await database.is_user_allowed(user_id):
-            # Автоматический сброс FSM-состояния при нажатии любой кнопки главного меню или команд
+            # Автоматический сброс FSM-состояния при нажатии любой кнопки главного меню или известных команд
             if isinstance(event, Message) and event.text:
                 txt = event.text.strip()
+                cmd = (txt.split(maxsplit=1) or [""])[0].split("@", 1)[0].lower()
+                known_commands = {
+                    "/start", "/help", "/profile", "/subscribe", "/tariffs", "/docs",
+                    "/agreement", "/offer", "/contract", "/privacy", "/policy", "/support", "/contacts",
+                    "/terms", "/proof", "/paysupport", "/cancel", "/lot", "/scans", "/admin", "/users",
+                    "/money", "/delete_user", "/purge_user", "/backup", "/db", "/logs", "/log",
+                    "/load", "/race", "/weekly", "/ready", "/report", "/find", "/user", "/search_user",
+                    "/stats", "/stats_at", "/direct_mode", "/direct", "/reload_proxies", "/proxy", "/emoji_id",
+                }
+                if config.RUB_TEST_ENABLED or config.is_admin(user_id):
+                    known_commands.add(f"/{config.RUB_TEST_COMMAND}")
                 menu_keywords = ui.ALL_MENU_TEXTS
-                if txt.startswith("/") or txt in menu_keywords:
+                if cmd in known_commands or txt in menu_keywords:
                     fsm_state = data.get("state")
                     if fsm_state:
                         current_st = await fsm_state.get_state()
@@ -194,6 +207,8 @@ class AccessControlMiddleware(BaseMiddleware):
 
         # 4. Триал ещё не брали: предлагаем его, админов это не касается
         if not user_record.get("trial_used"):
+            if isinstance(event, Message) and event.text and "avito.ru" in event.text.lower():
+                trial_gate.remember_pending_url(user_id, event.text.strip())
             offer_text, offer_kb = trial_gate.offer()
             await ui.show(event, offer_text, offer_kb)
             return
@@ -223,7 +238,7 @@ class AccessControlMiddleware(BaseMiddleware):
         admin_text = (
             "🔔 <b>Пользователь с истёкшим доступом пишет в бот:</b>\n\n"
             f"👤 <b>Имя:</b> {html.escape(user.full_name)}\n"
-            f"🔗 <b>Username:</b> @{user.username if user.username else 'нет'}\n"
+            f"🔗 <b>Username:</b> {f'@{html.escape(user.username)}' if user.username else 'нет'}\n"
             f"🆔 <b>ID:</b> <code>{user_id}</code>{user_msg}"
         )
         admin_kb = ui.kb(

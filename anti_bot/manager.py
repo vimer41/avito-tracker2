@@ -341,15 +341,18 @@ def extract_pow_challenge(response: Any, session: requests.Session) -> Optional[
     2. Кук ответа
     3. Кук сессии (только если ответ вернул статус блокировки 403, 429 или 439)
     """
-    # 1. Из тела ответа JSON
-    try:
-        data = response.json()
-        if isinstance(data, dict):
-            ch = data.get("pow_challenge")
-            if isinstance(ch, str) and ch:
-                return ch
-    except Exception:
-        pass
+    # 1. Из тела ответа JSON (только на небольших JSON-ответах блокировок, без парсинга 4-МБ HTML)
+    status = getattr(response, "status_code", None)
+    text = getattr(response, "text", "") or ""
+    if status in (403, 429, 439) and len(text) < 16384 and (not text or text.lstrip().startswith("{")):
+        try:
+            data = response.json()
+            if isinstance(data, dict):
+                ch = data.get("pow_challenge")
+                if isinstance(ch, str) and ch:
+                    return ch
+        except Exception:
+            pass
 
     # 2. Из кук ответа
     if hasattr(response, "cookies") and response.cookies.get("pow_challenge"):
@@ -484,7 +487,7 @@ def is_geetest_challenge(response: Any) -> bool:
     if "initGeetest4" in text and "gt4.js" in text and "captchaId" in text:
         return True
 
-    if getattr(response, "status_code", 0) in (403, 429):
+    if getattr(response, "status_code", 0) in (403, 429, 439) and len(text) < 16384 and (not text or text.lstrip().startswith("{")):
         try:
             data = response.json()
             if isinstance(data, dict):
@@ -530,10 +533,13 @@ def _geetest_seccode(
         if budget <= 0:
             return None  # the scan is out of time: Avito's verify could not be sent anyway
         try:
-            return challenge_process.run(
+            result = challenge_process.run(
                 "geetest", captcha_id, _session_user_agent(session), BROWSER_PROFILE,
                 timeout=budget, cancel_event=cancel_event,
             )
+            if isinstance(result, dict) and result.get("_warming"):
+                return None
+            return result
         except challenge_process.ChallengeProcessUnavailable:
             pass
     geetest_session, owns_geetest_session = _geetest_session(session)

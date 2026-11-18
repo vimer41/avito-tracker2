@@ -506,11 +506,6 @@ class TestSharedCalibration(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(monitoring.run_monitoring(Mock(send_message=AsyncMock())), 5)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-
 class TestRuntimeMetricsAndCapacity(unittest.TestCase):
     def test_percentiles_capacity_reserve_and_credential_sanitization(self):
         import runtime_metrics
@@ -775,3 +770,7 @@ class TestFastSkipCatchupAndHysteresis(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(planner.running["u"], current)
         self.assertTrue(planner.sources["u"].http_in_flight)
+
+
+if __name__ == "__main__":
+    unittest.main()

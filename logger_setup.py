@@ -28,6 +28,7 @@ import re
 import secrets
 import shutil
 import sys
+import tempfile
 import threading
 import time
 from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
@@ -476,28 +477,90 @@ def log_user_event(
         user_logger.info(log_line)
 
 
-def _scrub_log_file(path: Path, needle: str) -> None:
+def _build_user_scrub_regex(pattern: str) -> Optional[re.Pattern[str]]:
+    raw = (pattern or "").strip()
+    clean = raw.lstrip("@").lower()
+    if not clean:
+        return None
+    if clean.isdigit():
+        if len(clean) < 4:
+            return None
+        return re.compile(
+            rf'(?:id[:=\s]+|"user(?:_id)?"\s*:\s*|chat[:=\s]+|\buser\s+){re.escape(clean)}(?!\d)',
+            re.IGNORECASE,
+        )
+    if len(clean) < 3:
+        return None
+    if raw.startswith("@") and len(clean) < 5:
+        return re.compile(rf"@{re.escape(clean)}(?![\w])", re.IGNORECASE)
+    if len(clean) < 5:
+        return None
+    return re.compile(rf"(?:@|(?<![\w/.-])){re.escape(clean)}(?![\w.])", re.IGNORECASE)
+
+
+def _scrub_stream(path: Path, tmp_path: Path, rx: re.Pattern[str]) -> bool:
     opener = gzip.open if path.suffix == ".gz" else open
+    removed = False
     with opener(path, "rt", encoding="utf-8", errors="ignore") as source:
-        lines = source.readlines()
-    kept = [line for line in lines if needle not in line.lower()]
-    if len(kept) != len(lines):
-        with opener(path, "wt", encoding="utf-8") as target:
-            target.writelines(kept)
+        with opener(tmp_path, "wt", encoding="utf-8") as dest:
+            for line in source:
+                if rx.search(line):
+                    removed = True
+                    continue
+                dest.write(line)
+    return removed
+
+
+def _scrub_log_file(path: Path, rx: re.Pattern[str]) -> None:
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".scrub_{path.name}_", dir=str(path.parent))
+    os.close(tmp_fd)
+    tmp_path = Path(tmp_name)
+    active_handler = None
+    listener = _listener
+    if listener is not None:
+        try:
+            target_resolved = path.resolve()
+            for handler in getattr(listener, "handlers", ()):
+                base_fn = getattr(handler, "baseFilename", None)
+                if base_fn and Path(base_fn).resolve() == target_resolved:
+                    active_handler = handler
+                    break
+        except Exception:
+            active_handler = None
+
+    try:
+        if active_handler is not None:
+            active_handler.acquire()
+            try:
+                active_handler.flush()
+                active_handler.close()
+                if _scrub_stream(path, tmp_path, rx):
+                    os.replace(tmp_path, path)
+            finally:
+                active_handler.release()
+        else:
+            if _scrub_stream(path, tmp_path, rx):
+                os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def sanitize_logs_for_user(pattern: str):
     """
     Удаляет строки с упоминанием пользователя из всех файлов логов, включая ротированные.
     """
-    clean = pattern.strip().lstrip("@").lower()
-    if not clean or len(clean) < 3:
+    rx = _build_user_scrub_regex(pattern)
+    if rx is None:
         return
     log_files = [*LOGS_DIR.glob("*.log*"), *LOGS_DIR.glob("*.jsonl*"), *COMBINED_LOG.parent.glob(f"{COMBINED_LOG.name}*")]
     for lf in log_files:
         if lf.is_file():
             try:
-                _scrub_log_file(lf, clean)
+                _scrub_log_file(lf, rx)
             except Exception as e:
                 logging.getLogger(__name__).warning(f"Не удалось очистить лог {lf}: {e}")
 

@@ -89,12 +89,17 @@ def main():
     parser.add_argument("--notify-admin", action="store_true")
     args = parser.parse_args()
     import config
+    from pathlib import Path
     print("Safe configuration:", json.dumps({"stars_enabled": config.STARS_PAYMENTS_ENABLED,
                                              "lite": config.STARS_PRICE_LITE, "standart": config.STARS_PRICE_STANDART,
                                              "pro": config.STARS_PRICE_PRO,
                                              "check_interval": config.CHECK_INTERVAL, "workers": config.MAX_CONCURRENT_WORKERS,
                                              "admin_radar_limit": config.MAX_SEARCHES_PER_USER,
-                                             "proxy_configured": bool(config.PROXY_URL)}))
+                                             "proxy_configured": bool(
+                                                 config.PROXY_URL
+                                                 or config.PROXY_URLS
+                                                 or (config.PROXY_POOL_FILE and Path(config.PROXY_POOL_FILE).is_file())
+                                             )}))
     print_database_summary(config.DB_PATH)
     from logger_setup import COMBINED_LOG, METRICS_LOG
     print("Avito / delivery metrics:", json.dumps(scan_summary(tail(METRICS_LOG), tail(COMBINED_LOG))))

@@ -4,11 +4,16 @@ After=network.target
 
 [Service]
 Type=simple
+# Recommended in hardened setups: dedicate a non-root 'avito' user owning /opt/avito_parser_bot
 User=root
 WorkingDirectory=/opt/avito_parser_bot
 ExecStart=/opt/avito_parser_bot/venv/bin/python bot.py
 Restart=always
 RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal
 

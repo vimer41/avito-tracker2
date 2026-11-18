@@ -105,7 +105,11 @@ async def collect_source(
             page_items = await asyncio.to_thread(parser.parse_items, html)
             catalog_missing = not page_items and not await asyncio.to_thread(parser.has_catalog, html)
         if catalog_missing:
-            parser.last_failure = FetchFailure("catalog_missing", detail=page_fingerprint(html) if is_real_parser else "")
+            parser.last_failure = FetchFailure(
+                "catalog_missing",
+                retryable=False,
+                detail=page_fingerprint(html) if is_real_parser else "",
+            )
             if pages == 0:
                 return None
             gap = True

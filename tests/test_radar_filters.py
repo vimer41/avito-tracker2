@@ -41,11 +41,18 @@ class FilterReasonTests(unittest.TestCase):
     def test_empty_radar_passes_everything(self):
         self.assertIsNone(radar_filters.filter_reason(lot(), {}))
 
-    def test_price_bounds_are_ignored(self):
+    def test_price_empty_and_shop_filters(self):
         radar = {"price_min": 10000, "price_max": 20000}
-        self.assertIsNone(radar_filters.filter_reason(lot(price=9999), radar))
-        self.assertIsNone(radar_filters.filter_reason(lot(price=25000), radar))
-        self.assertEqual(radar_filters.summary(radar), "нет")
+        self.assertEqual(radar_filters.filter_reason(lot(price=9999), radar), "price")
+        self.assertEqual(radar_filters.filter_reason(lot(price=25000), radar), "price")
+        self.assertIsNone(radar_filters.filter_reason(lot(price=15000), radar))
+        self.assertEqual(radar_filters.filter_reason(lot(price=0), {"no_empty_price": 1}), "empty_price")
+        self.assertEqual(radar_filters.filter_reason(lot(seller_key="/brands/shop1"), {"hide_shops": 1}), "shop")
+        self.assertIsNone(radar_filters.filter_reason(lot(seller_key="/user/u1"), {"hide_shops": 1}))
+        summary = radar_filters.summary({**radar, "no_empty_price": 1, "hide_shops": 1})
+        self.assertIn("10 000 ₽", summary)
+        self.assertIn("без договорной", summary)
+        self.assertIn("без магазинов", summary)
 
     def test_delivery_and_promotion(self):
         self.assertEqual(radar_filters.filter_reason(lot(), {"delivery_only": 1}), "delivery")

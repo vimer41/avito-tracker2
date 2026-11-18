@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import bisect
+import functools
 from html import escape as html_escape
 import math
 import os
 import re
+import threading
 import time
+import types
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
 
@@ -565,6 +568,7 @@ class RuntimeMetricsRegistry:
     ) -> None:
         self._monotonic = monotonic_fn
         self._wall_clock = wall_clock_fn
+        self._lock = threading.RLock()
         self._started_at = wall_clock_fn()
         self._buckets: list[MinuteBucket] = [MinuteBucket() for _ in range(self.NUM_BUCKETS)]
         self._proxy_rings: dict[str, list[ProxyMinuteSlice]] = {}
@@ -645,10 +649,12 @@ class RuntimeMetricsRegistry:
     def _proxy_slice(self, proxy_id: str, masked_url: str | None = None) -> ProxyMinuteSlice:
         if proxy_id not in self._proxy_rings:
             self._proxy_rings[proxy_id] = [ProxyMinuteSlice() for _ in range(self.NUM_BUCKETS)]
-        if masked_url and proxy_id not in self._proxy_meta:
+        clean_url = sanitize_proxy_credentials(masked_url) if masked_url else ""
+        meta = self._proxy_meta.get(proxy_id)
+        if meta is None:
             self._proxy_meta[proxy_id] = {
                 "proxy_id": proxy_id,
-                "masked_url": sanitize_proxy_credentials(masked_url),
+                "masked_url": clean_url or proxy_id,
                 "state": "healthy",
                 "configured_rate": config.PROXY_RATE_LIMIT,
                 "effective_rate": config.PROXY_RATE_LIMIT,
@@ -656,6 +662,8 @@ class RuntimeMetricsRegistry:
                 "quarantine_reason": "",
                 "quarantine_remaining": 0.0,
             }
+        elif clean_url and meta.get("masked_url") in ("", proxy_id):
+            meta["masked_url"] = clean_url
         mid = self._current_minute_id()
         idx = mid % self.NUM_BUCKETS
         sl = self._proxy_rings[proxy_id][idx]
@@ -665,7 +673,8 @@ class RuntimeMetricsRegistry:
 
     def forget_proxies_except(self, keep_ids: set[str]) -> None:
         """Drop removed proxies, so screens and capacity count only channels that are still in the pool."""
-        for proxy_id in [pid for pid in self._proxy_meta if pid not in keep_ids]:
+        stale_ids = (set(self._proxy_meta) | set(self._proxy_rings)) - keep_ids
+        for proxy_id in stale_ids:
             self._proxy_meta.pop(proxy_id, None)
             self._proxy_rings.pop(proxy_id, None)
 
@@ -1891,4 +1900,19 @@ def channel_card(p: dict[str, Any]) -> list[str]:
     card.append(rate)
     return card
 
+def _synchronize_registry(cls) -> None:
+    """Wrap all RuntimeMetricsRegistry methods with its re-entrant lock for thread safety."""
+    for name, fn in list(vars(cls).items()):
+        if name.startswith("__") or not isinstance(fn, types.FunctionType):
+            continue
+
+        @functools.wraps(fn)
+        def _synchronized(self, *args, _fn=fn, **kwargs):
+            with self._lock:
+                return _fn(self, *args, **kwargs)
+
+        setattr(cls, name, _synchronized)
+
+
+_synchronize_registry(RuntimeMetricsRegistry)
 METRICS = RuntimeMetricsRegistry()

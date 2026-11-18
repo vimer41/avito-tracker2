@@ -424,6 +424,7 @@ class AvitoParser:
         self._install_request_budget()
         self._last_saved_cookies: list = []
         self._cookies_saved_at = 0.0
+        self._jar_loaded_at = time.monotonic()
         self._cookie_write: Optional[Future] = None
         self._session_warmed = False
         self._load_cookies()
@@ -574,7 +575,15 @@ class AvitoParser:
         cookies.sort(key=lambda c: (c["domain"], c["path"], c["name"]))
         return cookies
 
+    def _cookies_stale(self) -> bool:
+        return (
+            self.proxy_client is not None
+            and self.proxy_client.cookies_refreshed_at > self._jar_loaded_at
+        )
+
     def _save_cookies_from_jar(self, cookie_jar):
+        if self._cookies_stale():
+            return
         try:
             cookies = self._snapshot_cookies(cookie_jar)
         except Exception as e:
@@ -585,6 +594,8 @@ class AvitoParser:
 
     def _queue_cookie_save(self, cookie_jar):
         """Hot path: the snapshot stays on the event loop, the slow fsync goes to the background thread."""
+        if self._cookies_stale():
+            return
         if self._cookie_write is not None and not self._cookie_write.done():
             return
         try:
@@ -632,6 +643,7 @@ class AvitoParser:
         self._queue_cookie_save(cookie_jar)
 
     def _load_cookies_into_jar(self, cookies_obj):
+        self._jar_loaded_at = time.monotonic()
         if not self.cookie_file.exists():
             return
         try:
@@ -715,7 +727,7 @@ class AvitoParser:
         query_params = parse_qs(parsed.query)
 
         # Удаляем мусорные / сессионные параметры, меняющиеся между запросами
-        junk_keys = {"context", "localPriority", "presentationType", "from", "view", "p", "_t"}
+        junk_keys = {"context", "presentationType", "from", "view", "p", "_t"}
         for k in list(query_params.keys()):
             if k in junk_keys or k.startswith("utm_"):
                 query_params.pop(k, None)
@@ -892,19 +904,21 @@ class AvitoParser:
                 METRICS.record_transport_time(client.proxy_id, client.masked_url, time.monotonic() - req_t0)
                 raise
             req_elapsed = max(0.0, time.monotonic() - req_t0)
+            text = getattr(response, "text", "") or ""
+            clean_url = remove_cache_busting(url)
+            challenged = self._needs_challenge(response, text, async_session)
             client.record_raw_http_response(
                 response.status_code, req_elapsed,
                 size_bytes=_response_size(response), ttfb_seconds=_response_ttfb(response),
+                is_challenge=challenged,
             )
-            text = getattr(response, "text", "") or ""
-            clean_url = remove_cache_busting(url)
-            if self._is_firewall(response) or self._needs_challenge(response, text, async_session):
-                return response, clean_url, text
+            if challenged or response.status_code in (403, 429, 439):
+                return response, clean_url, text, challenged
             if response.status_code not in (301, 302, 303, 307, 308):
-                return response, clean_url, text
+                return response, clean_url, text, False
             location = response.headers.get("Location") or response.headers.get("location")
             if not location:
-                return response, clean_url, text
+                return response, clean_url, text, False
             # A browser keeps the original Referer (or none) across HTTP 30x, so nav_referer stays as passed.
             url = urljoin(url, location)
         raise ValueError("Avito redirect limit exceeded")
@@ -955,10 +969,9 @@ class AvitoParser:
                     self.last_failure = self.last_failure or FetchFailure("cooldown", retry_after=client.cooldown_remaining())
                     return None
                 try:
-                    response, actual_url, page_html = await self._get_page_response_async_client(
+                    response, actual_url, page_html, challenged = await self._get_page_response_async_client(
                         async_session, target, op_deadline, request_counter, max_requests, referer=nav_referer
                     )
-                    challenged = self._needs_challenge(response, page_html, async_session)
                     retry_after = parse_retry_after(response.headers)
 
                     if response.status_code in (403, 429) and (retry_after or not challenged):
@@ -1372,13 +1385,13 @@ class AvitoParser:
         try:
             m_h1 = _H1_RE.search(html)
             if m_h1:
-                text = _TAG_RE.sub("", m_h1.group(1)).replace("\xa0", " ").replace("&nbsp;", " ").strip()
+                text = " ".join(_TAG_RE.sub("", m_h1.group(1)).replace("\xa0", " ").replace("&nbsp;", " ").split())
                 if text:
                     return text
             m_title = _TITLE_RE.search(html)
             if m_title:
-                t = _TAG_RE.sub("", m_title.group(1)).replace("\xa0", " ").replace("&nbsp;", " ").strip()
-                t = t.split("—")[0].split("|")[0].split("купить")[-1].strip()
+                t = " ".join(_TAG_RE.sub("", m_title.group(1)).replace("\xa0", " ").replace("&nbsp;", " ").split())
+                t = " ".join(t.split("—")[0].split("|")[0].split("купить")[-1].split())
                 if t:
                     return t
         except Exception:
@@ -1423,8 +1436,14 @@ class AvitoParser:
                     data = _json_loads(raw)
                 except Exception:
                     continue
-                items = data.get("loaderData", {}).get("data", {}).get("catalog", {}).get("items")
+                data_node = data.get("loaderData", {}).get("data", {})
+                items = data_node.get("catalog", {}).get("items") if isinstance(data_node, dict) else None
                 if items is not None and isinstance(items, list):
+                    if (
+                        ("mainCount" in data_node and data_node.get("mainCount") == 0)
+                        or ("itemsOnPageMainSection" in data_node and data_node.get("itemsOnPageMainSection") == 0)
+                    ):
+                        return []
                     catalog_items = items
                     break
 
@@ -1437,6 +1456,8 @@ class AvitoParser:
             profile_fields: list[str] = []
             for it in catalog_items:
                 if not isinstance(it, dict):
+                    continue
+                if it.get("type") not in (None, "item"):
                     continue
                 raw_id = it.get("id")
                 if not raw_id:

@@ -188,6 +188,7 @@ class ProxyClient:
         self._state: str = "healthy"  # healthy | quarantined | half_open | draining
         self.quarantined_until: float = 0.0
         self.quarantine_reason: str = ""
+        self.cookies_refreshed_at: float = 0.0
         self.block_streak: int = 0
         self.consecutive_blocks: int = 0          # 403/429/439 in a row, the server included
         self.fresh_session_at: float = -math.inf
@@ -203,8 +204,9 @@ class ProxyClient:
         self._half_open_probe_active: bool = False
         self.last_acquired_at: float = -math.inf
 
-        # Pacing & concurrency state (protected by threading.Lock so both event loop and challenge thread are safe)
+        # Pacing & stats concurrency state (protected by locks so event loop and worker threads are safe)
         self._pacing_lock = threading.Lock()
+        self._stats_lock = threading.RLock()
         self._next_request_at: float = 0.0
         self._tokens: float = max(1.0, float(config.PROXY_RATE_BURST))
         self._tokens_at: float = self._monotonic()
@@ -230,11 +232,12 @@ class ProxyClient:
         if self._draining:
             return "draining"
         now = self._monotonic()
-        if self._state == "quarantined" and now >= self.quarantined_until:
-            self._state = "half_open"
-            self.quarantine_reason = ""
-            self._sync_metrics_state()
-        return self._state
+        with self._stats_lock:
+            if self._state == "quarantined" and now >= self.quarantined_until:
+                self._state = "half_open"
+                self.quarantine_reason = ""
+                self._sync_metrics_state()
+            return self._state
 
     def _sync_metrics_state(self) -> None:
         METRICS.update_proxy_state(
@@ -272,36 +275,35 @@ class ProxyClient:
         if self._draining:
             return False
         cur = self._monotonic() if now is None else now
-        if self._state == "quarantined":
-            if cur < self.quarantined_until:
+        with self._stats_lock:
+            if self._state == "quarantined":
+                if cur < self.quarantined_until:
+                    return False
+                self._state = "half_open"
+                self.quarantine_reason = ""
+                self._sync_metrics_state()
+            if self._state == "half_open" and self._half_open_probe_active:
                 return False
-            self._state = "half_open"
-            self.quarantine_reason = ""
-            self._sync_metrics_state()
-        if self._state == "half_open" and self._half_open_probe_active:
-            return False
         return True
 
     def is_available(self, now: float | None = None) -> bool:
         if self._draining:
             return False
-        if self.is_direct:
-            return True
         cur = self._monotonic() if now is None else now
-        if self._state == "quarantined":
-            if cur < self.quarantined_until:
-                return False
-            self._state = "half_open"
-            self.quarantine_reason = ""
-            self._sync_metrics_state()
+        with self._stats_lock:
+            if self._state == "quarantined":
+                if cur < self.quarantined_until:
+                    return False
+                self._state = "half_open"
+                self.quarantine_reason = ""
+                self._sync_metrics_state()
         return True
 
     def cooldown_remaining(self, now: float | None = None) -> float:
-        if self.is_direct:
-            return 0.0
         cur = self._monotonic() if now is None else now
         if self.state == "quarantined":
-            return max(0.0, self.quarantined_until - cur)
+            with self._stats_lock:
+                return max(0.0, self.quarantined_until - cur)
         return 0.0
 
     def estimated_ready_at(self, now: float | None = None) -> float:
@@ -343,11 +345,13 @@ class ProxyClient:
         """After SESSION_REFRESH_BLOCKS blocks in a row: delete this channel's saved cookies and close every lane's
         session, so the next request starts like after a bot restart. True when it happened."""
         now = self._monotonic()
-        if self.consecutive_blocks < int(config.SESSION_REFRESH_BLOCKS) \
-                or now - self.fresh_session_at < float(config.SESSION_REFRESH_GAP):
-            return False
-        streak, self.consecutive_blocks, self.fresh_session_at = self.consecutive_blocks, 0, now
-        self.fresh_sessions += 1
+        with self._stats_lock:
+            if self.consecutive_blocks < int(config.SESSION_REFRESH_BLOCKS) \
+                    or now - self.fresh_session_at < float(config.SESSION_REFRESH_GAP):
+                return False
+            streak, self.consecutive_blocks, self.fresh_session_at = self.consecutive_blocks, 0, now
+            self.fresh_sessions += 1
+            self.cookies_refreshed_at = now
         try:
             self.cookie_file.unlink(missing_ok=True)
         except OSError:
@@ -423,7 +427,8 @@ class ProxyClient:
     def _recent_block_ratio(self, limit: int | None = None) -> tuple[int, float]:
         """(responses, share of 403/429/439) over the last PROXY_RATE_WINDOW HTTP responses (at most `limit`)."""
         window = max(1, int(config.PROXY_RATE_WINDOW))
-        statuses = [status for _, status, transport in list(self._history_10m) if not transport and status is not None][-window:]
+        with self._stats_lock:
+            statuses = [status for _, status, transport in self._history_10m if not transport and status is not None][-window:]
         if limit is not None:
             statuses = statuses[len(statuses) - max(0, limit):] if limit < len(statuses) else statuses
         if not statuses:
@@ -434,7 +439,8 @@ class ProxyClient:
     def recent_health(self) -> float:
         """Share of successful answers among the last PROXY_HEALTH_WINDOW requests; a timeout counts as a failure."""
         window = max(1, int(config.PROXY_HEALTH_WINDOW))
-        recent = list(self._history_10m)[-window:]
+        with self._stats_lock:
+            recent = list(self._history_10m)[-window:]
         if len(recent) < min(3, window):
             return 1.0  # a new channel gets its chance
         ok = sum(1 for _, status, transport in recent if not transport and status is not None and 200 <= status < 400)
@@ -442,7 +448,8 @@ class ProxyClient:
 
     def long_health(self) -> float:
         """Share of successful answers among the last PROXY_QUALITY_WINDOW, however old; neutral until 3 answers."""
-        outcomes = list(self._outcomes)
+        with self._stats_lock:
+            outcomes = list(self._outcomes)
         if len(outcomes) < 3:
             return float(config.PROXY_GOOD_HEALTH)
         return sum(outcomes) / len(outcomes)
@@ -451,10 +458,11 @@ class ProxyClient:
         """(answers, share of 403/429/439) among the last PROXY_RATE_WINDOW answers of the last 10 minutes."""
         cutoff = now - float(config.PROXY_BLOCK_WINDOW_SECONDS)
         window = max(1, int(config.PROXY_RATE_WINDOW))
-        statuses = [
-            status for at, status, transport in list(self._history_10m)
-            if at >= cutoff and not transport and status is not None
-        ][-window:]
+        with self._stats_lock:
+            statuses = [
+                status for at, status, transport in self._history_10m
+                if at >= cutoff and not transport and status is not None
+            ][-window:]
         if not statuses:
             return 0, 0.0
         return len(statuses), sum(1 for status in statuses if status in (403, 429, 439)) / len(statuses)
@@ -467,7 +475,9 @@ class ProxyClient:
             return "в запасе: берёт скан, только если сервер ошибся, без лишних проверок"
         if self.is_direct:
             return "запасной, берёт нагрузку, когда хорошие прокси заняты"
-        if len(self._history_10m) < 3:
+        with self._stats_lock:
+            hist_len = len(self._history_10m)
+        if hist_len < 3:
             return "новый, пока считается хорошим"
         if self.recent_health() >= float(config.PROXY_GOOD_HEALTH):
             return "основной, работает в первую очередь"
@@ -498,7 +508,8 @@ class ProxyClient:
         good = health >= float(config.PROXY_GOOD_HEALTH)
         idle = now - self.last_acquired_at
         if not good or self.is_direct:
-            last = self._history_10m[-1] if self._history_10m else None
+            with self._stats_lock:
+                last = self._history_10m[-1] if self._history_10m else None
             last_ok = last is not None and not last[2] and last[1] is not None and 200 <= last[1] < 400
             if idle >= float(config.PROXY_PROBE_RETRY if last_ok else config.PROXY_PROBE_INTERVAL):
                 return 2.0
@@ -523,16 +534,21 @@ class ProxyClient:
         is_transport_error: bool = False,
         size_bytes: int = 0,
         ttfb_seconds: float | None = None,
+        is_challenge: bool = False,
     ) -> None:
         now = self._monotonic()
-        self._prune_10m_history(now)
-        self._history_10m.append((now, status_code, is_transport_error))
-        self._outcomes.append(not is_transport_error and status_code is not None and 200 <= status_code < 400)
-        if not is_transport_error and status_code == 200 and size_bytes >= PAGE_MIN_BYTES and latency_seconds > 0:
-            self._page_times.append(float(latency_seconds))
-            if len(self._page_times) >= PAGE_TIME_MIN_SAMPLES:
-                ordered = sorted(self._page_times)
-                self.page_time_p50 = ordered[len(ordered) // 2]
+        is_ok_http = not is_transport_error and status_code is not None and 200 <= status_code < 400
+        with self._stats_lock:
+            self._prune_10m_history(now)
+            history_status = None if (is_challenge and is_ok_http) else status_code
+            self._history_10m.append((now, history_status, is_transport_error))
+            if not is_challenge:
+                self._outcomes.append(is_ok_http)
+            if is_ok_http and not is_challenge and status_code == 200 and size_bytes >= PAGE_MIN_BYTES and latency_seconds > 0:
+                self._page_times.append(float(latency_seconds))
+                if len(self._page_times) >= PAGE_TIME_MIN_SAMPLES:
+                    ordered = sorted(self._page_times)
+                    self.page_time_p50 = ordered[len(ordered) // 2]
 
         METRICS.record_http_request(
             self.proxy_id,
@@ -544,45 +560,51 @@ class ProxyClient:
             ttfb_seconds=ttfb_seconds,
         )
 
-        if is_transport_error or status_code is None or status_code >= 500:
-            # A timeout says nothing about Avito's patience, so it does not reset the rate recovery streak.
-            self.transport_failure_streak += 1
-            if self.transport_failure_streak >= config.PROXY_FAILURE_THRESHOLD:
-                exp = self.transport_failure_streak - config.PROXY_FAILURE_THRESHOLD
-                backoff = min(
-                    float(config.PROXY_TRANSPORT_BACKOFF_MAX),
-                    float(config.PROXY_TRANSPORT_BACKOFF_BASE) * (2 ** min(exp, 6)),
-                )
-                self._enter_quarantine(now, backoff, reason=f"transport_or_5xx_streak={self.transport_failure_streak}")
-            return
+        with self._stats_lock:
+            if is_transport_error or status_code is None or status_code >= 500:
+                # A timeout says nothing about Avito's patience, so it does not reset the rate recovery streak.
+                self.transport_failure_streak += 1
+                if self.transport_failure_streak >= config.PROXY_FAILURE_THRESHOLD:
+                    exp = self.transport_failure_streak - config.PROXY_FAILURE_THRESHOLD
+                    backoff = min(
+                        float(config.PROXY_TRANSPORT_BACKOFF_MAX),
+                        float(config.PROXY_TRANSPORT_BACKOFF_BASE) * (2 ** min(exp, 6)),
+                    )
+                    self._enter_quarantine(now, backoff, reason=f"transport_or_5xx_streak={self.transport_failure_streak}")
+                return
 
-        self._answers_total += 1
-        if 200 <= status_code < 400:
-            self.consecutive_blocks = 0
-            self.transport_failure_streak = 0
-            self.recovery_success_streak += 1
-            _, block_ratio = self._recent_block_ratio()
-            if (
-                self.recovery_success_streak >= config.PROXY_RECOVERY_SUCCESS_STREAK
-                and block_ratio <= float(config.PROXY_RATE_CUT_RATIO)
-                and self.effective_rate < self.configured_rate
-            ):
-                self._step_rate_up(now, "серия успешных ответов")
-            self._sync_metrics_state()
-            return
+            self._answers_total += 1
+            if is_ok_http:
+                if is_challenge:
+                    self.recovery_success_streak = 0
+                    self._sync_metrics_state()
+                    return
+                self.consecutive_blocks = 0
+                self.transport_failure_streak = 0
+                self.recovery_success_streak += 1
+                _, block_ratio = self._recent_block_ratio()
+                if (
+                    self.recovery_success_streak >= config.PROXY_RECOVERY_SUCCESS_STREAK
+                    and block_ratio <= float(config.PROXY_RATE_CUT_RATIO)
+                    and self.effective_rate < self.configured_rate
+                ):
+                    self._step_rate_up(now, "серия успешных ответов")
+                self._sync_metrics_state()
+                return
 
-        if status_code in (403, 429, 439):
-            self.consecutive_blocks += 1
-            # A single block is Avito's background noise: the window ratio decides, not the streak.
-            # It does break the clean run that recovery waits for.
-            self.recovery_success_streak = 0
-            self._last_block_at = now
-            self._sync_metrics_state()
+            if status_code in (403, 429, 439):
+                self.consecutive_blocks += 1
+                # A single block is Avito's background noise: the window ratio decides, not the streak.
+                # It does break the clean run that recovery waits for.
+                self.recovery_success_streak = 0
+                self._last_block_at = now
+                self._sync_metrics_state()
 
     def _step_rate_up(self, now: float, why: str) -> None:
-        self.effective_rate = min(self.configured_rate, round(self.effective_rate * config.PROXY_RECOVERY_FACTOR, 4))
-        self.recovery_success_streak = 0
-        self._last_rate_step_at = now
+        with self._stats_lock:
+            self.effective_rate = min(self.configured_rate, round(self.effective_rate * config.PROXY_RECOVERY_FACTOR, 4))
+            self.recovery_success_streak = 0
+            self._last_rate_step_at = now
         log.debug(
             f"📈 Прокси {self.proxy_id} ({self.masked_url}) восстановил эффективную скорость до "
             f"{self.effective_rate:.2f}/{self.configured_rate:.2f} req/s ({why})"
@@ -592,12 +614,13 @@ class ProxyClient:
         """A throttled proxy with no block for PROXY_RATE_CALM_SECONDS steps back up even with little traffic:
         a reserve proxy in smart mode may get a few requests an hour and would otherwise stay at the floor."""
         calm = float(config.PROXY_RATE_CALM_SECONDS)
-        if (
-            self.effective_rate < self.configured_rate
-            and now - self._last_block_at >= calm
-            and now - self._last_rate_step_at >= calm
-        ):
-            self._step_rate_up(now, "давно без блоков")
+        with self._stats_lock:
+            if (
+                self.effective_rate < self.configured_rate
+                and now - self._last_block_at >= calm
+                and now - self._last_rate_step_at >= calm
+            ):
+                self._step_rate_up(now, "давно без блоков")
 
     def record_final_block(
         self,
@@ -606,41 +629,38 @@ class ProxyClient:
         retry_after_seconds: float | None = None,
     ) -> float:
         now = self._monotonic()
-        if self.is_direct:
-            self.block_streak = 0
-            self.recovery_success_streak = 0
-            self.effective_rate = max(1.5, float(self.configured_rate or 1.5))
-            self.quarantined_until = 0.0
-            self._state = "healthy"
-            self._sync_metrics_state()
-            return 0.0
-        self.block_streak += 1
-        self._last_block_at = now
-        # Judge only the answers since the previous cut: the blocks that caused it stay in the window for a while
-        # and used to cut again on the very next 403, 1.5 → 0.75 → 0.5 within seconds.
-        since_cut = self._answers_total - self._answers_at_cut
-        responses, block_ratio = self._recent_block_ratio(limit=since_cut)
-        if responses >= max(5, int(config.PROXY_RATE_WINDOW) // 2) and block_ratio > float(config.PROXY_RATE_CUT_RATIO):
-            self.recovery_success_streak = 0
-            self._answers_at_cut = self._answers_total
-            self._last_rate_step_at = now
-            before = self.effective_rate
-            self.effective_rate = max(
-                config.PROXY_MIN_RATE,
-                round(self.effective_rate * float(config.PROXY_RATE_CUT_FACTOR), 4),
+        with self._stats_lock:
+            self.block_streak += 1
+            self._last_block_at = now
+            # Judge only the answers since the previous cut: the blocks that caused it stay in the window for a while
+            # and used to cut again on the very next 403, 1.5 → 0.75 → 0.5 within seconds.
+            since_cut = self._answers_total - self._answers_at_cut
+            responses, block_ratio = self._recent_block_ratio(limit=since_cut)
+            if responses >= max(5, int(config.PROXY_RATE_WINDOW) // 2) and block_ratio > float(config.PROXY_RATE_CUT_RATIO):
+                self.recovery_success_streak = 0
+                self._answers_at_cut = self._answers_total
+                self._last_rate_step_at = now
+                before = self.effective_rate
+                self.effective_rate = max(
+                    config.PROXY_MIN_RATE,
+                    round(self.effective_rate * float(config.PROXY_RATE_CUT_FACTOR), 4),
+                )
+                log.info(
+                    f"📉 Прокси {self.proxy_id} ({self.masked_url}) замедлен {before:.2f} → {self.effective_rate:.2f} req/s: "
+                    f"блоков {block_ratio:.0%} из {responses} ответов"
+                )
+            duration = min(
+                float(config.PROXY_QUARANTINE_MAX),
+                float(config.PROXY_QUARANTINE_BASE) * (2 ** min(self.block_streak - 1, 8)),
             )
-            log.info(
-                f"📉 Прокси {self.proxy_id} ({self.masked_url}) замедлен {before:.2f} → {self.effective_rate:.2f} req/s: "
-                f"блоков {block_ratio:.0%} из {responses} ответов"
-            )
-        duration = min(
-            float(config.PROXY_QUARANTINE_MAX),
-            float(config.PROXY_QUARANTINE_BASE) * (2 ** min(self.block_streak - 1, 8)),
-        )
-        if retry_after_seconds is not None and math.isfinite(retry_after_seconds) and retry_after_seconds > 0:
-            duration = min(float(config.PROXY_QUARANTINE_MAX), max(duration, float(retry_after_seconds)))
-        self._enter_quarantine(now, duration, reason=reason)
-        return duration
+            has_retry_after = retry_after_seconds is not None and math.isfinite(retry_after_seconds) and retry_after_seconds > 0
+            if has_retry_after:
+                duration = min(float(config.PROXY_QUARANTINE_MAX), max(duration, float(retry_after_seconds)))
+            if self.is_direct and not has_retry_after and self.block_streak < 2:
+                self._sync_metrics_state()
+                return 0.0
+            self._enter_quarantine(now, duration, reason=reason)
+            return duration
 
     def record_block_or_challenge_failure(
         self,
@@ -652,21 +672,17 @@ class ProxyClient:
         return self.record_final_block(reason=reason, retry_after_seconds=retry_after)
 
     def record_transport_error(self, *, reason: str = "transport") -> float:
-        if self.is_direct:
-            self.quarantined_until = 0.0
-            self._state = "healthy"
-            self._sync_metrics_state()
-            return 0.0
         self.record_raw_http_response(None, 0.0, is_transport_error=True)
         return self.cooldown_remaining()
 
     def record_success(self) -> None:
-        if self._state == "half_open":
-            self._state = "healthy"
-            self.quarantine_reason = ""
-        if self.block_streak > 0:
-            self.block_streak = max(0, self.block_streak - 1)
-        self._sync_metrics_state()
+        with self._stats_lock:
+            if self._state == "half_open":
+                self._state = "healthy"
+                self.quarantine_reason = ""
+            if self.block_streak > 0:
+                self.block_streak = max(0, self.block_streak - 1)
+            self._sync_metrics_state()
 
     def record_collection_outcome(
         self,
@@ -681,12 +697,7 @@ class ProxyClient:
         has_new_items: bool = False,
     ) -> None:
         if success:
-            if self._state == "half_open":
-                self._state = "healthy"
-                self.quarantine_reason = ""
-            if self.block_streak > 0:
-                self.block_streak = max(0, self.block_streak - 1)
-            self._sync_metrics_state()
+            self.record_success()
 
         METRICS.record_collection(
             self.proxy_id,
@@ -702,28 +713,24 @@ class ProxyClient:
         )
 
     def _enter_quarantine(self, now: float, duration_seconds: float, *, reason: str) -> None:
-        if self.is_direct:
-            self.quarantined_until = 0.0
-            self.quarantine_reason = ""
-            self._state = "healthy"
+        with self._stats_lock:
+            until = now + max(1.0, float(duration_seconds))
+            if until > self.quarantined_until:
+                self.quarantined_until = until
+            self._state = "quarantined"
+            self.quarantine_reason = reason
             self._sync_metrics_state()
-            return
-        until = now + max(1.0, float(duration_seconds))
-        if until > self.quarantined_until:
-            self.quarantined_until = until
-        self._state = "quarantined"
-        self.quarantine_reason = reason
-        self._sync_metrics_state()
+            rate = self.effective_rate
         channel = short_channel(self.proxy_id, self.masked_url)
         log_event(
             log,
             logging.INFO,
             "proxy.quarantine",
-            f"🛑 {channel} в карантин на {duration_seconds:.1f} с · {reason} · {self.effective_rate:.2f} req/s",
+            f"🛑 {channel} в карантин на {duration_seconds:.1f} с · {reason} · {rate:.2f} req/s",
             ch=channel,
             s=round(duration_seconds, 1),
             reason=reason,
-            rate=self.effective_rate,
+            rate=rate,
         )
 
     def snapshot(self) -> dict[str, Any]:

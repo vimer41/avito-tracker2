@@ -278,6 +278,15 @@ def watching(order_id: int) -> bool:
     return task is not None and not task.done()
 
 
+async def shutdown() -> None:
+    watchers = list(_watchers.values())
+    _watchers.clear()
+    for task in watchers:
+        task.cancel()
+    if watchers:
+        await asyncio.gather(*watchers, return_exceptions=True)
+
+
 async def _watch(bot: Bot, order_id: int):
     order = await billing.get_rub_order(order_id)
     if not order:
@@ -359,21 +368,23 @@ async def sweep_once(bot: Bot) -> int:
 
 def _payment_problem(order: dict, info: dict) -> str | None:
     """Why a CONFIRMED answer must not grant the tariff, or None when it matches the order."""
-    tx = str(info.get("id") or "")
-    if tx and tx.lower() != str(order["transaction_id"]).lower():
+    tx = str(info.get("id") or "").strip()
+    if not tx or tx.lower() != str(order["transaction_id"]).lower():
         return "номер платежа в ответе не совпадает с заказом"
     payload = info.get("payload")
     if payload not in (None, "", f"order:{order['id']}"):
         return "платёж создан не для этого заказа"
     details = info.get("paymentDetails") if isinstance(info.get("paymentDetails"), dict) else {}
-    currency = str(details.get("currency") or "RUB").upper()
+    raw_cur = details.get("currency") if "currency" in details else info.get("currency")
+    currency = str(raw_cur or "").upper()
     if currency != "RUB":
-        return f"валюта {html.escape(currency)} вместо RUB"
-    paid = _num(info.get("paidAmount"))
-    if paid is None or paid <= 0:
+        return f"валюта {html.escape(currency or '—')} вместо RUB"
+    if "paidAmount" in info:
+        paid = _num(info.get("paidAmount"))
+    else:
         paid = _num(details.get("amount"))
-    if paid is None:
-        return "Platega не передала сумму"
+    if paid is None or paid <= 0:
+        return "Platega не подтвердила оплаченную сумму"
     if paid + 0.004 < order["amount"]:
         return f"оплачено {rub(paid)} ₽ из {rub(order['amount'])} ₽"
     return None

@@ -47,7 +47,7 @@ STRETCH_CHECK_SECONDS = 30.0  # how often the interval stretch is reconsidered
 STRETCH_STEP = 0.1  # smaller changes of the stretch are not applied, so intervals do not jitter
 CRASH_ALERT_INTERVAL = 24 * 3600  # the same code error pushes once a day; every repeat is in errors.log
 # Failures that describe the page itself. Blocks and timeouts say nothing about the link.
-DEAD_LINK_KINDS = frozenset({"catalog_missing", "invalid_redirect", "invalid_html", "invalid_response", "http_client"})
+DEAD_LINK_KINDS = frozenset({"catalog_missing", "http_client"})
 DEAD_LINK_OK_WINDOW = 120.0
 DEAD_LINK_OWNER_COOLDOWN = 86400.0  # a flaky link must not repeat the same warning to its owner
 
@@ -296,6 +296,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         )
 
     dead_link_warned_at: dict[int, float] = {}
+    dead_link_streaks: dict[str, int] = {}
 
     async def alert_dead_link(task: ScheduledScan, failure, streak: int):
         """The verdict comes from scans that already ran, so a user's bad link costs no extra requests."""
@@ -503,7 +504,7 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             task.previous_processed_at > 0
             and (now_epoch - task.previous_processed_at) > (max_age * 60)
         )
-        collection_max_age = config.CATCHUP_MAX_AGE_MINUTES
+        collection_max_age = config.CATCHUP_MAX_AGE_MINUTES if has_catchup else max_age
         collection_max_pages = max(1, int(config.BROAD_RADAR_MAX_PAGES))
 
         async def page_is_all_new(page_items, _task=task) -> bool:
@@ -513,12 +514,6 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
         scan_attempts = max(1, int(config.SCAN_PROXY_ATTEMPTS), min(3, len(pool.clients)))
         for _attempt in range(scan_attempts):
             lease = pool.acquire_client(exclude_ids=tried_proxy_ids)
-            if lease is None and len(pool.clients) == 1:
-                only_client = pool.clients[0]
-                only_client.quarantined_until = 0.0
-                only_client._state = "healthy"
-                only_client._half_open_probe_active = False
-                lease = pool.acquire_client()
             if lease is None:
                 break
             client = lease.client
@@ -596,6 +591,11 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             logger.debug("Журнал сканов не записан", exc_info=True)
 
         if not ok:
+            failure_kind = last_failure.kind if last_failure else ("unknown" if attempts else "no_channel")
+            if last_failure is not None and failure_kind in DEAD_LINK_KINDS:
+                dead_link_streaks[task.key] = dead_link_streaks.get(task.key, 0) + 1
+            else:
+                dead_link_streaks.pop(task.key, None)
             log_scan_failure(task, last_failure, attempts, elapsed_ms, max(1, total_http_reqs))
             is_direct_run = getattr(pool, "is_direct_only", False) or (
                 bool(getattr(pool, "clients", []))
@@ -626,8 +626,10 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
             if catalog_down() and not alert_sent:
                 alert_sent = True
                 await notify_health(False)
-            await alert_dead_link(task, last_failure, state_after.source_failure_streak if state_after else 0)
+            await alert_dead_link(task, last_failure, dead_link_streaks.get(task.key, 0))
             return
+
+        dead_link_streaks.pop(task.key, None)
 
         log_scan_success(
             task,
@@ -732,6 +734,11 @@ async def run_monitoring(bot, parser: Optional[AvitoParser] = None):
                 searches = await database.get_all_active_searches()
                 groups = group_sources(searches)
                 seen_store.prune(groups)
+                active_radar_ids = {int(r["id"]) for r in searches if r.get("id") is not None}
+                for stale_key in [k for k in dead_link_streaks if k not in groups]:
+                    dead_link_streaks.pop(stale_key, None)
+                for stale_rid in [rid for rid in dead_link_warned_at if rid not in active_radar_ids]:
+                    dead_link_warned_at.pop(stale_rid, None)
                 base = {key: source_interval(radars, key) for key, radars in groups.items()}
                 last_searches_sync = time.monotonic()
             network = budget.snapshot()

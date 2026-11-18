@@ -89,6 +89,13 @@ rollback() {
     if [[ "$CHANGED" == 1 ]]; then
         echo "Deploy failed; restoring previous code/environment"
         systemctl stop avito-bot || true
+        if [[ -n "${BACKUP_PATH:-}" && -f "$BACKUP_PATH" ]]; then
+            RESTORE_DB="${DB_FILE:-$TARGET_DIR/data/bot.db}"
+            mkdir -p "$(dirname "$RESTORE_DB")"
+            rm -f "${RESTORE_DB}-wal" "${RESTORE_DB}-shm" 2>/dev/null || true
+            cp -p "$BACKUP_PATH" "$RESTORE_DB" || true
+            echo "Restored pre-deploy database backup $BACKUP_PATH -> $RESTORE_DB"
+        fi
         if [[ -n "$PREVIOUS_BRANCH" ]]; then
             git checkout -B "$PREVIOUS_BRANCH" "$PREVIOUS_SHA" || true
         else
@@ -243,6 +250,18 @@ if [[ "$STOPPED_EARLY" == 0 ]]; then
 fi
 mkdir -p "$TARGET_DIR/backups"
 BACKUP_PATH="$TARGET_DIR/backups/bot-before-$DEPLOY_SHA-$(date -u +%Y%m%dT%H%M%SZ).db"
+DB_FILE=""
+if [[ -f "$TARGET_DIR/.env" ]]; then
+    RAW_DB_PATH="$(grep -E '^DB_PATH=' "$TARGET_DIR/.env" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "\"' \r" || true)"
+    if [[ -n "$RAW_DB_PATH" ]]; then
+        if [[ "$RAW_DB_PATH" == /* ]]; then
+            DB_FILE="$RAW_DB_PATH"
+        else
+            DB_FILE="$TARGET_DIR/$RAW_DB_PATH"
+        fi
+    fi
+fi
+DB_FILE="${DB_FILE:-$TARGET_DIR/data/bot.db}"
 export BACKUP_PATH TARGET_DIR
 PYTHONPATH="$STAGE_DIR" "$NEW_ENV/bin/python" -B - <<'PY'
 import os
@@ -255,9 +274,14 @@ import config
 
 database_path = Path(config.DB_PATH)
 if database_path.is_file():
-    with sqlite3.connect(database_path.resolve().as_uri() + '?mode=ro', uri=True) as source:
+    try:
+        source = sqlite3.connect(str(database_path))
+    except sqlite3.OperationalError:
+        source = sqlite3.connect(database_path.resolve().as_uri() + '?mode=ro', uri=True)
+    with source:
         with sqlite3.connect(os.environ['BACKUP_PATH']) as destination:
             source.backup(destination)
+    source.close()
     print('SQLite backup created')
 else:
     print('No existing database; first deployment')

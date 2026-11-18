@@ -191,6 +191,9 @@ async def send_weekly_digests(bot: Bot, now: Optional[float] = None) -> int:
         night_mode, night_from, night_to = await database.get_night_settings(user_id)
         quiet = night_mode != database.NIGHT_OFF and config.is_quiet_hour_msk(night_from, night_to, now)
         try:
+            if not config.TESTING:
+                from scheduler import pace_global_bot_api
+                await pace_global_bot_api()
             await bot.send_message(
                 user_id, weekly_digest_text(row), parse_mode="HTML", disable_notification=quiet,
                 reply_markup=ui.kb([ui.btn("Радары", "radars", callback_data="list_searches")]),
@@ -335,6 +338,15 @@ async def announce_release(bot: Bot, version: str, delay: float = RELEASE_NOTE_D
 
 
 DAILY_BACKUP_PREFIX = "daily-"
+DAILY_BACKUP_DATE_KEY = "daily_backup_sent_date"
+
+
+def _msk_today(now: Optional[float] = None) -> str:
+    return time.strftime("%Y%m%d", time.gmtime((time.time() if now is None else now) + 3 * 3600))
+
+
+def _msk_hour(now: Optional[float] = None) -> int:
+    return time.gmtime((time.time() if now is None else now) + 3 * 3600).tm_hour
 
 
 def keep_daily_copy(packed: str, now: Optional[float] = None) -> Path:
@@ -370,11 +382,24 @@ async def send_daily_backup(bot: Bot) -> None:
         await bot.send_document(
             config.ADMIN_ID, FSInputFile(packed), caption=f"Ежедневная копия базы, {size // 1024} КБ. Храните её как личные данные."
         )
+        await database.set_bot_setting(DAILY_BACKUP_DATE_KEY, _msk_today())
     finally:
         os.remove(packed)
 
 
 async def daily_report_worker(bot: Bot) -> None:
+    if not config.TESTING:
+        await asyncio.sleep(60)
+        try:
+            today_msk = _msk_today()
+            if _msk_hour() >= int(getattr(config, "DAILY_REPORT_HOUR", 9)):
+                last_date = await database.get_bot_setting(DAILY_BACKUP_DATE_KEY, "")
+                if last_date != today_msk:
+                    await send_daily_backup(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Сбой догоняющей ежедневной копии базы")
     while True:
         await asyncio.sleep(seconds_until_report())
         try:

@@ -166,13 +166,12 @@ async def writer_connection():
         assert db is not None
         try:
             yield db
-        except BaseException:
+        finally:
             if db.in_transaction:
                 try:
                     await db.rollback()
                 except Exception:
                     pass
-            raise
 
 
 @asynccontextmanager
@@ -704,7 +703,14 @@ async def init_db():
                         refund_needs_review INTEGER NOT NULL DEFAULT 0
                     )
                 """)
-                await db.execute("INSERT INTO stars_orders SELECT * FROM stars_orders_old;")
+                async with db.execute("PRAGMA table_info(stars_orders_old)") as old_cur:
+                    old_cols = [str(r[1]) for r in await old_cur.fetchall()]
+                async with db.execute("PRAGMA table_info(stars_orders)") as new_cur:
+                    new_cols = {str(r[1]) for r in await new_cur.fetchall()}
+                common_cols = [c for c in old_cols if c in new_cols]
+                if common_cols:
+                    cols_sql = ", ".join(common_cols)
+                    await db.execute(f"INSERT INTO stars_orders ({cols_sql}) SELECT {cols_sql} FROM stars_orders_old;")
                 await db.execute("DROP TABLE stars_orders_old;")
         await db.execute("CREATE INDEX IF NOT EXISTS stars_orders_user ON stars_orders(user_id, id)")
         # Рублёвые оплаты через Platega. status — наш учёт:
@@ -766,6 +772,7 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS rub_orders_user ON rub_orders(user_id, id)")
         await db.execute("CREATE INDEX IF NOT EXISTS rub_orders_status ON rub_orders(status)")
         await db.execute("CREATE INDEX IF NOT EXISTS rub_orders_next_check ON rub_orders(next_check_at)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_rub_orders_tx_lower ON rub_orders(lower(transaction_id))")
         # Использование бота по дням (МСК) для доказательств по спорам: notification_events живут сутки,
         # а спор по платежу приходит через месяцы. Лоты переносятся сюда при чистке событий, заходы — из touch_user.
         await db.execute("""
@@ -871,6 +878,8 @@ async def init_db():
             "must_words": "TEXT DEFAULT '[]'",
             "delivery_only": "INTEGER DEFAULT 0",
             "hide_promoted": "INTEGER DEFAULT 0",
+            "no_empty_price": "INTEGER NOT NULL DEFAULT 0",
+            "hide_shops": "INTEGER NOT NULL DEFAULT 0",
             "reply_template": "TEXT DEFAULT ''",
             "pause_reason": "TEXT DEFAULT ''",
         })
@@ -916,6 +925,10 @@ async def init_db():
                 FOREIGN KEY (search_id) REFERENCES searches (id) ON DELETE CASCADE
             );
         """)
+        await ensure_columns(db, "seen_items", {
+            "last_price": "INTEGER DEFAULT 0",
+            "created_at": "TIMESTAMP",
+        })
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS blocked_sellers (
@@ -1058,6 +1071,42 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_notification_events_expired_at "
             "ON notification_events(expired_at) WHERE expired_at IS NOT NULL;"
         )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notification_events_claim "
+            "ON notification_events(status, priority, deliver_at, id);"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_seen_items_created_at ON seen_items(created_at);"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_subscription_until ON users(subscription_until);"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notification_dedupe_status_updated "
+            "ON notification_dedupe(status, updated_at);"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notification_dedupe_status_sent "
+            "ON notification_dedupe(status, sent_at);"
+        )
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS purged_users (
+                user_id INTEGER PRIMARY KEY,
+                trial_used INTEGER NOT NULL DEFAULT 1,
+                purged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS fsm_states (
+                bot_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                state TEXT,
+                data_json TEXT NOT NULL DEFAULT '{}',
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (bot_id, chat_id, user_id)
+            );
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
@@ -1136,8 +1185,16 @@ async def get_bot_setting(key: str, default: Optional[str] = None) -> Optional[s
             async with db.execute("SELECT value FROM bot_settings WHERE key = ?", (str(key),)) as cur:
                 row = await cur.fetchone()
                 return str(row[0]) if row is not None else default
-    except sqlite3.OperationalError:
-        return default
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return default
+        raise
+
+
+async def is_user_purged(user_id: int) -> bool:
+    async with reader_connection() as db:
+        async with db.execute("SELECT 1 FROM purged_users WHERE user_id = ?", (int(user_id),)) as cur:
+            return await cur.fetchone() is not None
 
 
 async def get_proxy_urls() -> list[str]:
@@ -1183,12 +1240,15 @@ async def get_or_create_user(user_id: int, username: Optional[str] = None, first
                 (user_id, username, first_name, DEFAULT_SELLER_MESSAGE)
             )
         else:
+            async with db.execute("SELECT trial_used FROM purged_users WHERE user_id = ?", (user_id,)) as cur:
+                purged = await cur.fetchone()
+            prior_trial = int(purged[0]) if purged else 0
             # No access yet: the trial is taken through the channel gate (trial_gate.py).
             await db.execute("""
-                INSERT OR IGNORE INTO users (user_id, username, first_name, default_template, is_allowed, tariff_plan)
-                VALUES (?, ?, ?, ?, 0, 'standart')
-            """, (user_id, username, first_name, DEFAULT_SELLER_MESSAGE))
-            if referral and int(referral[0]) != int(user_id):
+                INSERT OR IGNORE INTO users (user_id, username, first_name, default_template, is_allowed, tariff_plan, trial_used)
+                VALUES (?, ?, ?, ?, 0, 'standart', ?)
+            """, (user_id, username, first_name, DEFAULT_SELLER_MESSAGE, prior_trial))
+            if referral and int(referral[0]) != int(user_id) and not purged:
                 await db.execute(
                     "UPDATE users SET referred_by = ?, ref_link_id = ?, referred_at = datetime('now') WHERE user_id = ?",
                     (int(referral[0]), int(referral[1]), user_id),
@@ -1293,6 +1353,7 @@ async def count_limit_paused(user_id: int) -> int:
 async def resume_blocked_searches(user_id: int) -> int:
     """The user is back after blocking the bot: their radars run again, within the tariff."""
     async with writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
         async with db.execute(
             "SELECT id FROM searches WHERE user_id = ? AND pause_reason = ?", (user_id, PAUSE_BLOCKED)
         ) as cur:
@@ -1307,7 +1368,9 @@ async def resume_blocked_searches(user_id: int) -> int:
         if resumed:
             await sync_radar_limit_in_transaction(db, user_id)
         await db.commit()
-        return resumed
+    if resumed:
+        bump_searches_revision()
+    return resumed
 
 
 def subscription_seconds_left(user: dict) -> int:
@@ -1335,6 +1398,7 @@ async def change_user_extra_radars(user_id: int, delta: int) -> int:
     """Adds delta (may be negative) to the admin-granted radar bonus; never below zero. Returns the new bonus."""
     await get_or_create_user(user_id)
     async with writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
         await db.execute(
             "UPDATE users SET extra_radars = MAX(0, COALESCE(extra_radars, 0) + ?) WHERE user_id = ?",
             (int(delta), user_id),
@@ -1344,6 +1408,20 @@ async def change_user_extra_radars(user_id: int, delta: int) -> int:
         async with db.execute("SELECT extra_radars FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             return int(row[0] or 0) if row else 0
+
+
+def is_user_row_allowed(user: Dict[str, Any], now_utc_str: Optional[str] = None) -> bool:
+    """In-memory access check matching is_user_allowed() without issuing an extra SQL query."""
+    uid = int(user.get("user_id") or 0)
+    if uid in ADMIN_IDS:
+        return True
+    sub_until = user.get("subscription_until")
+    if bool(user.get("is_allowed")) and not sub_until:
+        return True
+    if sub_until:
+        now_str = now_utc_str or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        return str(sub_until) > now_str
+    return False
 
 
 async def is_user_allowed(user_id: int) -> bool:
@@ -1361,6 +1439,7 @@ async def is_user_allowed(user_id: int) -> bool:
 
 async def set_user_allowed(user_id: int, is_allowed: int = 1):
     async with writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
         if is_allowed:
             await recalibrate_if_no_access_in_transaction(db, user_id)
         await db.execute(
@@ -1369,6 +1448,7 @@ async def set_user_allowed(user_id: int, is_allowed: int = 1):
         )
         await sync_radar_limit_in_transaction(db, user_id)
         await db.commit()
+    bump_searches_revision()
 
 
 async def get_all_users() -> List[Dict[str, Any]]:
@@ -1432,6 +1512,7 @@ async def recalibrate_if_no_access_in_transaction(db, user_id: int) -> None:
 async def grant_vip_access(user_id: int, tariff_plan: str = "pro") -> Dict[str, Any]:
     plan = tariff_plan.lower() if tariff_plan in config.PAID_PLANS else "pro"
     async with writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
         await recalibrate_if_no_access_in_transaction(db, user_id)
         await db.execute("""
             UPDATE users 
@@ -1444,12 +1525,14 @@ async def grant_vip_access(user_id: int, tariff_plan: str = "pro") -> Dict[str, 
         """, (plan, user_id))
         await sync_radar_limit_in_transaction(db, user_id)
         await db.commit()
+    bump_searches_revision()
     user = await get_user(user_id)
     return user or {}
 
 
 async def reset_user_trial(user_id: int) -> Dict[str, Any]:
     async with writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
         await recalibrate_if_no_access_in_transaction(db, user_id)
         await db.execute("""
             UPDATE users 
@@ -1462,6 +1545,7 @@ async def reset_user_trial(user_id: int) -> Dict[str, Any]:
         """, (f"+{config.TRIAL_HOURS} hours", user_id))
         await sync_radar_limit_in_transaction(db, user_id)
         await db.commit()
+    bump_searches_revision()
     user = await get_user(user_id)
     return user or {}
 
@@ -1527,7 +1611,8 @@ async def add_search(user_id: int, title: str, url: str, search_in_title_only: i
         else:
             await db.execute("UPDATE searches SET initialized_at = NULL WHERE id = ?", (search_id,))
         await db.commit()
-        return search_id
+    bump_searches_revision()
+    return search_id
 
 
 async def initialize_search_snapshot(search_id: int, items) -> bool:
@@ -1564,17 +1649,36 @@ async def update_search_max_age(search_id: int, user_id: int, max_age_minutes: i
 
 async def update_search_title_scope(search_id: int, user_id: int, search_in_title_only: int, new_url: str) -> bool:
     async with writer_connection() as db:
-        cursor = await db.execute(
-            "UPDATE searches SET search_in_title_only = ?, url = ? WHERE id = ? AND user_id = ?",
-            (search_in_title_only, new_url, search_id, user_id)
-        )
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT url FROM searches WHERE id = ? AND user_id = ?", (search_id, user_id)
+        ) as cur:
+            before = await cur.fetchone()
+        if before is None:
+            await db.commit()
+            return False
+        url_changed = (before[0] or "") != new_url
+        if url_changed:
+            cursor = await db.execute(
+                "UPDATE searches SET search_in_title_only = ?, url = ?, initialized_at = NULL WHERE id = ? AND user_id = ?",
+                (search_in_title_only, new_url, search_id, user_id),
+            )
+            await db.execute("DELETE FROM seen_items WHERE search_id = ?", (search_id,))
+        else:
+            cursor = await db.execute(
+                "UPDATE searches SET search_in_title_only = ?, url = ? WHERE id = ? AND user_id = ?",
+                (search_in_title_only, new_url, search_id, user_id),
+            )
         if cursor.rowcount > 0:
             await log_radar_history(
                 db, user_id, search_id, "scope", url=new_url,
                 detail="только в заголовках" if search_in_title_only else "заголовок и текст",
             )
         await db.commit()
-        return cursor.rowcount > 0
+        updated = cursor.rowcount > 0
+    if updated:
+        bump_searches_revision()
+    return updated
 
 
 async def rename_search(search_id: int, user_id: int, title: str) -> bool:
@@ -1586,7 +1690,10 @@ async def rename_search(search_id: int, user_id: int, title: str) -> bool:
         if cursor.rowcount > 0:
             await log_radar_history(db, user_id, search_id, "rename", title.strip()[:100])
         await db.commit()
-        return cursor.rowcount > 0
+        updated = cursor.rowcount > 0
+    if updated:
+        bump_searches_revision()
+    return updated
 
 
 RADAR_HISTORY_LABELS = {
@@ -1815,6 +1922,14 @@ async def get_money_stats() -> Dict[str, Any]:
         """) as cursor:
             payers, renewed = (int(v or 0) for v in await cursor.fetchone())
         async with db.execute("""
+            SELECT COUNT(DISTINCT user_id) FROM (
+                SELECT user_id FROM stars_orders WHERE status IN ('paid', 'refunding')
+                UNION
+                SELECT user_id FROM rub_orders WHERE status IN ('paid', 'disputed')
+            )
+        """) as cursor:
+            total_payers = int((await cursor.fetchone())[0] or 0)
+        async with db.execute("""
             SELECT SUM(CASE WHEN is_allowed = 1 THEN 1 ELSE 0 END), SUM(CASE WHEN is_allowed = 0 THEN 1 ELSE 0 END)
             FROM users WHERE subscription_until > datetime('now')
         """) as cursor:
@@ -1835,7 +1950,7 @@ async def get_money_stats() -> Dict[str, Any]:
         "revenue": revenue, "revenue_rub": revenue_rub, "by_plan": by_plan,
         "rub_disputed": disputed, "rub_refunded": refunded, "rub_review": review,
         "funnel": {"new": new_users, "tried": tried, "paid": paid},
-        "payers": payers, "renewed": renewed,
+        "payers": payers, "total_payers": total_payers, "renewed": renewed,
         "active_paid": active_paid, "active_trial": active_trial,
         "lapsed": lapsed, "lapsed_paid": lapsed_paid,
     }
@@ -1905,7 +2020,8 @@ async def replace_search_url(search_id: int, user_id: int, url: str, search_in_t
         else:
             await db.execute("UPDATE searches SET initialized_at = NULL WHERE id = ?", (search_id,))
         await db.commit()
-        return True
+    bump_searches_revision()
+    return True
 
 
 NIGHT_OFF, NIGHT_SILENT, NIGHT_HOLD = 0, 1, 2
@@ -2045,19 +2161,30 @@ async def count_user_searches(user_id: int) -> int:
 
 
 async def toggle_search_active(search_id: int, user_id: int) -> Optional[bool]:
-    max_radars = await get_user_max_radars(user_id)
     async with writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
         async with db.execute("SELECT is_active FROM searches WHERE id = ? AND user_id = ?", (search_id, user_id)) as cursor:
             row = await cursor.fetchone()
             if not row:
+                await db.commit()
                 return None
             new_status = 0 if row[0] == 1 else 1
 
         if new_status and user_id not in ADMIN_IDS:
             async with db.execute(
+                "SELECT tariff_plan, is_allowed, trial_used, extra_radars FROM users WHERE user_id = ?", (user_id,)
+            ) as cursor:
+                urow = await cursor.fetchone()
+            plan = (urow["tariff_plan"] or "standart").lower() if urow else "standart"
+            max_radars = (
+                _plan_max_radars(plan, bool(urow["is_allowed"]), bool(urow["trial_used"]))
+                + int(urow["extra_radars"] or 0)
+            ) if urow else config.TRIAL_RADARS
+            async with db.execute(
                 "SELECT COUNT(*) FROM searches WHERE user_id = ? AND is_active = 1", (user_id,)
             ) as cursor:
                 if (await cursor.fetchone())[0] >= max_radars:
+                    await db.commit()
                     raise RadarLimitError(f"Тариф вмещает работающих радаров: {max_radars}")
 
         await db.execute(
@@ -2066,7 +2193,8 @@ async def toggle_search_active(search_id: int, user_id: int) -> Optional[bool]:
         )
         await log_radar_history(db, user_id, search_id, "resume" if new_status else "pause")
         await db.commit()
-        return bool(new_status)
+    bump_searches_revision()
+    return bool(new_status)
 
 
 async def is_search_active(search_id: int) -> bool:
@@ -2134,31 +2262,41 @@ async def delete_search(search_id: int, user_id: int) -> bool:
                 (search_id, user_id),
             )
 
-            for iid in affected_items:
+            if affected_items:
+                placeholders = ",".join("?" for _ in affected_items)
                 async with db.execute(
-                    "SELECT COUNT(*) FROM notification_dedupe_radars WHERE user_id = ? AND item_id = ?",
-                    (user_id, iid),
-                ) as c2:
-                    rem = (await c2.fetchone())[0]
-                if rem == 0:
+                    f"SELECT DISTINCT item_id FROM notification_dedupe_radars "
+                    f"WHERE user_id = ? AND item_id IN ({placeholders})",
+                    (user_id, *affected_items),
+                ) as cur:
+                    still_present = {str(r[0]) for r in await cur.fetchall()}
+                orphaned = [iid for iid in affected_items if str(iid) not in still_present]
+                if orphaned:
+                    orph_ph = ",".join("?" for _ in orphaned)
                     await db.execute(
-                        """
+                        f"""
                         UPDATE notification_events
                         SET status = 'expired', expired_at = ?, lease_until = NULL, last_error = 'radar_deleted'
-                        WHERE user_id = ? AND item_id = ? AND status IN ('pending', 'sending')
+                        WHERE user_id = ? AND item_id IN ({orph_ph}) AND status IN ('pending', 'sending')
                         """,
-                        (now_epoch, user_id, iid),
+                        (now_epoch, user_id, *orphaned),
                     )
                     await db.execute(
-                        """
+                        f"""
                         UPDATE notification_dedupe
                         SET status = 'expired', updated_at = ?
-                        WHERE user_id = ? AND item_id = ? AND status = 'queued'
+                        WHERE user_id = ? AND item_id IN ({orph_ph}) AND status = 'queued'
                         """,
-                        (now_epoch, user_id, iid),
+                        (now_epoch, user_id, *orphaned),
                     )
 
             await db.commit()
+            try:
+                import scan_journal
+                scan_journal.forget(search_id)
+            except Exception:
+                pass
+            bump_searches_revision()
             return True
         await db.commit()
         return False
@@ -2454,7 +2592,8 @@ async def update_seen_item_price(search_id: int, item_id: str, new_price: int):
 
 
 SEARCH_FILTER_COLUMNS = frozenset({
-    "price_min", "price_max", "must_words", "delivery_only", "hide_promoted", "reply_template",
+    "price_min", "price_max", "must_words", "delivery_only", "hide_promoted",
+    "no_empty_price", "hide_shops", "reply_template",
 })
 
 
@@ -2695,6 +2834,7 @@ async def enqueue_group_events(
             )
 
         admin_placeholders = ",".join("?" for _ in ADMIN_IDS)
+        pending_count: Optional[int] = None
 
         for ev in normalized_events:
             uid = int(ev["user_id"])
@@ -2846,11 +2986,13 @@ async def enqueue_group_events(
                     continue
 
             # Контроль переполнения OUTBOX_MAX_PENDING (3000) с вытеснением по приоритету
-            async with db.execute(
-                "SELECT COUNT(*) FROM notification_events WHERE status = 'pending'"
-            ) as cur:
-                pending_count = (await cur.fetchone())[0]
+            if pending_count is None:
+                async with db.execute(
+                    "SELECT COUNT(*) FROM notification_events WHERE status = 'pending'"
+                ) as cur:
+                    pending_count = int((await cur.fetchone())[0] or 0)
 
+            evicted_victim = False
             if pending_count >= config.OUTBOX_MAX_PENDING:
                 # Ищем самую старую pending-запись с низшим приоритетом (сначала base=30, затем standart=20)
                 async with db.execute(
@@ -2879,9 +3021,12 @@ async def enqueue_group_events(
                         """,
                         (now, victim["user_id"], victim["item_id"]),
                     )
+                    evicted_victim = True
                 else:
                     logger.warning("Очередь notification_events заполнена (%d); событие отложено до следующего скана", pending_count)
                     continue
+            if not evicted_victim:
+                pending_count += 1
 
             if existing_ev is not None:
                 # Переоткрываем ранее expired/failed событие
@@ -3132,20 +3277,20 @@ async def claim_notification_event(
                 """
                 UPDATE notification_events
                 SET status = 'sending',
-                    send_started_at = ?,
+                    send_started_at = NULL,
                     lease_until = ?,
                     attempt_count = attempt_count + 1,
                     last_error = ?
                 WHERE id = ?
                 """,
-                (eff_now, lease_until, f"lease:{ltoken}", ev_id),
+                (lease_until, f"lease:{ltoken}", ev_id),
             )
             rcur = conn.execute(
                 """
                 SELECT dr.search_id, dr.radar_title,
                        s.id AS live_id, s.title AS live_title, s.is_active, s.stop_words, s.search_in_title_only,
                        s.max_age_minutes, s.url, s.template, s.price_min, s.price_max, s.must_words,
-                       s.delivery_only, s.hide_promoted, s.reply_template
+                       s.delivery_only, s.hide_promoted, s.no_empty_price, s.hide_shops, s.reply_template
                 FROM notification_dedupe_radars dr
                 LEFT JOIN searches s ON s.id = dr.search_id AND s.user_id = dr.user_id
                 WHERE dr.user_id = ? AND dr.item_id = ?
@@ -3203,6 +3348,8 @@ async def claim_notification_event(
             "must_words": r["must_words"] or "[]",
             "delivery_only": int(r["delivery_only"] or 0),
             "hide_promoted": int(r["hide_promoted"] or 0),
+            "no_empty_price": int(r["no_empty_price"] or 0),
+            "hide_shops": int(r["hide_shops"] or 0),
             "reply_template": r["reply_template"] or "",
         })
 
@@ -3210,7 +3357,7 @@ async def claim_notification_event(
     result = dict(row)
     result["attempt_count"] = int(row["attempt_count"]) + 1
     result["attempts"] = result["attempt_count"]
-    result["send_started_at"] = eff_now
+    result["send_started_at"] = None
     result["lease_until"] = lease_until
     result["lease_token"] = lease_token
     result["radars"] = radars
@@ -3324,15 +3471,18 @@ async def reschedule_event(
     error_text: str | None = None,
     is_generic_error: bool = False,
     now_epoch: float | None = None,
+    max_delay: float | None = None,
+    mark_possible_dup: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
-    Освобождает lease и переносит повторную попытку на delay_seconds (до NOTIFICATION_RETRY_MAX).
+    Освобождает lease и переносит повторную попытку на delay_seconds (до max_delay или NOTIFICATION_RETRY_MAX).
     Если возраст превысил NOTIFICATION_MAX_AGE -> переводит в expired.
     Если превышен лимит NOTIFICATION_GENERIC_ATTEMPTS -> переводит в failed.
     Возвращает обновленные поля события, если оно осталось pending.
     """
     now = float(time.time() if now_epoch is None else now_epoch)
-    delay = min(float(config.NOTIFICATION_RETRY_MAX), max(0.0, float(delay_seconds)))
+    cap = float(config.NOTIFICATION_RETRY_MAX if max_delay is None else max_delay)
+    delay = min(cap, max(0.0, float(delay_seconds)))
 
     async with writer_connection() as db:
         await db.execute("BEGIN IMMEDIATE")
@@ -3387,11 +3537,13 @@ async def reschedule_event(
         await db.execute(
             """
             UPDATE notification_events
-            SET status = 'pending', lease_until = NULL, send_started_at = NULL,
+            SET status = 'pending', lease_until = NULL,
+                crash_retry = CASE WHEN ? AND send_started_at IS NOT NULL THEN 1 ELSE crash_retry END,
+                send_started_at = NULL,
                 next_attempt_at = ?, generic_error_count = ?, last_error = ?
             WHERE id = ?
             """,
-            (next_attempt, gen_count, error_text, int(event_id)),
+            (1 if mark_possible_dup else 0, next_attempt, gen_count, error_text, int(event_id)),
         )
         await db.commit()
         return {
@@ -3844,11 +3996,17 @@ async def grant_subscription_in_transaction(db, user_id: int, days: int, tariff_
                 "UPDATE users SET subscription_until = datetime('now', '+' || ? || ' seconds') WHERE user_id = ?",
                 (config.plan_switch_seconds(current[0], effective_plan, left), user_id),
             )
-    cursor = await db.execute("""
+    is_short_test = seconds is not None or (tariff_plan is not None and tariff_plan.lower() == "test")
+    # Preserve remaining trial hours on normal multi-day paid purchases, but never convert free trial
+    # hours into paid access for short test checkouts (e.g. 1-hour rubtest or 1-day test).
+    until_base_expr = (
+        "CASE WHEN is_allowed = 1 AND subscription_until > datetime('now') THEN subscription_until ELSE datetime('now') END"
+        if is_short_test else
+        "CASE WHEN subscription_until > datetime('now') THEN subscription_until ELSE datetime('now') END"
+    )
+    cursor = await db.execute(f"""
         UPDATE users
-        SET subscription_until = datetime(
-                CASE WHEN subscription_until > datetime('now') THEN subscription_until ELSE datetime('now') END,
-                '+' || ? || ?),
+        SET subscription_until = datetime({until_base_expr}, '+' || ? || ?),
             tariff_plan = COALESCE(?, tariff_plan),
             is_allowed = 1, trial_used = 1,
             subscription_revision = subscription_revision + 1
@@ -3882,18 +4040,51 @@ async def extend_active_subscriptions(seconds: int) -> list[tuple[int, str]]:
         raise ValueError("seconds must be a positive integer")
     async with writer_connection() as db:
         await db.execute("BEGIN IMMEDIATE")
-        async with db.execute("SELECT user_id FROM users WHERE subscription_until > datetime('now')") as cur:
-            ids = [int(r[0]) for r in await cur.fetchall() if int(r[0]) not in ADMIN_IDS]
+        async with db.execute(
+            "SELECT user_id, is_allowed, subscription_until, subscription_revision "
+            "FROM users WHERE subscription_until > datetime('now')"
+        ) as cur:
+            before_rows = [
+                (int(r[0]), int(r[1] or 0), r[2], r[3])
+                for r in await cur.fetchall()
+                if int(r[0]) not in ADMIN_IDS
+            ]
+        if not before_rows:
+            await db.commit()
+            return []
+        ids = [r[0] for r in before_rows]
         await db.executemany(
             "UPDATE users SET subscription_until = datetime(subscription_until, '+' || ? || ' seconds'), "
             "subscription_revision = subscription_revision + 1 WHERE user_id = ?",
             [(seconds, uid) for uid in ids],
         )
-        result = []
-        for uid in ids:
-            async with db.execute("SELECT subscription_until FROM users WHERE user_id = ?", (uid,)) as cur:
-                row = await cur.fetchone()
-            result.append((uid, row[0] if row else ""))
+        placeholders = ",".join("?" for _ in ids)
+        async with db.execute(
+            f"SELECT user_id, subscription_until, subscription_revision FROM users WHERE user_id IN ({placeholders})",
+            tuple(ids),
+        ) as cur:
+            updated_map = {int(r[0]): (r[1], r[2]) for r in await cur.fetchall()}
+
+        order_updates = []
+        result: list[tuple[int, str]] = []
+        for uid, was_allowed, old_until, old_rev in before_rows:
+            new_until, new_rev = updated_map.get(uid, ("", None))
+            result.append((uid, new_until or ""))
+            if was_allowed and new_until and new_rev is not None and old_until and old_rev is not None:
+                order_updates.append((new_until, new_rev, uid, old_until, old_rev))
+        if order_updates:
+            await db.executemany(
+                "UPDATE stars_orders SET subscription_after = ?, revision_after = ? "
+                "WHERE user_id = ? AND status IN ('paid', 'refunding') "
+                "AND subscription_after = ? AND revision_after = ?",
+                order_updates,
+            )
+            await db.executemany(
+                "UPDATE rub_orders SET subscription_after = ?, revision_after = ? "
+                "WHERE user_id = ? AND status IN ('paid', 'disputed') "
+                "AND subscription_after = ? AND revision_after = ?",
+                order_updates,
+            )
         await db.commit()
     bump_searches_revision()
     return result
@@ -3944,7 +4135,9 @@ async def apply_admin_subscription_action(token: str, admin_id: int) -> Dict[str
 
 
 async def deactivate_user_searches(user_id: int):
+    now = time.time()
     async with writer_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
         async with db.execute("SELECT id FROM searches WHERE user_id = ? AND is_active = 1", (user_id,)) as cursor:
             stopped = [int(row[0]) for row in await cursor.fetchall()]
         for radar_id in stopped:
@@ -3952,6 +4145,18 @@ async def deactivate_user_searches(user_id: int):
         await db.execute(
             "UPDATE searches SET is_active = 0, pause_reason = ? WHERE user_id = ? AND is_active = 1",
             (PAUSE_BLOCKED, user_id),
+        )
+        await db.execute(
+            """
+            UPDATE notification_events
+            SET status = 'failed', failed_at = ?, lease_until = NULL, send_started_at = NULL, last_error = 'user_blocked'
+            WHERE user_id = ? AND status = 'pending'
+            """,
+            (now, user_id),
+        )
+        await db.execute(
+            "UPDATE notification_dedupe SET status = 'failed', updated_at = ? WHERE user_id = ? AND status = 'queued'",
+            (now, user_id),
         )
         await db.commit()
     bump_searches_revision()
@@ -4150,13 +4355,24 @@ async def acknowledge_notification(notification_id: int, lease_token: str, price
     return await mark_event_sent(notification_id, lease_token, raw_price=price)
 
 
-async def release_notification(notification_id: int, lease_token: str, delay_seconds: float = 0):
+async def release_notification(
+    notification_id: int,
+    lease_token: str,
+    delay_seconds: float = 0,
+    *,
+    max_delay: float | None = None,
+    mark_possible_dup: bool | None = None,
+):
+    if mark_possible_dup is None:
+        mark_possible_dup = float(delay_seconds) <= 0.0
     await reschedule_event(
         notification_id,
         lease_token,
         delay_seconds=delay_seconds,
         error_text="released",
         is_generic_error=False,
+        max_delay=max_delay,
+        mark_possible_dup=bool(mark_possible_dup),
     )
 
 
@@ -4165,20 +4381,40 @@ async def discard_notification(notification_id: int, lease_token: str):
 
 
 def create_database_backup_file() -> Optional[str]:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_filename = f"avito_radar_backup_{timestamp}.db"
-    backup_path = os.path.join(tempfile.gettempdir(), backup_filename)
-
+    backup_path = ""
+    src = None
+    dest = None
     try:
+        config.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        fd, backup_path = tempfile.mkstemp(
+            prefix=f"avito_radar_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}_",
+            suffix=".db",
+            dir=str(config.BACKUP_DIR),
+        )
+        os.close(fd)
         src = sqlite3.connect(_current_db_path())
         dest = sqlite3.connect(backup_path)
         src.backup(dest)
-        dest.close()
-        src.close()
         return backup_path
     except Exception as e:
         logger.error(f"Ошибка при создании бэкапа SQLite: {e}")
+        if backup_path and os.path.exists(backup_path):
+            try:
+                os.unlink(backup_path)
+            except OSError:
+                pass
         return None
+    finally:
+        if dest is not None:
+            try:
+                dest.close()
+            except Exception:
+                pass
+        if src is not None:
+            try:
+                src.close()
+            except Exception:
+                pass
 
 
 # ── Support tickets ──────────────────────────────────────────────────────
@@ -4665,8 +4901,14 @@ async def purge_user_by_pattern(pattern: str) -> Dict[str, Any]:
                 "UPDATE tickets SET user_deleted_epoch = ? WHERE user_id = ? AND user_deleted_epoch IS NULL",
                 (now_epoch, uid))
             await db.execute("DELETE FROM admin_subscription_actions WHERE user_id = ? AND applied_at IS NULL", (uid,))
+            await db.execute("DELETE FROM ref_links WHERE owner_id = ?", (uid,))
+            await db.execute("DELETE FROM fsm_states WHERE user_id = ?", (uid,))
+            await db.execute("INSERT OR REPLACE INTO purged_users (user_id, trial_used) VALUES (?, 1)", (uid,))
             await db.execute("DELETE FROM users WHERE user_id = ?", (uid,))
             invalidate_blacklist_cache(uid)
+            _NIGHT_MODE_CACHE.pop(int(uid), None)
+            _MIRROR_CHAT_CACHE.pop(int(uid), None)
+            _TOUCHED.pop(int(uid), None)
 
         await db.commit()
     bump_searches_revision()

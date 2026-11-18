@@ -24,7 +24,7 @@ async def group_delivery_allowed(user_id: int) -> bool:
     if config.is_admin(user_id):
         return True
     user = await database.get_user(user_id)
-    if not user or not await database.is_user_allowed(user_id):
+    if not user or not user.get("is_allowed") or not await database.is_user_allowed(user_id):
         return False
     return database.classify_user_tariff(user)[0] in config.GROUP_DELIVERY_PLANS
 

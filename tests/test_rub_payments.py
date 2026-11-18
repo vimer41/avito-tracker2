@@ -48,6 +48,7 @@ class TestRubPayments(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
             patch.object(config, "PLATEGA_MERCHANT_ID", "merchant-1"),
             patch.object(config, "PLATEGA_SECRET", "secret-key-123"),
             patch.object(config, "PLATEGA_ENABLED", True),
+            patch.object(config, "RUB_TEST_ENABLED", True),
             patch.object(config, "PLATEGA_CALLBACK_PORT", 0),
         ]
         for item in self.patches:
@@ -212,6 +213,14 @@ class TestRubPayments(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
         await database.grant_subscription(USER, 20, "lite")
         with self.assertRaises(billing.PaymentValidationError):
             await billing.create_rub_order(USER, config.RUB_TEST_PLAN, 1, "sbp")
+
+    async def test_hidden_one_ruble_test_disabled_by_default_for_users(self):
+        with patch.object(config, "RUB_TEST_ENABLED", False):
+            with self.assertRaises(billing.PaymentValidationError):
+                await billing.create_rub_order(USER, config.RUB_TEST_PLAN, 1, "sbp")
+            await database.get_or_create_user(config.ADMIN_ID, "admin", "Admin")
+            admin_order = await billing.create_rub_order(config.ADMIN_ID, config.RUB_TEST_PLAN, 1, "sbp")
+            self.assertEqual(admin_order["tariff_plan"], config.RUB_TEST_PLAN)
 
     async def paid_order(self):
         order = await self.new_order()

@@ -52,7 +52,7 @@ from curl_cffi import requests as curl_requests  # noqa: E402
 from anti_bot.manager import BROWSER_PROFILE  # noqa: E402
 from parser import AvitoParser  # noqa: E402
 
-MOBILE_API_KEY = "af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir"
+MOBILE_API_KEY = os.getenv("AVITO_MOBILE_API_KEY", "").strip()
 MOSCOW_LOCATION_ID = "637640"
 PHONES_CATEGORY_ID = "84"
 DEFAULT_WEB_URL = "https://www.avito.ru/moskva/telefony/mobilnye_telefony/apple-ASgBAgICAkS0wA3OqzmwwQ2I_Dc?s=104"
@@ -716,7 +716,7 @@ class Race:
         add(f"Прокси в запасе: {len(self.proxies)}; заблокированный прокси отдыхает {PROXY_REST_S // 60} мин для того "
             "источника, где его заблокировали")
         add(f"Сайт: {self.web_url}")
-        add(f"API:  {self.api_url.replace(MOBILE_API_KEY, 'KEY')}")
+        add(f"API:  {self.api_url.replace(MOBILE_API_KEY, 'KEY') if MOBILE_API_KEY else self.api_url}")
         add("Фильтры не идентичны (сайт — бренд Apple в телефонах, API — категория телефоны + «"
             f"{self.api_query}»), поэтому «только в одном» частично объясняется разной выдачей.")
         add("")

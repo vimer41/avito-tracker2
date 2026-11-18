@@ -47,6 +47,7 @@ class SearchStates(StatesGroup):
     waiting_for_rename = State()
     waiting_for_new_url = State()
     waiting_for_must_words = State()
+    waiting_for_price_range = State()
     waiting_for_reply_template = State()
 
 
@@ -992,16 +993,25 @@ async def cb_cancel_delete(call: CallbackQuery):
 
 # ── Управление стоп-словами ────────────────────────────────────────────
 
+STOPS_PER_PAGE = 20
+
+
 @router.callback_query(F.data.startswith("manage_stops:"))
-async def cb_manage_stops(call: CallbackQuery):
-    search_id = int(call.data.split(":")[1])
+async def cb_manage_stops(call: CallbackQuery, page: Optional[int] = None):
+    parts = call.data.split(":")
+    search_id = int(parts[1])
+    if page is None:
+        page = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else 0
     s = await _own_search(call, search_id)
     if not s:
         return
 
     stop_words = s["stop_words"]
+    total_pages = max(1, (len(stop_words) + STOPS_PER_PAGE - 1) // STOPS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    page_info = f" · стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
     lines = [
-        f"{ui.e('shield')} <b>Стоп-слова</b> · {html.escape(s['title'])}",
+        f"{ui.e('shield')} <b>Стоп-слова</b> · {html.escape(s['title'])}{page_info}",
         "",
     ]
     if stop_words:
@@ -1012,9 +1022,12 @@ async def cb_manage_stops(call: CallbackQuery):
     else:
         lines.append("Пока пусто. Например: «запчасти», «реплика», «дефект», «копия».")
 
+    start = page * STOPS_PER_PAGE
+    slice_words = stop_words[start:start + STOPS_PER_PAGE]
     rows, row = [], []
     # The button carries the word's position, not the word: callback data is limited to 64 bytes.
-    for idx, w in enumerate(stop_words):
+    for offset, w in enumerate(slice_words):
+        idx = start + offset
         btn_label = w if (ui.clean() and ui.custom_id("cancel")) else f"✖ {w}"
         row.append(ui.btn(btn_label, "cancel", callback_data=f"rm_stop_i:{search_id}:{idx}"))
         if len(row) == 2:
@@ -1022,6 +1035,9 @@ async def cb_manage_stops(call: CallbackQuery):
             row = []
     if row:
         rows.append(row)
+    nav = ui.page_nav(page, total_pages, f"manage_stops:{search_id}:{{page}}")
+    if nav:
+        rows.append(nav)
     rows.append([ui.btn("Добавить стоп-слово", "add", callback_data=f"add_stop:{search_id}", style="primary")])
     rows.append([ui.btn("« К радару", callback_data=f"open_search:{search_id}"),
                  ui.btn("Все радары", "radars", callback_data="list_searches")])
@@ -1113,7 +1129,7 @@ async def cb_add_stop_word_prompt(call: CallbackQuery, state: FSMContext):
 
 # ── Фильтры радара и сообщение продавцу ────────────────────────────────
 
-FILTER_TOGGLES = ("delivery_only", "hide_promoted")
+FILTER_TOGGLES = ("delivery_only", "hide_promoted", "no_empty_price", "hide_shops")
 
 
 def _yes_no(value) -> str:
@@ -1124,6 +1140,8 @@ def build_filters_screen(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
     search_id = s["id"]
     words = radar_filters.parse_words(s.get("must_words"))
     template = (s.get("reply_template") or "").strip()
+    p_min = int(s.get("price_min") or 0)
+    p_max = int(s.get("price_max") or 0)
     cur_age = s.get("max_age_minutes")
     if not cur_age or cur_age <= 0:
         cur_age = 5
@@ -1131,22 +1149,30 @@ def build_filters_screen(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
         cur_age = 30
     text = (
         f"{ui.e('sliders')} <b>Фильтры радара</b>\n«{html.escape(s['title'])}»\n\n"
+        f"<b>Цена:</b> {radar_filters.price_label(p_min, p_max)}\n"
+        f"<b>Без договорной цены:</b> {_yes_no(s.get('no_empty_price'))}\n"
+        f"<b>Без магазинов:</b> {_yes_no(s.get('hide_shops'))}\n"
         f"<b>Обязательные слова:</b> {html.escape(', '.join(words)) or 'нет'}\n"
         f"<b>Свежесть лотов:</b> до {cur_age} мин.\n"
         f"<b>Только с Авито Доставкой:</b> {_yes_no(s.get('delivery_only'))}\n"
         f"<b>Скрывать продвинутые:</b> {_yes_no(s.get('hide_promoted'))}\n"
         f"<b>Сообщение продавцу:</b> {html.escape(template) or 'нет'}\n\n"
-        "<blockquote>Фильтры по цене, продавцам (частные / компании), состоянию и др. ставятся на сайте avito.ru "
+        "<blockquote>Остальные фильтры (продавцы — частные или компании, состояние, память и др.) можно поставить на сайте avito.ru "
         "перед копированием ссылки. Лот придёт, если проходит все условия; отсеянный лот не придёт и после смены фильтра.</blockquote>"
     )
     markup = ui.kb(
-        [ui.btn("Обязательные слова", "scope", callback_data=f"flt_must:{search_id}"),
-         ui.btn(f"Свежесть: до {cur_age} мин", "time", callback_data=f"set_age:{search_id}")],
+        [ui.btn("Цена", "price", callback_data=f"flt_price:{search_id}"),
+         ui.btn("Обязательные слова", "scope", callback_data=f"flt_must:{search_id}")],
+        [ui.btn(f"Без договорной: {_yes_no(s.get('no_empty_price'))}", "ban",
+                callback_data=f"flt_tog:no_empty_price:{search_id}"),
+         ui.btn(f"Без магазинов: {_yes_no(s.get('hide_shops'))}", "ban",
+                callback_data=f"flt_tog:hide_shops:{search_id}")],
         [ui.btn(f"Только с доставкой: {_yes_no(s.get('delivery_only'))}", "box",
                 callback_data=f"flt_tog:delivery_only:{search_id}"),
          ui.btn(f"Скрывать продвинутые: {_yes_no(s.get('hide_promoted'))}", "ban",
                 callback_data=f"flt_tog:hide_promoted:{search_id}")],
-        [ui.btn("Сообщение продавцу", "write", callback_data=f"flt_tpl:{search_id}")],
+        [ui.btn(f"Свежесть: до {cur_age} мин", "time", callback_data=f"set_age:{search_id}"),
+         ui.btn("Сообщение продавцу", "write", callback_data=f"flt_tpl:{search_id}")],
         [ui.btn("« К радару", callback_data=f"open_search:{search_id}")],
     )
     return text, markup
@@ -1176,7 +1202,7 @@ async def _save_filter_value(message: Message, state: FSMContext, **fields) -> N
     await ui.show(message, text, markup)
 
 
-@router.callback_query(F.data.startswith(("flt_open:", "flt_back:", "flt_price:")))
+@router.callback_query(F.data.startswith(("flt_open:", "flt_back:")))
 async def cb_filters_open(call: CallbackQuery, state: FSMContext):
     await state.clear()
     s = await _own_search(call, int(call.data.split(":")[1]))
@@ -1184,6 +1210,30 @@ async def cb_filters_open(call: CallbackQuery, state: FSMContext):
         return
     text, markup = build_filters_screen(s)
     await ui.show(call, text, markup)
+
+
+@router.callback_query(F.data.startswith("flt_price:"))
+async def cb_filter_price(call: CallbackQuery, state: FSMContext):
+    await _ask_filter_value(
+        call, state, SearchStates.waiting_for_price_range,
+        f"{ui.e('price')} <b>Фильтр по цене</b>\n\n"
+        "Пришлите диапазон в рублях: <code>10000-50000</code>, <code>от 10 000</code>, <code>до 50 000</code> или <code>10-50 тыс</code>.\n"
+        "Сбросить ограничение: <code>нет</code>.",
+    )
+
+
+@router.message(SearchStates.waiting_for_price_range, F.text)
+async def process_filter_price_range(message: Message, state: FSMContext):
+    if await route_menu_text(message, state):
+        return
+    parsed = radar_filters.parse_price_range(message.text)
+    if parsed is None:
+        await message.answer(
+            f"{ui.e('warn')} Не понял цену. Примеры: <code>10000-50000</code>, <code>до 30000</code>, <code>нет</code>.",
+            parse_mode="HTML",
+        )
+        return
+    await _save_filter_value(message, state, price_min=parsed[0], price_max=parsed[1])
 
 
 @router.callback_query(F.data.startswith("flt_tog:"))
@@ -1290,6 +1340,7 @@ async def cb_remove_stop_word(call: CallbackQuery):
     parts = call.data.split(":", 2)
     search_id = int(parts[1])
     word = parts[2]
+    return_page = 0
     if by_index:
         s = await _own_search(call, search_id)
         if not s:
@@ -1299,6 +1350,7 @@ async def cb_remove_stop_word(call: CallbackQuery):
             await call.answer("Список изменился, откройте его заново", show_alert=True)
             return
         word = s["stop_words"][idx]
+        return_page = max(0, (idx - (1 if idx == len(s["stop_words"]) - 1 and idx % STOPS_PER_PAGE == 0 else 0)) // STOPS_PER_PAGE)
 
     if not await database.remove_stop_word_from_search(search_id, word, call.from_user.id):
         await call.answer("Радар или стоп-слово не найдено", show_alert=True)
@@ -1306,4 +1358,4 @@ async def cb_remove_stop_word(call: CallbackQuery):
     log_user_event(call.from_user.id, call.from_user.username, call.from_user.first_name, "Удаление стоп-слова", f"Удалено «{word}» из радара #{search_id}", status="OK")
     logger.info(f"🛡 [СТОП-СЛОВА] Пользователь ID:{call.from_user.id} удалил «{word}» из радара #{search_id}")
     await call.answer(f"«{word}» удалено")
-    await cb_manage_stops(call)
+    await cb_manage_stops(call, page=return_page)

@@ -78,13 +78,6 @@ class SourceSnapshotCache:
         bad_kind = ""
         for _ in range(max(1, int(config.SCAN_PROXY_ATTEMPTS))):
             lease = pool.acquire_client(exclude_ids=excluded)
-            if lease is None and len(pool.clients) == 1:
-                # Single client (e.g. direct mode or 1 proxy): clear quarantine/excluded and retry
-                only_client = pool.clients[0]
-                only_client.quarantined_until = 0.0
-                only_client._state = "healthy"
-                only_client._half_open_probe_active = False
-                lease = pool.acquire_client()
             if lease is None:
                 break
             client = lease.client
@@ -106,6 +99,9 @@ class SourceSnapshotCache:
 
         if failed_attempts and bad_pages == failed_attempts:
             raise BadSourceLink(bad_kind)
+
+        if pool.clients:
+            return None
 
         # Fallback for direct/legacy mode when pool has no clients
         parser = None

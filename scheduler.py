@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+from functools import lru_cache
 import html
 import inspect
 import json
@@ -7,7 +8,7 @@ import logging
 import random
 import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Optional, List, Dict, Tuple
 from urllib.parse import urlparse, parse_qs
 import aiohttp
@@ -181,11 +182,12 @@ async def get_image_session() -> aiohttp.ClientSession:
                     enable_cleanup_closed=True,
                 )
                 timeout = aiohttp.ClientTimeout(total=4.0, connect=1.5, sock_read=3.0)
+                from anti_bot.manager import get_browser_user_agent
                 _IMAGE_SESSION = aiohttp.ClientSession(
                     connector=connector,
                     timeout=timeout,
                     headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                        "User-Agent": get_browser_user_agent(),
                         "Accept": "image/jpeg, image/png;q=0.9, */*;q=0.1",
                         "Accept-Encoding": "gzip, deflate",
                         "Referer": "https://www.avito.ru/",
@@ -213,6 +215,17 @@ async def download_image_bytes(raw_url: str) -> Optional[bytes]:
     if not raw_url:
         return None
 
+    proxy = config.PROXY_URL
+    if not proxy:
+        try:
+            from proxy_pool import get_proxy_pool
+            pool = get_proxy_pool()
+            proxy = next((c.proxy_url for c in pool.clients if c.proxy_url and c.is_available()), None)
+        except Exception:
+            proxy = None
+    if proxy is None and not config.ALLOW_DIRECT_AVITO:
+        return None
+
     session = await get_image_session()
 
     urls_to_try = []
@@ -226,9 +239,9 @@ async def download_image_bytes(raw_url: str) -> Optional[bytes]:
             parsed = urlparse(u)
             if parsed.scheme != "https" or not (parsed.hostname or "").endswith(".img.avito.st") or parsed.username or parsed.password:
                 continue
-            budget = get_network_block_state(config.PROXY_URL)
+            budget = get_network_block_state(proxy)
             async with IMAGE_DOWNLOAD_SEMAPHORE, budget.request_slot_async():
-                async with session.get(u, proxy=config.PROXY_URL, allow_redirects=False) as resp:
+                async with session.get(u, proxy=proxy, allow_redirects=False) as resp:
                     budget.record_response(resp.status)
                     budget.register_throttle_response(resp.status, resp.headers)
                     if resp.status == 200:
@@ -253,12 +266,31 @@ async def download_image_bytes(raw_url: str) -> Optional[bytes]:
 NOTIFICATION_SEND_LOCK = asyncio.Lock()
 NEXT_NOTIFICATION_SEND = 0.0
 CHAT_NEXT_SEND: Dict[int, float] = {}
+TELEGRAM_GROUP_INTERVAL = 3.1
+_NEXT_GROUP_SEND: Dict[int, float] = {}
+_GROUP_RATE_LOCKS: Dict[int, asyncio.Lock] = {}
 
 
 def reset_notification_rate_limiter() -> None:
     global NEXT_NOTIFICATION_SEND
     NEXT_NOTIFICATION_SEND = 0.0
     CHAT_NEXT_SEND.clear()
+    _NEXT_GROUP_SEND.clear()
+    _GROUP_RATE_LOCKS.clear()
+
+
+async def pace_global_bot_api() -> None:
+    """Rate-limit non-outbox Bot API sends (broadcasts, digests) via the shared global bucket."""
+    await limit_notification_send_rate(None)
+
+
+async def _bump_global_send_cooldown(retry_after: float) -> None:
+    global NEXT_NOTIFICATION_SEND
+    async with NOTIFICATION_SEND_LOCK:
+        NEXT_NOTIFICATION_SEND = max(
+            NEXT_NOTIFICATION_SEND,
+            time.monotonic() + min(5.0, max(0.0, float(retry_after))),
+        )
 
 
 async def limit_notification_send_rate(chat_id: Optional[int] = None):
@@ -496,6 +528,15 @@ def is_ad_fresh_enough(
     return freshness_status(date_str, timestamp, max_age_minutes) is True
 
 
+_STOP_WORD_SIMPLE_RE = re.compile(r"[\w]+", re.UNICODE)
+
+
+@lru_cache(maxsize=2048)
+def _compile_stop_pattern(word: str, whole: bool) -> re.Pattern[str]:
+    suffix = r"(?!\w)" if whole else ""
+    return re.compile(rf"(?<!\w){re.escape(word)}{suffix}", re.UNICODE)
+
+
 def is_stop_word_matched(item: AvitoItem, stop_words: list) -> Optional[str]:
     """Проверяет, содержит ли объявление стоп-слово в названии или описании."""
     if not stop_words:
@@ -504,8 +545,19 @@ def is_stop_word_matched(item: AvitoItem, stop_words: list) -> Optional[str]:
     text_to_check = f"{item.title} {item.description or ''}".lower()
     for word in stop_words:
         w = word.strip().lower()
-        if w and w in text_to_check:
-            return w
+        if not w:
+            continue
+        if " " in w or not _STOP_WORD_SIMPLE_RE.fullmatch(w):
+            if w in text_to_check:
+                return w
+        elif len(w) <= 3:
+            if w == "бу" and "б/у" in text_to_check:
+                return w
+            if _compile_stop_pattern(w, True).search(text_to_check):
+                return w
+        else:
+            if _compile_stop_pattern(w, False).search(text_to_check):
+                return w
     return None
 
 
@@ -563,6 +615,14 @@ def _extract_photo_file_id(message_obj) -> Optional[str]:
 _MIRROR_TASKS: set[asyncio.Task] = set()
 
 
+async def shutdown_mirror_tasks() -> None:
+    tasks = list(_MIRROR_TASKS)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def _group_keyboard(keyboard: Optional[InlineKeyboardMarkup]) -> Optional[InlineKeyboardMarkup]:
     """Only link buttons go to the group: the others act on the owner's radars and blacklist."""
     if not keyboard:
@@ -572,44 +632,70 @@ def _group_keyboard(keyboard: Optional[InlineKeyboardMarkup]) -> Optional[Inline
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
+async def _pace_group_mirror(chat_id: int) -> None:
+    now = time.monotonic()
+    if len(_NEXT_GROUP_SEND) > 2000:
+        cutoff = now - 600.0
+        for cid in [k for k, ts in _NEXT_GROUP_SEND.items() if ts < cutoff]:
+            _NEXT_GROUP_SEND.pop(cid, None)
+            _GROUP_RATE_LOCKS.pop(cid, None)
+    due = _NEXT_GROUP_SEND.get(chat_id, 0.0)
+    wait = max(0.0, due - now)
+    target = max(now, due)
+    _NEXT_GROUP_SEND[chat_id] = target + TELEGRAM_GROUP_INTERVAL
+    if wait > 0:
+        await asyncio.sleep(wait)
+    await pace_global_bot_api()
+
+
 async def mirror_to_group(bot: Bot, user_id: int, message, keyboard: Optional[InlineKeyboardMarkup], silent: bool) -> bool:
     """Copy a delivered lot into the user's group. Best effort: a failure never touches the user's delivery."""
     chat_id = await database.get_mirror_chat(user_id)
     if not chat_id or message is None or flood_seconds_left(chat_id) > 0:
         return False
     user = await database.get_user(user_id)
-    if not user or database.classify_user_tariff(user)[0] not in config.GROUP_DELIVERY_PLANS:
+    if not user or (not config.is_admin(user_id) and not user.get("is_allowed")):
         return False
-    for _ in range(2):
-        try:
-            await bot.copy_message(
-                chat_id=chat_id, from_chat_id=user_id, message_id=message.message_id,
-                reply_markup=_group_keyboard(keyboard), disable_notification=silent,
-            )
-            return True
-        except TelegramMigrateToChat as exc:
-            # The group became a supergroup and got a new id.
-            chat_id = int(exc.migrate_to_chat_id)
-            await database.set_mirror_chat(user_id, chat_id)
-        except TelegramRetryAfter as exc:
-            pause_flooded_chat(chat_id, float(exc.retry_after))
-            log_event(logger, logging.INFO, "send.group", f"Группа {chat_id} упёрлась в лимит Telegram, копии пропущены",
-                      chat=user_id, group=chat_id, retry_after=exc.retry_after)
-            return False
-        except (TelegramForbiddenError, TelegramBadRequest) as exc:
-            reason = str(exc).lower()
-            if isinstance(exc, TelegramBadRequest) and not any(
-                marker in reason for marker in ("chat not found", "not enough rights", "have no rights", "kicked")
-            ):
-                logger.debug("Group copy refused for chat %s: %s", user_id, exc)
+    if database.classify_user_tariff(user)[0] not in config.GROUP_DELIVERY_PLANS:
+        return False
+    lock = _GROUP_RATE_LOCKS.setdefault(chat_id, asyncio.Lock())
+    async with lock:
+        for attempt in range(2):
+            try:
+                await _pace_group_mirror(chat_id)
+                await bot.copy_message(
+                    chat_id=chat_id, from_chat_id=user_id, message_id=message.message_id,
+                    reply_markup=_group_keyboard(keyboard), disable_notification=silent,
+                )
+                return True
+            except TelegramMigrateToChat as exc:
+                # The group became a supergroup and got a new id.
+                chat_id = int(exc.migrate_to_chat_id)
+                await database.set_mirror_chat(user_id, chat_id)
+            except TelegramRetryAfter as exc:
+                retry_after = float(exc.retry_after)
+                if attempt == 0 and retry_after <= 45.0:
+                    _NEXT_GROUP_SEND[chat_id] = time.monotonic() + retry_after + 0.5
+                    await asyncio.sleep(retry_after + 0.5)
+                    continue
+                pause_flooded_chat(chat_id, retry_after)
+                log_event(logger, logging.INFO, "send.group", f"Группа {chat_id} упёрлась в лимит Telegram, копии пропущены",
+                          chat=user_id, group=chat_id, retry_after=exc.retry_after)
                 return False
-            # The bot was removed from the group or the group is gone: stop copying until the user links it again.
-            await database.set_mirror_chat(user_id, None)
-            log_event(logger, logging.INFO, "send.group", f"Группа {chat_id} отключена: {exc}", chat=user_id, group=chat_id)
-            return False
-        except Exception as exc:
-            logger.debug("Group copy failed for chat %s: %s", user_id, exc)
-            return False
+            except (TelegramForbiddenError, TelegramBadRequest) as exc:
+                reason = str(exc).lower()
+                if isinstance(exc, TelegramBadRequest) and not any(
+                    marker in reason for marker in ("chat not found", "not enough rights", "have no rights", "kicked")
+                ):
+                    logger.debug("Group copy refused for chat %s: %s", user_id, exc)
+                    return False
+                # The bot was removed from the group or the group is gone: stop copying until the user links it again.
+                await database.set_mirror_chat(user_id, None)
+                log_event(logger, logging.INFO, "send.group", f"Группа {chat_id} отключена: {exc}", chat=user_id, group=chat_id)
+                return False
+            except Exception as exc:
+                logger.debug("Group copy failed for chat %s: %s", user_id, exc)
+                return False
     return False
 
 
@@ -623,6 +709,18 @@ async def schedule_mirror(bot: Bot, user_id: int, message, keyboard: Optional[In
         task.add_done_callback(_MIRROR_TASKS.discard)
     except Exception as exc:
         logger.debug("Group copy not scheduled for chat %s: %s", user_id, exc)
+
+
+def _is_permanent_chat_error(exc: Exception) -> bool:
+    if isinstance(exc, TelegramForbiddenError):
+        return True
+    if isinstance(exc, TelegramBadRequest):
+        msg = str(exc).lower()
+        return any(
+            marker in msg
+            for marker in ("user is deactivated", "chat not found", "bot was blocked", "chat_write_forbidden")
+        )
+    return False
 
 
 async def send_ad_to_user(
@@ -645,6 +743,7 @@ async def send_ad_to_user(
     preverified_delivery: bool = False,
     silent: bool = False,
     reply_template: str = "",
+    delivery_meta: Optional[dict] = None,
 ) -> bool:
     """Deliver notification to Telegram user: file_id cache, then photo by URL, then upload, then text."""
     caption = build_notification_text(
@@ -664,6 +763,12 @@ async def send_ad_to_user(
     )
     owner_str = f" [{user_label}]" if user_label else f" ID:{user_id}"
     check_ids = list(search_ids) if search_ids else ([search_id] if search_id else [])
+    had_photo_attempt = False
+
+    def _record_meta(mode: str, t0: float) -> None:
+        if delivery_meta is not None:
+            delivery_meta["mode"] = mode
+            delivery_meta["service_seconds"] = max(0.0, time.monotonic() - t0)
 
     async def prepare_send() -> bool:
         await _await_rate_limit(user_id)
@@ -679,9 +784,11 @@ async def send_ad_to_user(
     # 1. Быстрая попытка через кэш telegram file_id
     cached_fid = get_cached_photo_file_id(it.item_id)
     if cached_fid:
+        had_photo_attempt = True
         try:
             if not await prepare_send():
                 return False
+            t0 = time.monotonic()
             msg = await bot.send_photo(
                 chat_id=user_id,
                 photo=cached_fid,
@@ -690,6 +797,7 @@ async def send_ad_to_user(
                 disable_notification=silent,
                 parse_mode="HTML",
             )
+            _record_meta("photo_file_id", t0)
             logger.debug(
                 f"Радар #{search_id}{owner_str}: file_id из кэша · {it.price} · «{it.title[:35]}»"
             )
@@ -697,14 +805,20 @@ async def send_ad_to_user(
             return True
         except (TelegramForbiddenError, TelegramRetryAfter):
             raise
+        except TelegramBadRequest as cache_err:
+            if _is_permanent_chat_error(cache_err):
+                raise
+            logger.debug(f"file_id кэш сбой ({cache_err}), пробуем следующий путь...")
         except Exception as cache_err:
             logger.debug(f"file_id кэш сбой ({cache_err}), пробуем следующий путь...")
 
     # 2. Прямая отправка по image_url -> single-flight BufferedInputFile
     if it.image_url:
+        had_photo_attempt = True
         try:
             if not await prepare_send():
                 return False
+            t0 = time.monotonic()
             msg = await bot.send_photo(
                 chat_id=user_id,
                 photo=it.image_url,
@@ -713,6 +827,7 @@ async def send_ad_to_user(
                 disable_notification=silent,
                 parse_mode="HTML",
             )
+            _record_meta("photo_url", t0)
             fid = _extract_photo_file_id(msg)
             if fid:
                 set_cached_photo_file_id(it.item_id, fid)
@@ -723,7 +838,9 @@ async def send_ad_to_user(
             return True
         except (TelegramForbiddenError, TelegramRetryAfter):
             raise
-        except (TelegramBadRequest, TelegramNetworkError, Exception) as url_err:
+        except Exception as url_err:
+            if isinstance(url_err, TelegramBadRequest) and _is_permanent_chat_error(url_err):
+                raise
             logger.debug(f"Прямая отправка image_url не удалась ({url_err}), пробуем single-flight скачивание...")
             item_lock = await get_item_lock(it.item_id)
             async with item_lock:
@@ -732,6 +849,7 @@ async def send_ad_to_user(
                     try:
                         if not await prepare_send():
                             return False
+                        t0 = time.monotonic()
                         msg = await bot.send_photo(
                             chat_id=user_id,
                             photo=fid_after_lock,
@@ -740,10 +858,14 @@ async def send_ad_to_user(
                             disable_notification=silent,
                             parse_mode="HTML",
                         )
+                        _record_meta("photo_file_id", t0)
                         await schedule_mirror(bot, user_id, msg, keyboard, silent)
                         return True
                     except (TelegramForbiddenError, TelegramRetryAfter):
                         raise
+                    except TelegramBadRequest as lock_err:
+                        if _is_permanent_chat_error(lock_err):
+                            raise
                     except Exception:
                         pass
                 else:
@@ -753,6 +875,7 @@ async def send_ad_to_user(
                             if not await prepare_send():
                                 return False
                             input_file = BufferedInputFile(img_bytes, filename=f"{it.item_id}.jpg")
+                            t0 = time.monotonic()
                             msg = await bot.send_photo(
                                 chat_id=user_id,
                                 photo=input_file,
@@ -761,6 +884,7 @@ async def send_ad_to_user(
                                 disable_notification=silent,
                                 parse_mode="HTML",
                             )
+                            _record_meta("photo_upload", t0)
                             fid = _extract_photo_file_id(msg)
                             if fid:
                                 set_cached_photo_file_id(it.item_id, fid)
@@ -771,6 +895,10 @@ async def send_ad_to_user(
                             return True
                         except (TelegramForbiddenError, TelegramRetryAfter):
                             raise
+                        except TelegramBadRequest as upload_err:
+                            if _is_permanent_chat_error(upload_err):
+                                raise
+                            logger.debug(f"BufferedInputFile сбой ({upload_err}), отправляем текст...")
                         except Exception as upload_err:
                             logger.debug(f"BufferedInputFile сбой ({upload_err}), отправляем текст...")
 
@@ -779,6 +907,7 @@ async def send_ad_to_user(
         try:
             if not await prepare_send():
                 return False
+            t0 = time.monotonic()
             msg = await bot.send_message(
                 chat_id=user_id,
                 text=caption,
@@ -787,6 +916,7 @@ async def send_ad_to_user(
                 parse_mode="HTML",
                 disable_web_page_preview=False,
             )
+            _record_meta("photo_fallback_text" if had_photo_attempt else "text", t0)
             logger.debug(
                 f"Радар #{search_id}{owner_str}: текстом · {it.price} · «{it.title[:35]}»"
             )
@@ -794,6 +924,11 @@ async def send_ad_to_user(
             return True
         except (TelegramForbiddenError, TelegramRetryAfter):
             raise
+        except TelegramBadRequest as text_err:
+            if _is_permanent_chat_error(text_err):
+                raise
+            logger.error(f"❌ [РАДАР #{search_id}] Не удалось доставить лот #{it.item_id}: {text_err}")
+            return False
         except Exception as text_err:
             logger.error(f"❌ [РАДАР #{search_id}] Не удалось доставить лот #{it.item_id}: {text_err}")
             return False
@@ -990,6 +1125,7 @@ async def process_collected_group_fanout(
 
         # 🏷 Проверка области выборки (Только в названиях)
         title_only = bool(radar.get("search_in_title_only", 0))
+        q_val = ""
         if title_only:
             parsed_u = urlparse(radar.get("url", ""))
             q_val = parse_qs(parsed_u.query).get("q", [""])[0].strip()
@@ -1086,8 +1222,13 @@ async def process_collected_group_fanout(
         # In downtime catch-up mode, cap to CATCHUP_MAX_ITEMS (10) newest items
         omitted_catchup_ids: set[str] = set()
         if is_downtime_catchup and len(deliverable_items) > config.CATCHUP_MAX_ITEMS:
-            kept = deliverable_items[: config.CATCHUP_MAX_ITEMS]
-            omitted = deliverable_items[config.CATCHUP_MAX_ITEMS :]
+            ordered = sorted(
+                deliverable_items,
+                key=lambda item: (item.timestamp or 0, 1 if not item.is_promotion else 0),
+                reverse=True,
+            )
+            kept = ordered[: config.CATCHUP_MAX_ITEMS]
+            omitted = ordered[config.CATCHUP_MAX_ITEMS :]
             omitted_catchup_ids = {it.item_id for it in omitted}
             deliverable_items = kept
             METRICS.record_catchup_omitted(len(omitted))
@@ -1126,6 +1267,34 @@ async def process_collected_group_fanout(
                 f"(отсеян по возрасту: {age_summary}; {limit_label})"
             )
             continue
+
+        has_radar_filters = bool(
+            stop_words
+            or blocked_sellers
+            or title_only
+            or radar.get("must_words")
+            or radar.get("price_min")
+            or radar.get("price_max")
+            or radar.get("no_empty_price")
+            or radar.get("hide_shops")
+            or radar.get("delivery_only")
+            or radar.get("hide_promoted")
+        )
+        if has_radar_filters:
+            clean_pool = [
+                pool_it for pool_it in items
+                if (not title_only or not q_val or radar_filters.title_matches(pool_it.title, q_val))
+                and not is_stop_word_matched(pool_it, stop_words)
+                and not radar_filters.seller_is_blocked(pool_it, blocked_sellers)
+                and not radar_filters.filter_reason(pool_it, radar)
+            ]
+            if len(clean_pool) >= radar_filters.MARKET_MIN_PRICES:
+                radar_median = radar_filters.market_median(clean_pool)
+                recalculated = []
+                for d_it in deliverable_items:
+                    m_med, m_pct = radar_filters.compute_item_market(d_it, radar_median)
+                    recalculated.append(replace(d_it, market_median=m_med, market_percent=m_pct))
+                deliverable_items = recalculated
 
         fresh_label = plural_form(len(deliverable_items), "СВЕЖИЙ ЛОТ", "СВЕЖИХ ЛОТА", "СВЕЖИХ ЛОТОВ")
         log_event(
@@ -1272,8 +1441,8 @@ async def _prepare_delivery(row: dict) -> Optional[dict]:
     else:
         queued_at = float(queued_at_raw)
 
-    # Expiration check (> 30m in outbox)
-    if queued_at > 0 and (now - queued_at) > float(config.NOTIFICATION_MAX_AGE) and freshness_verified and (now - queued_at) > 3600:
+    # Expiration check (stale in outbox past NOTIFICATION_MAX_AGE)
+    if queued_at > 0 and (now - queued_at) > float(config.NOTIFICATION_MAX_AGE):
         await database.mark_event_expired(notification_id, token, mark_seen=True)
         METRICS.record_outbox_expired(1)
         return None
@@ -1295,6 +1464,8 @@ async def _prepare_delivery(row: dict) -> Optional[dict]:
                 "must_words": r.get("must_words"),
                 "delivery_only": r.get("delivery_only"),
                 "hide_promoted": r.get("hide_promoted"),
+                "no_empty_price": r.get("no_empty_price"),
+                "hide_shops": r.get("hide_shops"),
                 "reply_template": r.get("reply_template"),
             }
             for r in (row.get("radars") or [])
@@ -1321,11 +1492,7 @@ async def _prepare_delivery(row: dict) -> Optional[dict]:
 
     active_searches = [s for s in existing_searches if s.get("is_active")]
     if not active_searches:
-        if (now - queued_at) >= float(config.NOTIFICATION_MAX_AGE):
-            await database.mark_event_expired(notification_id, token, mark_seen=False)
-            METRICS.record_outbox_expired(1)
-        else:
-            await database.release_notification(notification_id, token, 30)
+        await database.mark_event_failed(notification_id, token, reason="no_active_radars", error="no_active_radars")
         return None
 
     # Legacy unverified freshness check
@@ -1383,7 +1550,13 @@ async def _prepare_delivery(row: dict) -> Optional[dict]:
     }
 
 
-async def _acknowledge_delivery(row: dict, ctx: dict) -> bool:
+async def _acknowledge_delivery(
+    row: dict,
+    ctx: dict,
+    *,
+    bot_api_service_seconds: float = 0.0,
+    delivery_mode: str = "text",
+) -> bool:
     item = ctx["item"]
     acknowledged = await database.acknowledge_notification(ctx["id"], ctx["token"], item.raw_price or 0)
     if acknowledged:
@@ -1398,6 +1571,8 @@ async def _acknowledge_delivery(row: dict, ctx: dict) -> bool:
             t_queued=ctx["queued_at"],
             deliver_at=deliver_at_val,
             t_sent=t_sent,
+            bot_api_service_seconds=bot_api_service_seconds,
+            delivery_mode=delivery_mode,
             is_catchup=ctx["is_catchup"],
         )
         t_pub_val = row.get("t_pub") or item.timestamp
@@ -1442,6 +1617,7 @@ async def deliver_notification(bot: Bot, parser: Optional[AvitoParser], row: dic
         user_id = ctx["user_id"]
         if not row.get("send_started_at"):
             await database.mark_event_send_started(notification_id, token)
+        delivery_meta: dict = {}
         delivered = await send_ad_to_user(
             bot,
             parser,
@@ -1458,17 +1634,27 @@ async def deliver_notification(bot: Bot, parser: Optional[AvitoParser], row: dic
             preverified_delivery=bool(row.get("_fast_claimed")),
             silent=ctx["silent"],
             reply_template=ctx["reply_template"],
+            delivery_meta=delivery_meta,
         )
         if delivered:
-            return await _acknowledge_delivery(row, ctx)
+            return await _acknowledge_delivery(
+                row,
+                ctx,
+                bot_api_service_seconds=float(delivery_meta.get("service_seconds") or 0.0),
+                delivery_mode=str(delivery_meta.get("mode") or "text"),
+            )
         await _release_after_failure(row, "delivery_returned_false")
         return False
     except asyncio.CancelledError:
         await asyncio.shield(database.release_notification(notification_id, token, 0))
         raise
-    except TelegramForbiddenError:
-        await database.deactivate_user_searches(user_id)
-        await database.discard_notification(notification_id, token)
+    except (TelegramForbiddenError, TelegramBadRequest) as exc:
+        if _is_permanent_chat_error(exc):
+            await database.deactivate_user_searches(user_id)
+            await database.mark_event_failed(notification_id, token, reason="chat_unavailable", error=str(exc)[:200])
+            return False
+        logger.exception("Outbox delivery failed #%s", notification_id)
+        await _release_after_failure(row, str(exc))
         return False
     except TelegramRetryAfter as exc:
         retry_delay = float(exc.retry_after) + random.uniform(0.5, 1.5)
@@ -1482,7 +1668,8 @@ async def deliver_notification(bot: Bot, parser: Optional[AvitoParser], row: dic
             retry_after=exc.retry_after,
         )
         pause_flooded_chat(user_id, retry_delay)
-        await database.release_notification(notification_id, token, retry_delay)
+        await _bump_global_send_cooldown(float(exc.retry_after))
+        await database.release_notification(notification_id, token, retry_delay, max_delay=3600.0)
         return False
     except Exception as exc:
         logger.exception("Outbox delivery failed #%s", notification_id)
@@ -1572,6 +1759,7 @@ async def deliver_digest(bot: Bot, parser: Optional[AvitoParser], rows: list[dic
                 await database.mark_event_send_started(ctx["id"], ctx["token"])
         await _await_rate_limit(user_id)
         digest_silent = all(ctx.get("silent") for _, ctx in ready)
+        t_api0 = time.monotonic()
         digest_msg = await bot.send_message(
             chat_id=user_id,
             text=build_digest_text([ctx for _, ctx in ready]),
@@ -1580,15 +1768,21 @@ async def deliver_digest(bot: Bot, parser: Optional[AvitoParser], rows: list[dic
             reply_markup=build_digest_keyboard([ctx for _, ctx in ready]),
             disable_notification=digest_silent,
         )
+        digest_service_seconds = max(0.0, time.monotonic() - t_api0)
         await schedule_mirror(bot, user_id, digest_msg, None, digest_silent)
     except asyncio.CancelledError:
         for row, ctx in ready:
             await asyncio.shield(database.release_notification(ctx["id"], ctx["token"], 0))
         raise
-    except TelegramForbiddenError:
-        await database.deactivate_user_searches(user_id)
-        for row, ctx in ready:
-            await database.discard_notification(ctx["id"], ctx["token"])
+    except (TelegramForbiddenError, TelegramBadRequest) as exc:
+        if _is_permanent_chat_error(exc):
+            await database.deactivate_user_searches(user_id)
+            for row, ctx in ready:
+                await database.mark_event_failed(ctx["id"], ctx["token"], reason="chat_unavailable", error=str(exc)[:200])
+            return 0
+        logger.exception("Outbox digest delivery failed for chat %s", user_id)
+        for row, _ in ready:
+            await _release_after_failure(row, str(exc))
         return 0
     except TelegramRetryAfter as exc:
         retry_delay = float(exc.retry_after) + random.uniform(0.5, 1.5)
@@ -1602,8 +1796,9 @@ async def deliver_digest(bot: Bot, parser: Optional[AvitoParser], rows: list[dic
             retry_after=exc.retry_after,
         )
         pause_flooded_chat(user_id, retry_delay)
+        await _bump_global_send_cooldown(float(exc.retry_after))
         for row, ctx in ready:
-            await database.release_notification(ctx["id"], ctx["token"], retry_delay)
+            await database.release_notification(ctx["id"], ctx["token"], retry_delay, max_delay=3600.0)
         return 0
     except Exception as exc:
         logger.exception("Outbox digest delivery failed for chat %s", user_id)
@@ -1614,7 +1809,12 @@ async def deliver_digest(bot: Bot, parser: Optional[AvitoParser], rows: list[dic
     log_event(logger, logging.INFO, "send.digest", f"📦 Пачка из {len(ready)} лотов [chat {user_id}]", chat=user_id, n=len(ready))
     delivered = 0
     for row, ctx in ready:
-        delivered += int(await _acknowledge_delivery(row, ctx))
+        delivered += int(await _acknowledge_delivery(
+            row,
+            ctx,
+            bot_api_service_seconds=digest_service_seconds if delivered == 0 else 0.0,
+            delivery_mode="text",
+        ))
     return delivered
 
 
