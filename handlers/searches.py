@@ -47,7 +47,6 @@ class SearchStates(StatesGroup):
     waiting_for_rename = State()
     waiting_for_new_url = State()
     waiting_for_must_words = State()
-    waiting_for_price_range = State()
     waiting_for_reply_template = State()
 
 
@@ -1129,7 +1128,7 @@ async def cb_add_stop_word_prompt(call: CallbackQuery, state: FSMContext):
 
 # ── Фильтры радара и сообщение продавцу ────────────────────────────────
 
-FILTER_TOGGLES = ("delivery_only", "hide_promoted", "no_empty_price", "hide_shops")
+FILTER_TOGGLES = ("delivery_only", "hide_promoted")
 
 
 def _yes_no(value) -> str:
@@ -1140,8 +1139,6 @@ def build_filters_screen(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
     search_id = s["id"]
     words = radar_filters.parse_words(s.get("must_words"))
     template = (s.get("reply_template") or "").strip()
-    p_min = int(s.get("price_min") or 0)
-    p_max = int(s.get("price_max") or 0)
     cur_age = s.get("max_age_minutes")
     if not cur_age or cur_age <= 0:
         cur_age = 5
@@ -1149,30 +1146,22 @@ def build_filters_screen(s: dict) -> Tuple[str, InlineKeyboardMarkup]:
         cur_age = 30
     text = (
         f"{ui.e('sliders')} <b>Фильтры радара</b>\n«{html.escape(s['title'])}»\n\n"
-        f"<b>Цена:</b> {radar_filters.price_label(p_min, p_max)}\n"
-        f"<b>Без договорной цены:</b> {_yes_no(s.get('no_empty_price'))}\n"
-        f"<b>Без магазинов:</b> {_yes_no(s.get('hide_shops'))}\n"
         f"<b>Обязательные слова:</b> {html.escape(', '.join(words)) or 'нет'}\n"
         f"<b>Свежесть лотов:</b> до {cur_age} мин.\n"
         f"<b>Только с Авито Доставкой:</b> {_yes_no(s.get('delivery_only'))}\n"
         f"<b>Скрывать продвинутые:</b> {_yes_no(s.get('hide_promoted'))}\n"
         f"<b>Сообщение продавцу:</b> {html.escape(template) or 'нет'}\n\n"
-        "<blockquote>Остальные фильтры (продавцы — частные или компании, состояние, память и др.) можно поставить на сайте avito.ru "
+        "<blockquote>Фильтры по цене, продавцам (частные / компании), состоянию и др. ставятся на сайте avito.ru "
         "перед копированием ссылки. Лот придёт, если проходит все условия; отсеянный лот не придёт и после смены фильтра.</blockquote>"
     )
     markup = ui.kb(
-        [ui.btn("Цена", "price", callback_data=f"flt_price:{search_id}"),
-         ui.btn("Обязательные слова", "scope", callback_data=f"flt_must:{search_id}")],
-        [ui.btn(f"Без договорной: {_yes_no(s.get('no_empty_price'))}", "ban",
-                callback_data=f"flt_tog:no_empty_price:{search_id}"),
-         ui.btn(f"Без магазинов: {_yes_no(s.get('hide_shops'))}", "ban",
-                callback_data=f"flt_tog:hide_shops:{search_id}")],
+        [ui.btn("Обязательные слова", "scope", callback_data=f"flt_must:{search_id}"),
+         ui.btn(f"Свежесть: до {cur_age} мин", "time", callback_data=f"set_age:{search_id}")],
         [ui.btn(f"Только с доставкой: {_yes_no(s.get('delivery_only'))}", "box",
                 callback_data=f"flt_tog:delivery_only:{search_id}"),
          ui.btn(f"Скрывать продвинутые: {_yes_no(s.get('hide_promoted'))}", "ban",
                 callback_data=f"flt_tog:hide_promoted:{search_id}")],
-        [ui.btn(f"Свежесть: до {cur_age} мин", "time", callback_data=f"set_age:{search_id}"),
-         ui.btn("Сообщение продавцу", "write", callback_data=f"flt_tpl:{search_id}")],
+        [ui.btn("Сообщение продавцу", "write", callback_data=f"flt_tpl:{search_id}")],
         [ui.btn("« К радару", callback_data=f"open_search:{search_id}")],
     )
     return text, markup
@@ -1202,7 +1191,7 @@ async def _save_filter_value(message: Message, state: FSMContext, **fields) -> N
     await ui.show(message, text, markup)
 
 
-@router.callback_query(F.data.startswith(("flt_open:", "flt_back:")))
+@router.callback_query(F.data.startswith(("flt_open:", "flt_back:", "flt_price:")))
 async def cb_filters_open(call: CallbackQuery, state: FSMContext):
     await state.clear()
     s = await _own_search(call, int(call.data.split(":")[1]))
@@ -1212,34 +1201,17 @@ async def cb_filters_open(call: CallbackQuery, state: FSMContext):
     await ui.show(call, text, markup)
 
 
-@router.callback_query(F.data.startswith("flt_price:"))
-async def cb_filter_price(call: CallbackQuery, state: FSMContext):
-    await _ask_filter_value(
-        call, state, SearchStates.waiting_for_price_range,
-        f"{ui.e('price')} <b>Фильтр по цене</b>\n\n"
-        "Пришлите диапазон в рублях: <code>10000-50000</code>, <code>от 10 000</code>, <code>до 50 000</code> или <code>10-50 тыс</code>.\n"
-        "Сбросить ограничение: <code>нет</code>.",
-    )
-
-
-@router.message(SearchStates.waiting_for_price_range, F.text)
-async def process_filter_price_range(message: Message, state: FSMContext):
-    if await route_menu_text(message, state):
-        return
-    parsed = radar_filters.parse_price_range(message.text)
-    if parsed is None:
-        await message.answer(
-            f"{ui.e('warn')} Не понял цену. Примеры: <code>10000-50000</code>, <code>до 30000</code>, <code>нет</code>.",
-            parse_mode="HTML",
-        )
-        return
-    await _save_filter_value(message, state, price_min=parsed[0], price_max=parsed[1])
-
-
 @router.callback_query(F.data.startswith("flt_tog:"))
 async def cb_filter_toggle(call: CallbackQuery):
     _, field, raw_id = call.data.split(":")
     if field not in FILTER_TOGGLES:
+        if field in ("no_empty_price", "hide_shops") and raw_id.isdigit():
+            s = await _own_search(call, int(raw_id))
+            if s:
+                await call.answer("Этот фильтр ставится в ссылке на avito.ru")
+                text, markup = build_filters_screen(s)
+                await ui.show(call, text, markup, answer=False)
+                return
         await call.answer()
         return
     s = await _own_search(call, int(raw_id))

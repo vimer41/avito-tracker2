@@ -1273,10 +1273,6 @@ async def process_collected_group_fanout(
             or blocked_sellers
             or title_only
             or radar.get("must_words")
-            or radar.get("price_min")
-            or radar.get("price_max")
-            or radar.get("no_empty_price")
-            or radar.get("hide_shops")
             or radar.get("delivery_only")
             or radar.get("hide_promoted")
         )
@@ -1459,13 +1455,9 @@ async def _prepare_delivery(row: dict) -> Optional[dict]:
                 "is_active": bool(r["is_active"]),
                 "stop_words": list(r.get("stop_words") or []),
                 "max_age_minutes": int(r.get("max_age_minutes") or 5),
-                "price_min": r.get("price_min"),
-                "price_max": r.get("price_max"),
                 "must_words": r.get("must_words"),
                 "delivery_only": r.get("delivery_only"),
                 "hide_promoted": r.get("hide_promoted"),
-                "no_empty_price": r.get("no_empty_price"),
-                "hide_shops": r.get("hide_shops"),
                 "reply_template": r.get("reply_template"),
             }
             for r in (row.get("radars") or [])

@@ -168,12 +168,12 @@ class AuditDBRegressionTests(unittest.IsolatedAsyncioTestCase):
     async def test_sqlite_fsm_storage_persists_across_instances(self):
         s1 = SQLiteFSMStorage()
         key = StorageKey(bot_id=1, chat_id=self.user_id, user_id=self.user_id)
-        await s1.set_state(key, "SearchStates:waiting_for_price_range")
-        await s1.set_data(key, {"search_id": 42, "step": "price"})
+        await s1.set_state(key, "SearchStates:waiting_for_must_words")
+        await s1.set_data(key, {"search_id": 42, "step": "must"})
 
         s2 = SQLiteFSMStorage()
-        self.assertEqual(await s2.get_state(key), "SearchStates:waiting_for_price_range")
-        self.assertEqual(await s2.get_data(key), {"search_id": 42, "step": "price"})
+        self.assertEqual(await s2.get_state(key), "SearchStates:waiting_for_must_words")
+        self.assertEqual(await s2.get_data(key), {"search_id": 42, "step": "must"})
 
         await s2.set_state(key, None)
         await s2.set_data(key, {})

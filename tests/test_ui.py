@@ -131,22 +131,17 @@ class TestInterfaceFlows(DispatcherFixture, unittest.IsolatedAsyncioTestCase):
     def _last_screen(self):
         return [m for m in self.session.calls if type(m).__name__ in ("SendMessage", "EditMessageText")][-1]
 
-    async def test_filters_screen_has_price_filters_and_points_to_avito(self):
+    async def test_filters_screen_has_no_price_button_and_points_to_avito(self):
         search_id = await database.add_search(self.user_id, "Радар", "https://www.avito.ru/moskva?q=x&s=104")
         await self.dispatch_callback(f"flt_open:{search_id}")
         sent = self._last_screen()
-        self.assertIn("<b>Цена:</b>", sent.text)
+        self.assertNotIn("<b>Цена:</b>", sent.text)
+        self.assertNotIn("Без договорной", sent.text)
+        self.assertNotIn("Без магазинов", sent.text)
         self.assertIn("avito.ru", sent.text)
-        callbacks = self.callback_values()
-        self.assertIn(f"flt_price:{search_id}", callbacks)
-        self.assertIn(f"flt_tog:no_empty_price:{search_id}", callbacks)
-        self.assertIn(f"flt_tog:hide_shops:{search_id}", callbacks)
+        self.assertFalse(any(v.startswith("flt_price:") for v in self.callback_values() if v))
         labels = [b.text for row in sent.reply_markup.inline_keyboard for b in row]
-        self.assertTrue(any("Цена" in label for label in labels))
-        await self.dispatch_callback(f"flt_price:{search_id}")
-        await self.dispatch_message(text="10000-50000")
-        updated = await database.get_search(search_id)
-        self.assertEqual((updated["price_min"], updated["price_max"]), (10000, 50000))
+        self.assertFalse(any("Цена" in label for label in labels))
 
     async def test_help_and_add_prompt_explain_avito_site_filters(self):
         for theme in ("emoji", "clean"):

@@ -88,10 +88,6 @@ def compute_group_revision(radars: Iterable[dict]) -> str:
                 "must_words": str(r.get("must_words") or "").strip(),
                 "delivery_only": int(bool(r.get("delivery_only") or 0)),
                 "hide_promoted": int(bool(r.get("hide_promoted") or 0)),
-                "price_min": int(r.get("price_min") or 0),
-                "price_max": int(r.get("price_max") or 0),
-                "no_empty_price": int(bool(r.get("no_empty_price") or 0)),
-                "hide_shops": int(bool(r.get("hide_shops") or 0)),
             }
         )
     payload = json.dumps(normalized, sort_keys=True, ensure_ascii=False, separators=(",", ":"))

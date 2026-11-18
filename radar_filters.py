@@ -93,17 +93,6 @@ def price_label(price_min: int, price_max: int) -> str:
 
 def filter_reason(item: Any, radar: dict) -> Optional[str]:
     """Which filter of this radar drops the lot, None when the lot passes."""
-    if radar.get("no_empty_price") and (item.raw_price is None or item.raw_price <= 0):
-        return "empty_price"
-    p_min = int(radar.get("price_min") or 0)
-    p_max = int(radar.get("price_max") or 0)
-    if p_min > 0 or p_max > 0:
-        if item.raw_price is None or item.raw_price <= 0:
-            return "price"
-        if (p_min > 0 and item.raw_price < p_min) or (p_max > 0 and item.raw_price > p_max):
-            return "price"
-    if radar.get("hide_shops") and str(getattr(item, "seller_key", "") or "").startswith("/brands/"):
-        return "shop"
     if radar.get("delivery_only") and not item.delivery:
         return "delivery"
     if radar.get("hide_promoted") and item.is_promotion:
@@ -140,14 +129,6 @@ def title_matches(title: str, query: str) -> bool:
 def summary(radar: dict) -> str:
     """One line for the radar card."""
     parts = []
-    p_min = int(radar.get("price_min") or 0)
-    p_max = int(radar.get("price_max") or 0)
-    if p_min or p_max:
-        parts.append(f"цена: {price_label(p_min, p_max)}")
-    if radar.get("no_empty_price"):
-        parts.append("без договорной")
-    if radar.get("hide_shops"):
-        parts.append("без магазинов")
     words = parse_words(radar.get("must_words"))
     if words:
         parts.append(f"обязательных слов: {len(words)}")
